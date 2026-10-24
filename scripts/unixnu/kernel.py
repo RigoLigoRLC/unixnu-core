@@ -93,18 +93,19 @@ def build(ctx, modules):
 
         return False
 
-    if compile_inputs_missing():
-        # The archive builders and the boot progress layer read compile records of the XNU build, which only an earlier
-        # pass leaves behind. A first build from scratch therefore runs one pass without them; XNU_BOOTSTRAP makes it
-        # skip the archive checks and link without the archives, so it stops at the link and only the records are
-        # required of it.
-        log('kernel: bootstrap pass for the compile records')
-        subprocess_env = {**env, 'XNU_BOOT_PROGRESS': '0', 'XNU_BOOTSTRAP': '1'}
-        try:
-            run(['bash', script], cwd=ctx.tree, env=subprocess_env, log_file=ctx.logs / 'kernel-bootstrap.log')
-        except Error:
-            if compile_inputs_missing():
-                raise
+    # Source preparation applies the current patches and exports their headers.
+    # Archive builders consume those sources and this pass's compile records.
+    # Old records must never allow an archive to precede source preparation.
+    log('kernel: bootstrap pass for source, headers and compile records')
+    subprocess_env = {**env, 'XNU_BOOT_PROGRESS': '0', 'XNU_BOOTSTRAP': '1'}
+    record.unlink(missing_ok=True)
+    record.with_suffix('').unlink(missing_ok=True)
+    link_filelist.unlink(missing_ok=True)
+    try:
+        run(['bash', script], cwd=ctx.tree, env=subprocess_env, log_file=ctx.logs / 'kernel-bootstrap.log')
+    except Error:
+        if compile_inputs_missing():
+            raise
     storage = ctx.tree / 'build/storage-abi/include/IOKit/storage'
     needs_storage = any(ctx.need_config().get(name) for name in (
         'XNU_NATIVE_UFS', 'XNU_NATIVE_VIRTIO_BLOCK', 'XNU_NATIVE_RAM_BLOCK'))
