@@ -37,6 +37,56 @@ def check_args(arguments):
     return line
 
 
+def override_args(arguments, extra):
+    names = {item.split('=', 1)[0] for item in extra}
+    return [item for item in arguments if item.split('=', 1)[0] not in names] + extra
+
+
+def extra_entries(spec, arguments, initrd):
+    """Render board entries after the default kernel entry, before installation.
+
+    XNU entries reuse the default kernel, Data seed and final command line.
+    Their kernel_args replace arguments by name, including command-line overrides.
+    EFI and action entries supply the fields consumed by the existing boot menu.
+    """
+    config = ''
+    for entry in spec.get('extra_entries', []):
+        kind = entry['type']
+        config += ('[[entry]]\n'
+                   f'id = {json.dumps(entry["id"])}\n'
+                   f'title = {json.dumps(entry["title"])}\n'
+                   f'type = {json.dumps(kind)}\n')
+        if kind == 'xnu':
+            line = check_args(override_args(arguments, entry.get('kernel_args', [])))
+            config += ('path = "Payloads/kernel.macho"\n'
+                       f'{initrd}args = {json.dumps(line)}\n')
+        elif kind == 'efi':
+            config += f'path = {json.dumps(entry["path"])}\n'
+            if 'args' in entry:
+                config += f'args = {json.dumps(entry["args"])}\n'
+        elif kind == 'action':
+            config += f'action = {json.dumps(entry["action"])}\n'
+        else:
+            raise Error(f'unsupported payload extra entry type: {kind}')
+
+    return config
+
+
+def copy_payload_files(ctx, spec, stage):
+    """Copy selected build outputs into board-specified paths inside the FAT."""
+    for entry in spec.get('files', []):
+        source = ctx.work / entry['source']
+        relative = Path(entry['destination'])
+        if relative.is_absolute() or '..' in relative.parts:
+            raise Error(f'payload file destination must stay inside the FAT: {relative}')
+
+        destination = stage / relative
+        if destination.exists():
+            raise Error(f'payload file would replace a generated file: {relative}')
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
 def check_native_root(kernel, arguments):
     """Refuse the known bare-metal AMFI panic before the volume is written."""
     values = {}
@@ -65,24 +115,44 @@ def write_volume(stage, image, label, size_mib):
 
 
 def skip_setup_seed(ctx, base, tool_path, tool_args=()):
-    """A copy of the Data seed whose preferences mark Setup (the Hello pages) as done; cached by the hash of the base and the
-    tool's extra arguments (board.toml [payload] skip_setup_args)."""
+    """Create a Data copy whose preferences mark Setup as complete.
+
+    With file hashes disabled, reuse is based on the source path, size, modification
+    time and tool arguments recorded beside the generated seed.
+    """
     tool('hdiutil')
     out = paths(ctx)[0]
     out.mkdir(parents=True, exist_ok=True)
-    key = sha256_file(base)[:12] + (('-' + hashlib.sha256(' '.join(tool_args).encode()).hexdigest()[:8]) if tool_args else '')
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
+    metadata = None
+    record = out / 'data-skip-setup-input.json'
+    if record_hashes:
+        key = sha256_file(base)[:12] + (('-' + hashlib.sha256(' '.join(tool_args).encode()).hexdigest()[:8]) if tool_args else '')
+    else:
+        key = 'metadata'
+        stat = base.stat()
+        tool_stat = (ctx.tree / tool_path).stat()
+        metadata = {'source': str(base), 'size': stat.st_size, 'mtime_ns': stat.st_mtime_ns,
+                    'tool': tool_path, 'tool_size': tool_stat.st_size,
+                    'tool_mtime_ns': tool_stat.st_mtime_ns, 'args': list(tool_args)}
+
     seed = out / f'data-skip-setup-{key}.dbr'
+    if metadata is not None and (not record.is_file() or json.loads(record.read_text()) != metadata):
+        seed.unlink(missing_ok=True)
     if not seed.is_file():
         log('payload: marking Setup as done in a copy of the Data seed (mounts the seed read-write, no root needed)')
         for stale in out.glob('data-skip-setup-*'):
             stale.unlink()
         (ctx.tree / 'build').mkdir(exist_ok=True)
         run(['python3', ctx.tree / tool_path, base, seed, *tool_args], cwd=ctx.tree, log_file=ctx.logs / 'payload-skip-setup.log')
+        if metadata is not None:
+            record.write_text(json.dumps(metadata, indent=2) + '\n')
     return seed
 
 
 def build(ctx, kernel=None):
     log('payload')
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
     spec = ctx.board.get('payload')
     if not spec:
         raise Error('board.toml has no [payload]')
@@ -92,8 +162,7 @@ def build(ctx, kernel=None):
         raise Error(f'kernel not found: {kernel}; run "unixnu build kernel" or pass --kernel FILE')
     extra = list(getattr(args, 'kernel_arg', None) or [])
     # An extra NAME=VALUE replaces the board's argument of the same name.
-    names = {item.split('=', 1)[0] for item in extra}
-    arguments = [item for item in spec.get('kernel_args', []) if item.split('=', 1)[0] not in names] + extra
+    arguments = override_args(spec.get('kernel_args', []), extra)
     line = check_args(arguments)
     check_native_root(kernel, arguments)
     owner_trust = getattr(args, 'owner_trust_cache', None)
@@ -102,7 +171,7 @@ def build(ctx, kernel=None):
         allowed = spec.get('trust_cache_sha256')
         if not trust.is_file():
             raise Error(f'trust cache not found: {trust}')
-        if allowed and not owner_trust and sha256_file(trust) not in allowed:
+        if record_hashes and allowed and not owner_trust and sha256_file(trust) not in allowed:
             raise Error(f'{trust} is not one of the trust caches this board accepts (board.toml [payload] trust_cache_sha256)')
     data = expand(args.data_ramdisk) if getattr(args, 'data_ramdisk', None) else None
     if data and not data.is_file():
@@ -174,6 +243,7 @@ def build(ctx, kernel=None):
     config = (f'version = 1\n[boot]\ntimeout = {spec.get("timeout", 3)}\ndefault = "xnu"\n[kits]\nautoload = false\n{loader}'
               f'[[entry]]\nid = "xnu"\ntitle = "{spec.get("title", "UniXNU")}"\ntype = "xnu"\npath = "Payloads/kernel.macho"\n{initrd}'
               f'args = "{line}"\n')
+    config += extra_entries(spec, arguments, initrd)
     install = spec.get('install')
     if install:
         if not data:
@@ -189,6 +259,7 @@ def build(ctx, kernel=None):
     config += ('[[entry]]\nid = "reset"\ntitle = "Restart"\ntype = "action"\naction = "reset"\n'
                '[[entry]]\nid = "shutdown"\ntitle = "Power off"\ntype = "action"\naction = "shutdown"\n')
     (stage / 'EFI/UniXNU/unixnu.toml').write_text(config)
+    copy_payload_files(ctx, spec, stage)
     for path in [stage, *stage.rglob('*')]:
         os.utime(path, (EPOCH, EPOCH))
     size = int(spec.get('size_mib', 192))
@@ -196,11 +267,17 @@ def build(ctx, kernel=None):
     if content > size * 1024 * 1024 * 0.95:
         raise Error(f'the payload files take {content >> 20} MiB; raise size_mib (now {size}) in board.toml [payload]')
     write_volume(stage, image, spec.get('volume', 'UNIXNU')[:11], size)
-    data_report = {'kernel_sha256': sha256_file(kernel), 'payload_kernel_sha256': sha256_file(payloads / 'kernel.macho'),
-                   'adt_sha256': sha256_file(payloads / 'kernel.macho.adt'), 'kernel_args': line,
-                   'trust_cache_sha256': sha256_file(trust) if trust else None, 'gpu_addon_sha256': sha256_file(addon) if addon else None,
-                   'data_ramdisk_sha256': sha256_file(data) if data else None, 'skip_setup': bool(getattr(args, 'skip_setup', False)), 'panic_screen': bool(spec.get('panic_screen')),
-                   'payload_sha256': sha256_file(image), 'payload_bytes': image.stat().st_size, 'hardware_tested': False}
+    data_report = {'kernel_args': line, 'skip_setup': bool(getattr(args, 'skip_setup', False)),
+                   'panic_screen': bool(spec.get('panic_screen')),
+                   'payload_bytes': image.stat().st_size, 'hardware_tested': False}
+    if record_hashes:
+        data_report.update({'kernel_sha256': sha256_file(kernel),
+                            'payload_kernel_sha256': sha256_file(payloads / 'kernel.macho'),
+                            'adt_sha256': sha256_file(payloads / 'kernel.macho.adt'),
+                            'trust_cache_sha256': sha256_file(trust) if trust else None,
+                            'gpu_addon_sha256': sha256_file(addon) if addon else None,
+                            'data_ramdisk_sha256': sha256_file(data) if data else None,
+                            'payload_sha256': sha256_file(image)})
     report.write_text(json.dumps(data_report, indent=2) + '\n')
     shutil.rmtree(stage)
     log(f'payload: {image} ({image.stat().st_size >> 20} MiB)')

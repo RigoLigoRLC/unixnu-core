@@ -10,6 +10,7 @@ chip_id, board_id, and the components the steps use.
 import hashlib
 import io
 import json
+import os
 import plistlib
 import struct
 import subprocess
@@ -139,31 +140,36 @@ class Ipsw:
 
     def extract(self, component):
         """Extract a component into the cache (skipped when it is there and matches its pin); returns its path."""
+        record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
         name, size, _ = self.info(component)
         destination = self.cache / Path(name).name
         pin = self.config.get('sha256', {}).get(Path(name).name)
         record = destination.with_suffix(destination.suffix + '.json')
         if destination.is_file() and destination.stat().st_size == size:
-            if pin is None or (record.is_file() and json.loads(record.read_text()).get('sha256') == pin) or sha256_file(destination) == pin:
+            if not record_hashes or pin is None or (record.is_file() and json.loads(record.read_text()).get('sha256') == pin) or sha256_file(destination) == pin:
                 return destination
             destination.unlink()
         self.cache.mkdir(parents=True, exist_ok=True)
         partial = destination.with_suffix(destination.suffix + '.partial')
-        digest = hashlib.sha256()
+        digest = hashlib.sha256() if record_hashes else None
         log(f'ipsw: extracting {component} ({name}, {size >> 20} MiB)')
         with self.zip.open(name) as source, partial.open('wb') as target:
             while chunk := source.read(CHUNK):
                 target.write(chunk)
-                digest.update(chunk)
+                if digest is not None:
+                    digest.update(chunk)
         if partial.stat().st_size != size:
             partial.unlink()
             raise Error(f'incomplete extraction of {name}')
-        if pin and digest.hexdigest() != pin:
+        if digest is not None and pin and digest.hexdigest() != pin:
             partial.unlink()
             raise Error(f'{name} differs from the pinned sha256 of board.toml [ipsw.sha256]: {digest.hexdigest()}')
         partial.rename(destination)
-        record.write_text(json.dumps({'component': component, 'member': name, 'size': size, 'sha256': digest.hexdigest(),
-                                      'source': 'remote' if self.remote else 'local'}, indent=2) + '\n')
+        metadata = {'component': component, 'member': name, 'size': size,
+                    'source': 'remote' if self.remote else 'local'}
+        if digest is not None:
+            metadata['sha256'] = digest.hexdigest()
+        record.write_text(json.dumps(metadata, indent=2) + '\n')
         return destination
 
     def read(self, component):
@@ -197,10 +203,11 @@ def im4p_payload(data):
 
 def kernelcache(ctx, source):
     """The decompressed arm64 kernelcache Mach-O of the IPSW, in out/ipsw (checked against the board pin)."""
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
     spec = ctx.board.get('kernel', {}).get('prelink', {})
     out = source.cache / 'kernelcache.decompressed'
     pin = spec.get('kernelcache_sha256')
-    if out.is_file() and (pin is None or sha256_file(out) == pin):
+    if out.is_file() and (not record_hashes or pin is None or sha256_file(out) == pin):
         return out
     tool('compression_tool', 'macOS /usr/bin/compression_tool decodes the LZFSE kernelcache')
     source.cache.mkdir(parents=True, exist_ok=True)
@@ -224,7 +231,7 @@ def kernelcache(ctx, source):
     if fat[:4] != b'\xcf\xfa\xed\xfe':
         raise Error('the decompressed kernelcache is not a 64-bit Mach-O')
     out.write_bytes(fat)
-    if pin and sha256_file(out) != pin:
+    if record_hashes and pin and sha256_file(out) != pin:
         out.unlink()
         raise Error(f'the kernelcache of this IPSW does not match the pin of board.toml (sha256 {pin})')
     return out

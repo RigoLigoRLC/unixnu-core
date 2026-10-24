@@ -512,6 +512,7 @@ typedef struct {
   UINTN                           MenuWidth;
   UINTN                           FooterTop;
   UINTN                           VisibleRows;
+  UINTN                           FirstVisible;     ///< Entry index drawn in the first visible row.
   UINTN                           TextColumns;      ///< Text mode only.
   UINTN                           TextRows;
   CHAR16                          Info[96];         ///< Injection summary line.

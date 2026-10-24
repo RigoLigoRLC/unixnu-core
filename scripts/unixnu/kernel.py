@@ -81,7 +81,19 @@ def build(ctx, modules):
     env.update(version_env(modules))
     env['JOBS'] = str(ctx.jobs)
     record = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json'
-    if not record.is_file():
+    link_filelist = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/link.filelist'
+
+    def compile_inputs_missing():
+        if not record.is_file() or not link_filelist.is_file():
+            return True
+
+        for line in link_filelist.read_text().splitlines():
+            if line.strip() and not Path(line.strip()).is_file():
+                return True
+
+        return False
+
+    if compile_inputs_missing():
         # The archive builders and the boot progress layer read compile records of the XNU build, which only an earlier
         # pass leaves behind. A first build from scratch therefore runs one pass without them; XNU_BOOTSTRAP makes it
         # skip the archive checks and link without the archives, so it stops at the link and only the records are
@@ -91,10 +103,12 @@ def build(ctx, modules):
         try:
             run(['bash', script], cwd=ctx.tree, env=subprocess_env, log_file=ctx.logs / 'kernel-bootstrap.log')
         except Error:
-            if not record.is_file():
+            if compile_inputs_missing():
                 raise
     storage = ctx.tree / 'build/storage-abi/include/IOKit/storage'
-    if (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
+    needs_storage = any(ctx.need_config().get(name) for name in (
+        'XNU_NATIVE_UFS', 'XNU_NATIVE_VIRTIO_BLOCK', 'XNU_NATIVE_RAM_BLOCK'))
+    if needs_storage and (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
         log('kernel: prepare storage headers')
         run(['python3', ctx.tree / 'scripts/prepare-storage-headers.py'], cwd=ctx.tree, env=env,
             log_file=ctx.logs / 'storage-headers.log')
@@ -115,7 +129,8 @@ def prelink(ctx):
     if not cache.is_file():
         raise Error(f'kernelcache not found: {cache}')
     wanted = spec.get('kernelcache_sha256')
-    if wanted and sha256_file(cache) != wanted:
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
+    if record_hashes and wanted and sha256_file(cache) != wanted:
         raise Error(f'{cache} does not match the kernelcache this board was qualified against (sha256 {wanted})')
     kernel = ctx.tree / spec['kernel']
     if not kernel.is_file():
@@ -133,5 +148,8 @@ def prelink(ctx):
         command += ['--early-security-init', spec['early_security_init']]
     command += spec.get('extra_args', [])
     run(command, cwd=ctx.tree, log_file=ctx.logs / 'prelink.log')
-    log(f'kernel: {output} sha256 {sha256_file(output)}')
+    if record_hashes:
+        log(f'kernel: {output} sha256 {sha256_file(output)}')
+    else:
+        log(f'kernel: {output} ({output.stat().st_size} bytes)')
     return output
