@@ -203,8 +203,16 @@ def arm_io_window(hardware):
 
 
 STRINGS = {'compatible', 'device_type', 'reg-names', 'interrupt-names', 'clock-names', 'method'}
+STRINGS.add('native-adreno-reg-names')
 U32 = {'phandle', 'linux,phandle', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency',
        'native-ufs-stream-id', 'native-ufs-interrupt', 'cluster-type', 'die-cluster-id', 'cluster-core-id'}
+U32.update({
+    'native-adreno-chip-id', 'native-adreno-gmem-bytes', 'native-adreno-frequency-hz',
+    'native-adreno-highest-bank-bit', 'native-adreno-gpu-bank', 'native-adreno-gpu-asid',
+    'native-adreno-gpu-slot', 'native-adreno-gpu-sid', 'native-adreno-gpu-sid-mask',
+    'native-adreno-gmu-bank', 'native-adreno-gmu-asid', 'native-adreno-gmu-slot',
+    'native-adreno-gmu-sid', 'native-adreno-gmu-sid-mask',
+})
 U64 = {'redistributor-stride'}
 FLAGS = {'interrupt-controller', 'dma-coherent'}
 REFERENCES = {'interrupt-parent': None, 'iommus': '#iommu-cells', 'clocks': '#clock-cells'}
@@ -228,6 +236,12 @@ def hardware_properties(entry, handles, base=0):
             if len(cells) != 4:
                 raise Error(f'{entry.name}: {key} requires a physical u64 address and u64 size')
             properties.append((key, struct.pack('<QQ', number(cells[:2]), number(cells[2:]))))
+        elif key == 'native-adreno-platform-reg':
+            cells = entry.cells(key)
+            if not cells or len(cells) % 4:
+                raise Error(f'{entry.name}: {key} requires physical u64 address/size pairs')
+            values = [number(cells[index:index + 2]) for index in range(0, len(cells), 2)]
+            properties.append((key, struct.pack(f'<{len(values)}Q', *values)))
         elif key in FLAGS:
             if raw:
                 raise Error(f'{entry.name}: {key} is a flag')
