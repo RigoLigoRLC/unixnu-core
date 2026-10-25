@@ -20,6 +20,70 @@
 #define SCAN_SUSPEND  0x0102
 #endif
 
+// Samsung's T733 ButtonsDxe reports the power button as scan code 0x80.
+#define SCAN_SAMSUNG_POWER  0x0080
+
+// RecoveryPayloadDxe owns this NUL-terminated CHAR16[192] buffer.
+STATIC EFI_GUID  mRecoveryStatusGuid = {
+  0x71a8180b, 0xb15b, 0x470a, { 0x91, 0x88, 0x8c, 0xd4, 0xa8, 0x04, 0x44, 0x16 }
+};
+
+STATIC
+BOOLEAN
+IsConfirmKey (
+  IN CONST EFI_INPUT_KEY  *Key
+  )
+{
+  return (Key->UnicodeChar == CHAR_CARRIAGE_RETURN) ||
+         (Key->UnicodeChar == CHAR_LINEFEED) ||
+         (Key->UnicodeChar == L' ') ||
+         (Key->ScanCode == SCAN_RIGHT) ||
+         (Key->ScanCode == SCAN_SUSPEND) ||
+         ((Key->ScanCode == SCAN_SAMSUNG_POWER) && (Key->UnicodeChar == 0));
+}
+
+STATIC
+VOID
+DrawKeyValue (
+  IN UNIXNU_UI           *Ui,
+  IN CONST EFI_INPUT_KEY *Key
+  )
+{
+  CHAR16  Line[96];
+
+  UnicodeSPrint (
+    Line,
+    sizeof (Line),
+    L"Key scan=0x%04x char=0x%04x    Power/Enter: confirm",
+    (UINT32)Key->ScanCode,
+    (UINT32)Key->UnicodeChar
+    );
+  UniXNUUiDrawStatus (Ui, 1, Line);
+  UniXNULog ("menu: key scan=0x%04x char=0x%04x", (UINT32)Key->ScanCode, (UINT32)Key->UnicodeChar);
+}
+
+STATIC
+VOID
+DrawRecoveryStatus (
+  IN     UNIXNU_UI      *Ui,
+  IN OUT CHAR16         *Previous
+  )
+{
+  CHAR16  *Text;
+  CHAR16  Current[192];
+
+  if (EFI_ERROR (gBS->LocateProtocol (&mRecoveryStatusGuid, NULL, (VOID **)&Text))) {
+    StrCpyS (Current, ARRAY_SIZE (Current), L"Recovery status protocol not present");
+  } else {
+    StrnCpyS (Current, ARRAY_SIZE (Current), Text, ARRAY_SIZE (Current) - 1);
+  }
+
+  if (StrCmp (Previous, Current) != 0) {
+    StrCpyS (Previous, ARRAY_SIZE (Current), Current);
+    UniXNUUiDrawStatus (Ui, 2, Current);
+  }
+}
+
 //
 // Physical input = a SimpleTextIn instance that sits on a device path; the
 // ConSplitter's virtual handle has none.
@@ -83,6 +147,43 @@ DrawCountdown (
   UniXNUUiDrawStatus (Ui, 0, Line);
 }
 
+// The visible entry range follows selection; cards retain their entry numbers.
+STATIC
+VOID
+DrawSelection (
+  IN UNIXNU_UI      *Ui,
+  IN UNIXNU_CONFIG  *Config,
+  IN UINTN          Selected,
+  IN UINTN          Previous,
+  IN BOOLEAN        Redraw
+  )
+{
+  UINTN  First;
+  UINTN  Index;
+
+  if (Ui->VisibleRows == 0) {
+    return;
+  }
+
+  First = Ui->FirstVisible;
+  if (Selected < First) {
+    First = Selected;
+  } else if (Selected - First >= Ui->VisibleRows) {
+    First = Selected - Ui->VisibleRows + 1;
+  }
+
+  First = MIN (First, Config->EntryCount - Ui->VisibleRows);
+  if (Redraw || (First != Ui->FirstVisible)) {
+    Ui->FirstVisible = First;
+    for (Index = First; Index < First + Ui->VisibleRows; Index++) {
+      UniXNUUiDrawEntry (Ui, Config, Index, Index == Selected);
+    }
+  } else {
+    UniXNUUiDrawEntry (Ui, Config, Previous, FALSE);
+    UniXNUUiDrawEntry (Ui, Config, Selected, TRUE);
+  }
+}
+
 UINTN
 UniXNUMenuRun (
   IN UNIXNU_UI      *Ui,
@@ -98,7 +199,6 @@ UniXNUMenuRun (
   EFI_INPUT_KEY  Key;
   UINTN          Selected;
   UINTN          Previous;
-  UINTN          Index;
   BOOLEAN        HasInput;
   BOOLEAN        UserActive;
   INTN           RemainingMs;
@@ -106,10 +206,14 @@ UniXNUMenuRun (
   UINTN          RotateAccum;
   INTN           LastShownSecond;
   UINTN          Count;
+  BOOLEAN        Builtin;
+  CHAR16         RecoveryStatus[192];
 
   Count    = Config->EntryCount;
   Selected = Config->DefaultIndex;
   HasInput = (CountInputDevices () > 0);
+  Builtin  = (Config->SourceLabel != NULL) && (StrCmp (Config->SourceLabel, L"built-in configuration") == 0);
+  RecoveryStatus[0] = L'\0';
 
   if (!Countdown) {
     RemainingMs = HasInput ? -1 : (INTN)Config->FallbackTimeout * 1000;
@@ -125,18 +229,20 @@ UniXNUMenuRun (
   }
 
   UniXNUUiDrawFrame (Ui, Config);
-  for (Index = 0; Index < Count; Index++) {
-    UniXNUUiDrawEntry (Ui, Config, Index, Index == Selected);
-  }
+  DrawSelection (Ui, Config, Selected, Selected, TRUE);
 
   UniXNUUiDrawStatus (
     Ui,
     1,
-    HasInput ? L"Up/Down: select    Enter: boot    1-9: boot entry    Esc: stop timer"
+    HasInput ? L"Up/Down: select    Power/Enter: boot    1-9: boot entry"
              : L"No input device: the default entry boots when the timer ends"
     );
   if (Ui->Notice[0] != L'\0') {
     UniXNUUiDrawStatus (Ui, 2, Ui->Notice);
+  }
+
+  if (Builtin) {
+    DrawRecoveryStatus (Ui, RecoveryStatus);
   }
 
   UniXNULog (
@@ -185,6 +291,10 @@ UniXNUMenuRun (
 
     Previous = Selected;
     if (Signaled == 0) {
+      if (Builtin) {
+        DrawRecoveryStatus (Ui, RecoveryStatus);
+      }
+
       if (RemainingMs > 0) {
         RemainingMs -= TICK_MS;
         if (RemainingMs <= 0) {
@@ -205,6 +315,8 @@ UniXNUMenuRun (
       if (EFI_ERROR (gST->ConIn->ReadKeyStroke (gST->ConIn, &Key))) {
         continue;
       }
+
+      DrawKeyValue (Ui, &Key);
 
       if (!UserActive) {
         //
@@ -228,17 +340,14 @@ UniXNUMenuRun (
         Selected = Key.UnicodeChar - L'1';
         UniXNULog ("menu: key %c, booting %u", Key.UnicodeChar, (UINT32)Selected);
         break;
-      } else if ((Key.UnicodeChar == CHAR_CARRIAGE_RETURN) || (Key.UnicodeChar == CHAR_LINEFEED) ||
-                 (Key.UnicodeChar == L' ') || (Key.ScanCode == SCAN_RIGHT) || (Key.ScanCode == SCAN_SUSPEND))
-      {
+      } else if (IsConfirmKey (&Key)) {
         UniXNULog ("menu: enter, booting %u", (UINT32)Selected);
         break;
       }
     }
 
     if (Selected != Previous) {
-      UniXNUUiDrawEntry (Ui, Config, Previous, FALSE);
-      UniXNUUiDrawEntry (Ui, Config, Selected, TRUE);
+      DrawSelection (Ui, Config, Selected, Previous, FALSE);
     }
   }
 
@@ -453,6 +562,8 @@ UniXNUMenuConfirm (
       continue;
     }
 
+    DrawKeyValue (Ui, &Key);
+
     if (Items > 0) {
       if (Key.ScanCode == SCAN_UP) {
         Shown = (Shown + Items - 1) % Items;
@@ -465,7 +576,7 @@ UniXNUMenuConfirm (
       }
     }
 
-    if ((Key.UnicodeChar == CHAR_CARRIAGE_RETURN) || (Key.UnicodeChar == CHAR_LINEFEED)) {
+    if (IsConfirmKey (&Key)) {
       if (Items > 0) {
         if (Shown + 1 == Items) {
           return FALSE;

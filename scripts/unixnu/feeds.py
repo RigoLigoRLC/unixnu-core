@@ -191,6 +191,10 @@ def resolve(ctx):
                     add('package', 'main' if base == ctx.root else 'device', base / 'package', label)
                 continue
             for name in _children(base / folder):
+                # SoC XNU patches are selected by series paths; the assembled
+                # patches/xnu module supplies the common ARM64 patch files.
+                if ctx.schema_version == 2 and label == 'soc' and kind == 'patch' and name == 'xnu':
+                    continue
                 add(kind, name, base / folder / name, label)
     # 7: git sources
     for (kind, name), entry in sources.items():

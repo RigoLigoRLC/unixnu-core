@@ -168,20 +168,34 @@ def build(ctx, modules):
         env['UNIXNU_GENERATED_DIR'] = str(generated)
     env['JOBS'] = str(ctx.jobs)
     record = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/osfmk/DEVELOPMENT/startup.o.json'
-    if not record.is_file():
-        # The archive builders and the boot progress layer read compile records of the XNU build, which only an earlier
-        # pass leaves behind. A first build from scratch therefore runs one pass without them; XNU_BOOTSTRAP makes it
-        # skip the archive checks and link without the archives, so it stops at the link and only the records are
-        # required of it.
-        log('kernel: bootstrap pass for the compile records')
-        subprocess_env = {**env, 'XNU_BOOT_PROGRESS': '0', 'XNU_BOOTSTRAP': '1'}
-        try:
-            run(['bash', script], cwd=ctx.tree, env=subprocess_env, log_file=ctx.logs / 'kernel-bootstrap.log')
-        except Error:
-            if not record.is_file():
-                raise
+    link_filelist = ctx.tree / 'build/xnu/ios-obj/DEVELOPMENT_ARM64_BCM2837/link.filelist'
+
+    def compile_inputs_missing():
+        if not record.is_file() or not link_filelist.is_file():
+            return True
+
+        for line in link_filelist.read_text().splitlines():
+            if line.strip() and not Path(line.strip()).is_file():
+                return True
+
+        return False
+
+    # The baseline prepares patched sources and headers before archive builders
+    # consume its compile records and link.filelist.
+    log('kernel: bootstrap pass for source, headers and compile records')
+    subprocess_env = {**env, 'XNU_BOOT_PROGRESS': '0', 'XNU_BOOTSTRAP': '1'}
+    record.unlink(missing_ok=True)
+    record.with_suffix('').unlink(missing_ok=True)
+    link_filelist.unlink(missing_ok=True)
+    try:
+        run(['bash', script], cwd=ctx.tree, env=subprocess_env, log_file=ctx.logs / 'kernel-bootstrap.log')
+    except Error:
+        if compile_inputs_missing():
+            raise
     storage = ctx.tree / 'build/storage-abi/include/IOKit/storage'
-    if (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
+    needs_storage = any(ctx.need_config().get(name) for name in (
+        'XNU_NATIVE_UFS', 'XNU_NATIVE_VIRTIO_BLOCK', 'XNU_NATIVE_RAM_BLOCK'))
+    if needs_storage and (ctx.tree / 'refer/IOStorageFamily').is_dir() and not storage.is_dir():
         log('kernel: prepare storage headers')
         run(['python3', ctx.tree / 'scripts/prepare-storage-headers.py'], cwd=ctx.tree, env=env,
             log_file=ctx.logs / 'storage-headers.log')
@@ -202,7 +216,8 @@ def prelink(ctx):
     if not cache.is_file():
         raise Error(f'kernelcache not found: {cache}')
     wanted = spec.get('kernelcache_sha256')
-    if wanted and sha256_file(cache) != wanted:
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
+    if record_hashes and wanted and sha256_file(cache) != wanted:
         raise Error(f'{cache} does not match the kernelcache this board was qualified against (sha256 {wanted})')
     kernel = ctx.tree / spec['kernel']
     if not kernel.is_file():
@@ -220,5 +235,8 @@ def prelink(ctx):
         command += ['--early-security-init', spec['early_security_init']]
     command += spec.get('extra_args', [])
     run(command, cwd=ctx.tree, log_file=ctx.logs / 'prelink.log')
-    log(f'kernel: {output} sha256 {sha256_file(output)}')
+    if record_hashes:
+        log(f'kernel: {output} sha256 {sha256_file(output)}')
+    else:
+        log(f'kernel: {output} ({output.stat().st_size} bytes)')
     return output

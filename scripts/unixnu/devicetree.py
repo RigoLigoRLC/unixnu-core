@@ -203,7 +203,8 @@ def arm_io_window(hardware):
 
 
 STRINGS = {'compatible', 'device_type', 'reg-names', 'interrupt-names', 'clock-names', 'method'}
-U32 = {'phandle', 'linux,phandle', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency'}
+U32 = {'phandle', 'linux,phandle', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency',
+       'native-ufs-stream-id', 'native-ufs-interrupt', 'cluster-type', 'die-cluster-id', 'cluster-core-id'}
 U64 = {'redistributor-stride'}
 FLAGS = {'interrupt-controller', 'dma-coherent'}
 REFERENCES = {'interrupt-parent': None, 'iommus': '#iommu-cells', 'clocks': '#clock-cells'}
@@ -222,6 +223,11 @@ def hardware_properties(entry, handles, base=0):
             if len(cells) not in (1, 2):
                 raise Error(f'{entry.name}: {key} requires one or two cells')
             properties.append((key, struct.pack('<Q', number(cells))))
+        elif key == 'native-ufs-smmu-reg':
+            cells = entry.cells(key)
+            if len(cells) != 4:
+                raise Error(f'{entry.name}: {key} requires a physical u64 address and u64 size')
+            properties.append((key, struct.pack('<QQ', number(cells[:2]), number(cells[2:]))))
         elif key in FLAGS:
             if raw:
                 raise Error(f'{entry.name}: {key} is a flag')
@@ -303,10 +309,14 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
     elif options.get('unique_chip_id') == 'required':
         raise Error('Pass --unique-chip-id HEX for this board')
     if options.get('owned_memory_size'):
-        size = int(str(options['owned_memory_size']), 0)
-        if not 0x10000000 <= size <= 0x200000000 or size % 0x200000:
-            raise Error('Owned memory must be 256 MiB to 8 GiB in 2 MiB steps')
-        chosen.append(('darwinboot-memory-size', struct.pack('<Q', size)))
+        if options['owned_memory_size'] == 'auto':
+            maximum = min(dram_size, 0x200000000) & ~0x1fffff
+            chosen.append(('darwinboot-memory-range', struct.pack('<QQ', 0x40000000, maximum)))
+        else:
+            size = int(str(options['owned_memory_size']), 0)
+            if not 0x10000000 <= size <= 0x200000000 or size % 0x200000:
+                raise Error('Owned memory must be 256 MiB to 8 GiB in 2 MiB steps')
+            chosen.append(('darwinboot-memory-size', struct.pack('<Q', size)))
     if options.get('root_match_volume_uuid'):
         volume = str(uuid.UUID(options['root_match_volume_uuid'])).upper()
         chosen.append(('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
@@ -336,7 +346,9 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
         cpu_nodes.append(node(f'cpu{len(cpu_nodes)}', [('reg', struct.pack('<I', values[0][0])),
                          ('state', b'running\0' if not cpu_nodes else b'waiting\0'), ('device_type', b'cpu\0'),
                          ('compatible', entry.properties['compatible']),
-                         ('timebase-frequency', struct.pack('<I', cpus.scalar('timebase-frequency')))]))
+                         ('timebase-frequency', struct.pack('<I', cpus.scalar('timebase-frequency'))),
+                         *[(key, struct.pack('<I', entry.scalar(key))) for key in
+                           ('cluster-type', 'die-cluster-id', 'cluster-core-id') if key in entry.properties]]))
     if not cpu_nodes:
         raise Error('Hardware DTS requires an enabled boot CPU')
     children.append(node('cpus', children=cpu_nodes))

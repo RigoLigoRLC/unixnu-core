@@ -516,6 +516,7 @@ typedef struct {
   UINTN                           ContentTop;       ///< Top of the plugin content region.
   UINTN                           ContentBottom;    ///< Bottom of the plugin content region.
   UINTN                           VisibleRows;
+  UINTN                           FirstVisible;     ///< Entry index drawn in the first visible row.
   UINTN                           TextColumns;      ///< Text mode only.
   UINTN                           TextRows;
   CHAR16                          Info[96];         ///< Injection summary line.
