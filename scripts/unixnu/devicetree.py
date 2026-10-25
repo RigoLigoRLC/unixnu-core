@@ -204,7 +204,7 @@ def arm_io_window(hardware):
 
 STRINGS = {'compatible', 'device_type', 'reg-names', 'interrupt-names', 'clock-names', 'method'}
 STRINGS.add('native-adreno-reg-names')
-U32 = {'phandle', 'linux,phandle', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency',
+U32 = {'phandle', 'linux,phandle', '#address-cells', '#size-cells', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency',
        'native-ufs-stream-id', 'native-ufs-interrupt', 'cluster-type', 'die-cluster-id', 'cluster-core-id'}
 U32.update({
     'native-adreno-chip-id', 'native-adreno-gmem-bytes', 'native-adreno-frequency-hz',
@@ -220,6 +220,9 @@ REFERENCES = {'interrupt-parent': None, 'iommus': '#iommu-cells', 'clocks': '#cl
 
 def hardware_properties(entry, handles, base=0):
     properties = []
+    handle = entry.properties.get('phandle', entry.properties.get('linux,phandle'))
+    if handle is not None:
+        properties.append(('AAPL,phandle', struct.pack('<I', number(struct.unpack('>I', handle)))))
     for key, raw in entry.properties.items():
         if key in STRINGS:
             entry.strings(key)
