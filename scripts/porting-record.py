@@ -116,7 +116,7 @@ def validate(record, board, label, component_catalog=None):
     return record
 
 
-def check(device, base=None):
+def check(device, base=None, soc=None):
     record = tomllib.loads((device / 'porting.toml').read_text())
     board = tomllib.loads((device / 'board.toml').read_text())
     sources = [ROOT / 'components.toml', ROOT / 'profiles/arch/arm64/components.toml']
@@ -128,10 +128,12 @@ def check(device, base=None):
             if entry.get('kind') != 'soc' or entry.get('name') != board.get('board', {}).get('soc_source'):
                 continue
             if entry.get('local'):
-                soc = Path(os.path.expandvars(entry['local'])).expanduser()
-                if not soc.is_absolute():
-                    soc = device / soc
-                sources.append(soc / 'components.toml')
+                local_soc = Path(os.path.expandvars(entry['local'])).expanduser()
+                if not local_soc.is_absolute():
+                    local_soc = device / local_soc
+                sources.append(local_soc / 'components.toml')
+    if soc is not None:
+        sources.append(soc / 'components.toml')
     profile = board.get('board', {}).get('os_profile')
     if profile:
         sources.append(ROOT / 'profiles/os' / profile / 'components.toml')
@@ -227,12 +229,13 @@ def main():
     check_parser = commands.add_parser('check')
     check_parser.add_argument('--device', type=Path, required=True)
     check_parser.add_argument('--base', help='compare code changes with this Git revision')
+    check_parser.add_argument('--soc', type=Path, help='SoC source directory whose components.toml is included')
     site_parser = commands.add_parser('site')
     site_parser.add_argument('--local', action='append', default=[], metavar='DEVICE=PATH')
     args = parser.parse_args()
     try:
         if args.command == 'check':
-            check(args.device, args.base)
+            check(args.device, args.base, args.soc)
         else:
             site(args.local)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
