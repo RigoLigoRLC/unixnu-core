@@ -149,6 +149,8 @@ class Context:
             configurations = state.get('configurations', {})
             selected = (getattr(args, 'name', None) if args.command == 'defconfig' else None)
             selected = selected or configurations.get(str(self.device)) or self.board.get('kernel', {}).get('defconfig')
+            if selected and Path(selected).is_absolute():
+                selected = Path(selected).name
             if not selected or Path(selected).name != selected or selected in ('.', '..'):
                 raise Error('schema_version = 2 needs [kernel] defconfig or a selected defconfig')
             self.config_name = selected
