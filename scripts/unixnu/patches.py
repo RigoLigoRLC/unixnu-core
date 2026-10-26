@@ -75,6 +75,8 @@ def prepare(ctx, modules):
             except Error as error:
                 shutil.rmtree(work)
                 raise Error(f'XNU patch {path}: {error}') from error
+        # A fresh clone lacks the public headers newer xnu omits (TrustCache among them); archives compile against it before the kernel build.
+        run(['python3', ctx.tree / 'scripts/prepare-xnu-source.py'], cwd=ctx.tree)
         stamp.write_text(json.dumps(signature, indent=2) + '\n')
     selection = json.dumps(signature, indent=2) + '\n'
     (ctx.work / 'xnu-inputs.json').write_text(selection)

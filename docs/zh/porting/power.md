@@ -47,9 +47,9 @@ Qualcomm AudioReach/GPR 固件按执行顺序参考以下源码：
 
 | 源码 | 用途 |
 | --- | --- |
-| [ShengGpr.h](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/package/ShengGpr.h)、[ShengAudioReach.h](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/package/ShengAudioReach.h) | 包头、APM 就绪查询、graph 打开与配置、内存映射、PRM 投票和时钟 |
-| [AudioProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/package/AudioProbe.cpp)、[ShengCs35l43.c](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/package/ShengCs35l43.c) | 通过 I2C 配置功放、graph 启动、周期缓冲区流程、codec SoundWire 启动 |
-| [ShengAudioService.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/package/ShengAudioService.cpp)、[ShengAudioPlugIn.c](https://github.com/UniXNU/UniXNU-sheng/blob/a516f43fc1901e0a3a4fede4f4b61dae0abcfe4a/hal/ShengAudioPlugIn.c) | 供系统音频服务使用的音频服务及其插件 |
+| [ShengGpr.h](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/ShengGpr.h)、[ShengAudioReach.h](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/ShengAudioReach.h) | 包头、APM 就绪查询、graph 打开与配置、内存映射、PRM 投票和时钟 |
+| [AudioProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/AudioProbe.cpp)、[ShengCs35l43.c](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/ShengCs35l43.c) | 通过 I2C 配置功放、graph 启动、周期缓冲区流程、codec SoundWire 启动、麦克风采集 |
+| [ShengAudioService.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/ShengAudioService.cpp)、[ShengAudioPlugIn.c](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/hal/ShengAudioPlugIn.c) | 供系统音频服务使用的音频服务及其插件 |
 | [Linux q6apm.h](https://github.com/torvalds/linux/blob/v6.12/sound/soc/qcom/qdsp6/q6apm.h)、[q6apm.c](https://github.com/torvalds/linux/blob/v6.12/sound/soc/qcom/qdsp6/q6apm.c) | 图生命周期、内存映射和读写请求 |
 | [Linux audioreach.c](https://github.com/torvalds/linux/blob/v6.12/sound/soc/qcom/qdsp6/audioreach.c)、[topology.c](https://github.com/torvalds/linux/blob/v6.12/sound/soc/qcom/qdsp6/topology.c) | 模块配置、图连接、媒体格式和端点参数 |
 | [Linux q6apm-dai.c](https://github.com/torvalds/linux/blob/v6.12/sound/soc/qcom/qdsp6/q6apm-dai.c) | `q6apm_dai_prepare`、流事件和周期缓冲区数据流 |
@@ -79,9 +79,39 @@ Linux 提供协议和流生命周期参考。使用选定 XNU 的接口实现其
 - DSP 先提供小的 GLINK intent，请求后再给大的。远端 intent 表满时也要保留新给的 intent。
 - PRM 请求从 PRM 自己的端口发出，使用 PRM 时钟 ID；TX core 时钟是 `0x30c`，不是设备树里的编号。
 - VA macro 和 TX macro 都要打开 TX SoundWire master 的时钟门控。
+- CoreAudio 假定 host clock 为 24 MHz。时基为 19.2 MHz 时，音频服务在启动时修正 CoreAudio 的这个常量，否则音频服务器的 IO 周期会长 25%，播放和录音都会卡顿。
 
 **结果：** 一条完整路由传输 PCM 数据、报告进度并释放资源。
 保存路由描述、格式、流计数和采集结果。下一端点使用自己的路由配置和观察记录。
+
+### 麦克风采集 {#microphone}
+
+采集路由在上面的流步骤之外，还需要 codec 和 SoundWire 链路。
+
+1. **给 codec 上电。** 释放复位并打开供电。投票 TX 和 VA macro 时钟，再打开两者的
+   门控：SM8550 上 VA macro 也门控 TX SoundWire master。
+2. **建立 SoundWire 链路。** 启动 TX master，等待 codec 枚举。配置前先读取厂商和器件 ID。
+3. **配置模拟通路。** 选择麦克风输入、偏置和 ADC，设置 ADC 增益，再把 ADC 映射到
+   codec 数据端口和通道。
+4. **配置数字通路。** 把 master 端口接到读取它的 TX decimator，再把 decimator 接到
+   DSP graph 使用的 codec DMA 接口。
+5. **读取缓冲区。** 通过读请求排队采集缓冲区。每个应答带有字节数和偏移，只取这些
+   字节；周期不满是正常的。
+6. **发布输入。** 直接采集已知声音成功后，再发布输入流。
+
+sheng 的路由，见 [AudioProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/main/package/AudioProbe.cpp)：
+
+| 阶段 | sheng 取值 |
+| --- | --- |
+| Codec | WCD938x，复位 gpio108，供电 ldob15，TX master（0x6d30000）上的 SoundWire 设备 1 |
+| 模拟 | AMIC3、micbias 3、ADC2 |
+| 链路 | codec 数据端口 1 通道 2 到 master 端口 2 |
+| 数字 | TX decimator 0 读取 SWR_MIC1，codec DMA TX3 |
+| 格式 | 单声道，48 kHz |
+| iOS | HAL 插件的输入端口；iOS 只在 Thunderbolt 传输类型下接受它 |
+
+用 `sheng-audio=4` 检查采集，它在启动时读取两秒：`[mic]` 和 `[mic capture]` 日志行
+给出返回的周期、字节数、非零样本比例和峰值。随后在应用中录音并读取 `[audio-io]`。
 
 ## 4. 实现电池状态上报 {#battery}
 
@@ -114,14 +144,23 @@ Linux 提供协议和流生命周期参考。使用选定 XNU 的接口实现其
 
 ## 5. 实现调频与电源操作 {#power}
 
-阅读 [CpuFreqProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/516a780473a2ac59c8b438e132bb60204dda9e22/package/CpuFreqProbe.cpp) 的 EPSS LUT 和 CPU/L3 工作点访问、[QcomRpmh.h](https://github.com/UniXNU/UniXNU-sheng/blob/516a780473a2ac59c8b438e132bb60204dda9e22/package/QcomRpmh.h) 的资源投票，
+阅读 [CpuFreqProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/CpuFreqProbe.cpp) 的 EPSS LUT 和 CPU/L3 工作点访问、[QcomRpmh.h](https://github.com/UniXNU/UniXNU-sheng/blob/516a780473a2ac59c8b438e132bb60204dda9e22/package/QcomRpmh.h) 的资源投票，
 以及 [ShengPlatformPower.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/516a780473a2ac59c8b438e132bb60204dda9e22/package/ShengPlatformPower.cpp) 的 OS 平台电源集成。这些实现供对应 Qualcomm 硬件接口参考。
+[GpuPowerProbe.cpp](https://github.com/UniXNU/UniXNU-sheng/blob/552b67499135bae191f415f444d782a6942c252e/package/GpuPowerProbe.cpp) 包含 GPU 调频。
 
 1. 将 CPU affinity 映射到性能域。读取目标 LUT、参考时钟和使能状态，按该控制器编码换算频率。
 2. 实现工作点请求和状态回读，按规定顺序执行目标稳压器、互连和温控要求。
 3. 为外设电源投票明确所有权和引用计数。停止依赖的 DMA 和中断后再释放资源。
 4. 接入选定 OS 电源回调。休眠/唤醒时保存所需状态，恢复时钟与映射、重新使能中断，再恢复消费者。
 5. 在负载下测量频率，然后在依赖驱动运行时逐项验证外设转换和恢复。
+
+SM8550 上的调频输入：
+
+- CPU：每 16 ms 读取调度器记录的各 CPU 空闲时间。频域跟随其中最忙的 CPU，留 1.25 倍余量，连续四个较闲的窗口后才降频。
+- GPU：读取 GMU XO 忙碌计数器，按让 GPU 约一半时间忙碌的档位通过 HFI 投票，同时投该档位的带宽。
+- 触摸：收到触摸报告后，P 频域和 GPU 保持最高档，直到最后一次报告后 1 s（`sheng-cpufreq-boost-ms`、`sheng-gpu-dcvs-boost-ms`）。
+- 帧：最近 4 个窗口中有 2 个有 GPU 提交时，所有 CPU 频域在 300 ms 内不低于各自最高档的 60%。GPU 从空闲降频后恢复工作时，50 ms 内以当前频率的两倍运行，至少 578 MHz。
+- fence 等待：等待者睡眠到 fence 中断为止，最长 1 ms（`sheng-gpu-pause-us`），不再轮询。
 
 **结果：** 频率请求和电源转换产生可观察效果，并保持依赖设备正常运行。
 

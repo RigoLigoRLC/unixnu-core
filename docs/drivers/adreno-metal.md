@@ -15,8 +15,18 @@ the kernel GPU interface.
 | Verified device | sheng |
 | Runtime plugin | `NativeAdrenoMetal` |
 
-sheng runs the GPU-composited desktop. UI shader variants compile on first use
-and exported pipeline caches are reused across boots.
+sheng runs the GPU-composited desktop. Exported pipeline caches are reused across
+boots. The render server primes every Metal library of the OS image while the
+desktop is idle: the payload carries the list (`NativeAdrenoMetal.primelist`) and
+a copy of the cryptex QuartzCore library, which the render server's sandbox
+cannot reach. The idle desktop submits about 6 command buffers per 250 ms at
+120 Hz, so priming waits only above 8. The PR log row shows its progress; all
+162 libraries are primed on sheng. With the list present the render server does
+not scan directories, and each library is read only while the display is quiet.
+
+A render pass that cannot be encoded still returns an encoder, and its command
+buffer is refused: RenderBox caches encoder methods and cannot take nil. The first problem of each process is written to the driver's
+per-process text line from the thread that hit it.
 
 ```sh
 python3 scripts/build-turnip-darwin.py --target ios
