@@ -238,10 +238,10 @@ index ab27798..00146a7 100644
     return VK_ERROR_INCOMPATIBLE_DRIVER;
  #endif
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 4c2bf6a..192ef28 100644
+index 4c2bf6a..0b840b4 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
-@@ -58,6 +58,19 @@ struct tu_bo {
+@@ -58,6 +58,21 @@ struct tu_bo {
     int shared_fd;
  #endif
  
@@ -256,12 +256,14 @@ index 4c2bf6a..192ef28 100644
 +   bool darwin_cacheable;
 +   /* A retained CPU map may be moved by the new owner's first placed map. */
 +   bool darwin_reused_map;
++   /* The allocation purpose remains available when Mesa's BO debug table is disabled. */
++   char darwin_profile_name[32];
 +#endif
 +
     bool implicit_sync : 1;
     bool never_unmap : 1;
     bool cached_non_coherent : 1;
-@@ -140,6 +153,9 @@ struct tu_knl {
+@@ -140,6 +155,9 @@ struct tu_knl {
                         const char *name);
     VkResult (*bo_init_dmabuf)(struct tu_device *dev, struct tu_bo **out_bo,
                                uint64_t size, enum tu_bo_alloc_flags flags, int prime_fd);
@@ -271,7 +273,7 @@ index 4c2bf6a..192ef28 100644
     int (*bo_export_dmabuf)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_alloc_lazy)(struct tu_device *dev, struct tu_bo *bo);
     VkResult (*bo_map)(struct tu_device *dev, struct tu_bo *bo, void *placed_addr);
-@@ -221,6 +237,9 @@ tu_bo_init_dmabuf(struct tu_device *dev,
+@@ -221,6 +239,9 @@ tu_bo_init_dmabuf(struct tu_device *dev,
  int
  tu_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo);
  
@@ -281,7 +283,7 @@ index 4c2bf6a..192ef28 100644
  void
  tu_bo_finish(struct tu_device *dev, struct tu_bo *bo);
  
-@@ -262,6 +281,7 @@ void tu_sparse_vma_finish(struct tu_device *device,
+@@ -262,6 +283,7 @@ void tu_sparse_vma_finish(struct tu_device *device,
                            struct tu_sparse_vma *vma);
  
  VkResult tu_knl_kgsl_load(struct tu_instance *instance, int fd);
@@ -291,10 +293,10 @@ index 4c2bf6a..192ef28 100644
  VkResult tu_knl_drm_msm_load(struct tu_instance *instance,
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
 new file mode 100644
-index 0000000..006c40f
+index 0000000..61b7968
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -0,0 +1,1360 @@
+@@ -0,0 +1,1805 @@
 +/*
 + * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
 + * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
@@ -346,6 +348,7 @@ index 0000000..006c40f
 +   bool tunnel;
 +   uint32_t selector;
 +   uint32_t last_fence;
++   uint64_t next_profile_device;
 +   NativeAdrenoAbiDeviceInfo info;
 +   NativeAdrenoAbiParams params;
 +} dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
@@ -368,6 +371,7 @@ index 0000000..006c40f
 +   VkMemoryPropertyFlags mem_property;
 +   uint64_t alignment;
 +   bool cacheable;
++   char name[32];
 +};
 +
 +/* darwin_retire_state retains unfinished BOs and completed private BOs. Its
@@ -384,6 +388,18 @@ index 0000000..006c40f
 +   VkResult failure;
 +   uint64_t enqueued, reaped, pressure_waits;
 +   uint64_t cache_bytes, cache_peak_bytes, cache_hits, cache_misses, cache_evictions;
++   uint64_t pending_bytes;
++   NativeAdrenoAbiBoCacheCounters profile;
++   NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
++   NativeAdrenoAbiBoCacheBin usages[NativeAdrenoBoProfileUsageCount];
++   NativeAdrenoAbiBoProfile slow[NativeAdrenoBoProfileSlowCount];
++   pthread_t reporter;
++   pthread_cond_t report_wake;
++   bool reporter_started, reporter_stop;
++   uint64_t profile_device;
++   io_connect_t profile_connection;
++   bool profile_tunnel;
++   uint32_t profile_selector;
 +};
 +
 +static kern_return_t
@@ -403,6 +419,190 @@ index 0000000..006c40f
 +      memcpy(buffer + sizeof(header), in, in_size);
 +   return IOConnectCallStructMethod(dw.conn, dw.selector, buffer, sizeof(header) + in_size, out_size ? out : NULL,
 +                                    out_size ? &out_bytes : NULL);
++}
++
++static void
++darwin_profile_name(char *target, size_t capacity, const char *name)
++{
++   snprintf(target, capacity, "%s", name ? name : "unnamed");
++}
++
++static unsigned
++darwin_profile_size_bin(uint64_t bytes)
++{
++   unsigned index = 0;
++   uint64_t upper = 4096;
++   while (index + 1 < NativeAdrenoBoProfileSizeCount && bytes > upper) {
++      ++index;
++      upper <<= 1;
++   }
++   return index;
++}
++
++static unsigned
++darwin_profile_usage_bin(struct darwin_retire_state *retire, const char *name)
++{
++   char key[32] = {};
++   darwin_profile_name(key, sizeof(key), name);
++   for (unsigned i = 0; i + 1 < NativeAdrenoBoProfileUsageCount; ++i) {
++      if (!retire->usages[i].requests || !strcmp(retire->usages[i].name, key)) {
++         memcpy(retire->usages[i].name, key, sizeof(key));
++         return i;
++      }
++   }
++   return NativeAdrenoBoProfileUsageCount - 1;
++}
++
++/* The slow-event record captures the complete allocation or release call.
++ * Its fence is the connection's conservative retirement fence, not a measured
++ * last use of this BO. The caller holds retire->lock while appending a record. */
++static void
++darwin_profile_slow_locked(struct darwin_retire_state *retire, uint64_t began,
++                          NativeAdrenoAbiBoSlowEvent event, VkResult result)
++{
++   const uint64_t ended = os_time_get_nano() / 1000;
++   if (ended < began || ended - began < 8000) {
++      return;
++   }
++
++   const uint64_t sequence = ++retire->profile.slow_total;
++   if (sequence > NativeAdrenoBoProfileSlowCount) {
++      ++retire->profile.slow_overwritten;
++   }
++   event.elapsed_us = ended - began;
++   event.cached_objects = retire->cache_count;
++   event.cached_bytes = retire->cache_bytes;
++   event.pending_objects = retire->count;
++   event.pending_bytes = retire->pending_bytes;
++   event.status = (uint32_t)result;
++   NativeAdrenoAbiBoProfile *record = &retire->slow[(sequence - 1) % NativeAdrenoBoProfileSlowCount];
++   *record = {};
++   record->version = NativeAdrenoBoProfileVersion;
++   record->kind = NativeAdrenoBoProfileSlow;
++   record->index = (sequence - 1) % NativeAdrenoBoProfileSlowCount;
++   record->sequence = sequence;
++   record->sampled_us = ended;
++   record->device_id = retire->profile_device;
++   record->data.slow = event;
++}
++
++static NativeAdrenoAbiBoSlowEvent
++darwin_profile_bo_event(const struct darwin_retired_bo *bo, unsigned operation)
++{
++   NativeAdrenoAbiBoSlowEvent event = {};
++   event.operation = operation;
++   event.bytes = bo->size;
++   event.alignment = bo->alignment;
++   event.handle = bo->handle;
++   event.iova = bo->iova;
++   event.alloc_flags = bo->alloc_flags;
++   event.memory_property = bo->mem_property;
++   event.connection_fence = bo->fence;
++   event.cache_reason = NativeAdrenoBoCacheNotRequested;
++   memcpy(event.name, bo->name, sizeof(event.name));
++   return event;
++}
++
++static kern_return_t
++darwin_send_profile(const struct darwin_retire_state *retire, const NativeAdrenoAbiBoProfile *record)
++{
++   if (!retire->profile_tunnel) {
++      return IOConnectCallStructMethod(retire->profile_connection, NativeAdrenoMethodReportBoProfile,
++                                       record, sizeof(*record), NULL, NULL);
++   }
++   uint8_t buffer[8 + sizeof(*record)];
++   const uint32_t header[2] = {DW_TUNNEL_MAGIC, NativeAdrenoMethodReportBoProfile};
++   memcpy(buffer, header, sizeof(header));
++   memcpy(buffer + sizeof(header), record, sizeof(*record));
++   return IOConnectCallStructMethod(retire->profile_connection, retire->profile_selector,
++                                    buffer, sizeof(buffer), NULL, NULL);
++}
++
++/* The reporter owns its snapshot until all records have been sent. Allocation
++ * threads only change counters and bounded arrays under retire->lock. No
++ * transport operation, USB output or sleeping occurs while that lock is held. */
++static void *
++darwin_profile_reporter(void *argument)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)argument;
++   uint64_t sequence = 0;
++   uint64_t sent_slow = 0;
++   for (;;) {
++      NativeAdrenoAbiBoCacheCounters counters;
++      NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
++      NativeAdrenoAbiBoCacheBin usages[NativeAdrenoBoProfileUsageCount];
++      NativeAdrenoAbiBoProfile slow[NativeAdrenoBoProfileSlowCount];
++      struct timespec deadline;
++      clock_gettime(CLOCK_REALTIME, &deadline);
++      deadline.tv_sec += 2;
++
++      pthread_mutex_lock(&retire->lock);
++      while (!retire->reporter_stop) {
++         if (pthread_cond_timedwait(&retire->report_wake, &retire->lock, &deadline) == ETIMEDOUT) {
++            break;
++         }
++      }
++      const bool stop = retire->reporter_stop;
++      counters = retire->profile;
++      counters.cached_objects = retire->cache_count;
++      counters.cached_bytes = retire->cache_bytes;
++      counters.peak_bytes = retire->cache_peak_bytes;
++      counters.pending_objects = retire->count;
++      counters.pending_bytes = retire->pending_bytes;
++      counters.pressure_waits = retire->pressure_waits;
++      counters.reaped = retire->reaped;
++      memcpy(sizes, retire->sizes, sizeof(sizes));
++      memcpy(usages, retire->usages, sizeof(usages));
++      memcpy(slow, retire->slow, sizeof(slow));
++      pthread_mutex_unlock(&retire->lock);
++
++      NativeAdrenoAbiBoProfile record = {};
++      record.version = NativeAdrenoBoProfileVersion;
++      record.sequence = ++sequence;
++      record.device_id = retire->profile_device;
++      record.sampled_us = os_time_get_nano() / 1000;
++      record.kind = NativeAdrenoBoProfileCounters;
++      record.data.counters = counters;
++      uint64_t failures = darwin_send_profile(retire, &record) != KERN_SUCCESS;
++      for (unsigned i = 0; i < NativeAdrenoBoProfileSizeCount; ++i) {
++         if (!sizes[i].requests) {
++            continue;
++         }
++         record.kind = NativeAdrenoBoProfileSize;
++         record.index = i;
++         record.data.bin = sizes[i];
++         failures += darwin_send_profile(retire, &record) != KERN_SUCCESS;
++      }
++      for (unsigned i = 0; i < NativeAdrenoBoProfileUsageCount; ++i) {
++         if (!usages[i].requests) {
++            continue;
++         }
++         record.kind = NativeAdrenoBoProfileUsage;
++         record.index = i;
++         record.data.bin = usages[i];
++         failures += darwin_send_profile(retire, &record) != KERN_SUCCESS;
++      }
++      const uint64_t first = MAX2(sent_slow + 1,
++         counters.slow_total > NativeAdrenoBoProfileSlowCount ?
++         counters.slow_total - NativeAdrenoBoProfileSlowCount + 1 : 1);
++      for (uint64_t i = first; i <= counters.slow_total; ++i) {
++         const NativeAdrenoAbiBoProfile *event = &slow[(i - 1) % NativeAdrenoBoProfileSlowCount];
++         if (darwin_send_profile(retire, event) == KERN_SUCCESS) {
++            sent_slow = i;
++         } else {
++            ++failures;
++            break;
++         }
++      }
++      if (failures) {
++         pthread_mutex_lock(&retire->lock);
++         retire->profile.report_failures += failures;
++         pthread_mutex_unlock(&retire->lock);
++      }
++      if (stop) {
++         return NULL;
++      }
++   }
 +}
 +
 +/* Finds an admitted selector: the driver answers a tunnel probe (method 0xffffffff) with success for every selector the sandbox lets through. */
@@ -579,8 +779,8 @@ index 0000000..006c40f
 +/* The caller holds retire->lock and has observed this BO's fence completion.
 + * A busy kernel handle keeps its ID and GPU address for the next collection. */
 +static VkResult
-+darwin_release_bo_locked(struct tu_device *dev, struct darwin_retire_state *retire,
-+                         struct darwin_retired_bo *bo)
++darwin_release_bo_storage_locked(struct tu_device *dev, struct darwin_retire_state *retire,
++                                 struct darwin_retired_bo *bo)
 +{
 +   if (bo->token) {
 +      if (bo->mapping) {
@@ -616,6 +816,17 @@ index 0000000..006c40f
 +   return VK_SUCCESS;
 +}
 +
++static VkResult
++darwin_release_bo_locked(struct tu_device *dev, struct darwin_retire_state *retire,
++                         struct darwin_retired_bo *bo)
++{
++   const uint64_t began = os_time_get_nano() / 1000;
++   const NativeAdrenoAbiBoSlowEvent event = darwin_profile_bo_event(bo, NativeAdrenoBoSlowRelease);
++   VkResult result = darwin_release_bo_storage_locked(dev, retire, bo);
++   darwin_profile_slow_locked(retire, began, event, result);
++   return result;
++}
++
 +static void
 +darwin_remove_cached_locked(struct darwin_retire_state *retire, unsigned index, uint64_t size)
 +{
@@ -626,8 +837,17 @@ index 0000000..006c40f
 +   retire->cache_bytes -= size;
 +}
 +
++enum darwin_cache_evict_reason {
++   DARWIN_EVICT_OBJECTS,
++   DARWIN_EVICT_BYTES,
++   DARWIN_EVICT_IOVA,
++   DARWIN_EVICT_ALLOCATION,
++   DARWIN_EVICT_CLOSE,
++};
++
 +static VkResult
-+darwin_evict_oldest_locked(struct tu_device *dev, struct darwin_retire_state *retire)
++darwin_evict_oldest_locked(struct tu_device *dev, struct darwin_retire_state *retire,
++                           enum darwin_cache_evict_reason reason)
 +{
 +   uint64_t size = retire->cache[0].size;
 +   VkResult result = darwin_release_bo_locked(dev, retire, &retire->cache[0]);
@@ -637,6 +857,23 @@ index 0000000..006c40f
 +
 +   darwin_remove_cached_locked(retire, 0, size);
 +   ++retire->cache_evictions;
++   switch (reason) {
++   case DARWIN_EVICT_OBJECTS:
++      ++retire->profile.evict_objects;
++      break;
++   case DARWIN_EVICT_BYTES:
++      ++retire->profile.evict_bytes;
++      break;
++   case DARWIN_EVICT_IOVA:
++      ++retire->profile.evict_iova;
++      break;
++   case DARWIN_EVICT_ALLOCATION:
++      ++retire->profile.evict_allocation;
++      break;
++   case DARWIN_EVICT_CLOSE:
++      ++retire->profile.evict_close;
++      break;
++   }
 +
 +   return VK_SUCCESS;
 +}
@@ -651,7 +888,9 @@ index 0000000..006c40f
 +
 +   while (retire->cache_count == DARWIN_CACHED_BOS ||
 +          bo->size > DARWIN_BO_CACHE_BYTES - retire->cache_bytes) {
-+      VkResult result = darwin_evict_oldest_locked(dev, retire);
++      const enum darwin_cache_evict_reason reason = retire->cache_count == DARWIN_CACHED_BOS ?
++         DARWIN_EVICT_OBJECTS : DARWIN_EVICT_BYTES;
++      VkResult result = darwin_evict_oldest_locked(dev, retire, reason);
 +      if (result != VK_SUCCESS) {
 +         return result;
 +      }
@@ -660,6 +899,8 @@ index 0000000..006c40f
 +   retire->cache[retire->cache_count++] = *bo;
 +   retire->cache_bytes += bo->size;
 +   retire->cache_peak_bytes = MAX2(retire->cache_peak_bytes, retire->cache_bytes);
++   retire->profile.peak_objects = MAX2(retire->profile.peak_objects, retire->cache_count);
++   ++retire->profile.puts;
 +   *bo = {};
 +
 +   return VK_SUCCESS;
@@ -686,6 +927,7 @@ index 0000000..006c40f
 +         have_completed_fence = true;
 +         completed_fence = bo->fence;
 +      }
++      const uint64_t bytes = bo->size;
 +      VkResult result = darwin_cache_completed_locked(dev, retire, bo);
 +      if (result == VK_NOT_READY) {
 +         return VK_SUCCESS;
@@ -696,6 +938,7 @@ index 0000000..006c40f
 +
 +      retire->head = (retire->head + 1) % DARWIN_RETIRED_BOS;
 +      --retire->count;
++      retire->pending_bytes -= bytes;
 +      ++retire->reaped;
 +   }
 +   return VK_SUCCESS;
@@ -722,30 +965,115 @@ index 0000000..006c40f
 +   return id;
 +}
 +
++static bool
++darwin_bo_matches(const struct darwin_retired_bo *bo, uint64_t size, uint64_t alignment,
++                  uint32_t alloc_flags, VkMemoryPropertyFlags mem_property)
++{
++   return bo->cacheable && bo->size == size && bo->alignment == alignment &&
++          bo->alloc_flags == alloc_flags && bo->mem_property == mem_property;
++}
++
 +static VkResult
 +darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
 +                    uint32_t alloc_flags, VkMemoryPropertyFlags mem_property,
++                    bool eligible, const char *name, uint32_t *reason,
 +                    struct darwin_retired_bo *out)
 +{
 +   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
 +   pthread_mutex_lock(&retire->lock);
++   NativeAdrenoAbiBoCacheCounters *profile = &retire->profile;
++   NativeAdrenoAbiBoCacheBin *size_bin = &retire->sizes[darwin_profile_size_bin(size)];
++   NativeAdrenoAbiBoCacheBin *usage_bin = &retire->usages[darwin_profile_usage_bin(retire, name)];
++   ++profile->requests;
++   profile->requested_bytes += size;
++   ++size_bin->requests;
++   size_bin->requested_bytes += size;
++   ++usage_bin->requests;
++   usage_bin->requested_bytes += size;
++   if (eligible) {
++      ++profile->eligible;
++      ++size_bin->eligible;
++      ++usage_bin->eligible;
++   } else if (*reason == NativeAdrenoBoCacheFixedAddress) {
++      ++profile->bypass_fixed;
++   } else if (*reason == NativeAdrenoBoCacheExcludedFlags) {
++      ++profile->bypass_flags;
++   } else {
++      ++profile->bypass_oversize;
++   }
++
 +   VkResult result = darwin_reap_locked(dev, retire);
-+   if (result == VK_SUCCESS) {
++   if (result == VK_SUCCESS && eligible) {
++      bool same_size = false;
++      bool same_alignment = false;
++      bool same_flags = false;
 +      for (unsigned i = 0; i < retire->cache_count; ++i) {
 +         const struct darwin_retired_bo *bo = &retire->cache[i];
-+         if (bo->size != size || bo->alignment != alignment ||
-+             bo->alloc_flags != alloc_flags || bo->mem_property != mem_property) {
++         if (bo->size != size) {
++            continue;
++         }
++         same_size = true;
++         if (bo->alignment != alignment) {
++            continue;
++         }
++         same_alignment = true;
++         if (bo->alloc_flags != alloc_flags) {
++            continue;
++         }
++         same_flags = true;
++         if (bo->mem_property != mem_property) {
 +            continue;
 +         }
 +
 +         *out = *bo;
 +         darwin_remove_cached_locked(retire, i, size);
 +         ++retire->cache_hits;
++         ++profile->hits;
++         ++size_bin->hits;
++         ++usage_bin->hits;
++         *reason = NativeAdrenoBoCacheHit;
 +         break;
 +      }
 +      if (!out->handle) {
 +         ++retire->cache_misses;
++         ++profile->misses;
++         ++size_bin->misses;
++         ++usage_bin->misses;
++         bool compatible_pending = false;
++         for (unsigned i = 0; i < retire->count; ++i) {
++            const struct darwin_retired_bo *bo = &retire->entries[(retire->head + i) % DARWIN_RETIRED_BOS];
++            if (darwin_bo_matches(bo, size, alignment, alloc_flags, mem_property)) {
++               compatible_pending = true;
++               break;
++            }
++         }
++         /* A matching entry behind an unfinished queue head cannot be reused
++          * yet. No extra fence polling is introduced for measurement. */
++         if (compatible_pending) {
++            *reason = NativeAdrenoBoCachePending;
++            ++profile->miss_pending;
++            ++profile->compatible_pending_requests;
++            ++size_bin->compatible_pending_requests;
++            ++usage_bin->compatible_pending_requests;
++         } else if (!retire->cache_count) {
++            *reason = NativeAdrenoBoCacheEmpty;
++            ++profile->miss_empty;
++         } else if (!same_size) {
++            *reason = NativeAdrenoBoCacheSize;
++            ++profile->miss_size;
++         } else if (!same_alignment) {
++            *reason = NativeAdrenoBoCacheAlignment;
++            ++profile->miss_alignment;
++         } else if (!same_flags) {
++            *reason = NativeAdrenoBoCacheFlags;
++            ++profile->miss_flags;
++         } else {
++            *reason = NativeAdrenoBoCacheMemoryProperty;
++            ++profile->miss_memory_property;
++         }
 +      }
++   } else if (result != VK_SUCCESS) {
++      *reason = NativeAdrenoBoCacheFailure;
 +   }
 +   pthread_mutex_unlock(&retire->lock);
 +
@@ -755,13 +1083,13 @@ index 0000000..006c40f
 +/* Allocation pressure releases only completed cached objects. Pending fences
 + * remain in the retirement queue and are polled by later collections. */
 +static VkResult
-+darwin_trim_cache(struct tu_device *dev)
++darwin_trim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason)
 +{
 +   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
 +   pthread_mutex_lock(&retire->lock);
 +   VkResult result = retire->failure;
 +   while (result == VK_SUCCESS && retire->cache_count) {
-+      result = darwin_evict_oldest_locked(dev, retire);
++      result = darwin_evict_oldest_locked(dev, retire, reason);
 +   }
 +   pthread_mutex_unlock(&retire->lock);
 +
@@ -791,11 +1119,11 @@ index 0000000..006c40f
 +/* ---- buffer objects ---- */
 +
 +static VkResult
-+darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
++darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
 +               struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
 +               VkMemoryPropertyFlags mem_property,
 +               enum tu_bo_alloc_flags flags, struct tu_sparse_vma *lazy_vma,
-+               const char *name)
++               const char *name, uint32_t *cache_reason)
 +{
 +   MESA_TRACE_FUNC();
 +   if (lazy_vma) {
@@ -807,9 +1135,11 @@ index 0000000..006c40f
 +                                   TU_BO_ALLOC_SHAREABLE | TU_BO_ALLOC_IMPLICIT_SYNC;
 +   const bool cacheable = !client_iova && !(flags & excluded_flags) &&
 +                          size <= DARWIN_BO_CACHE_MAX_OBJECT_BYTES;
++   *cache_reason = client_iova ? NativeAdrenoBoCacheFixedAddress :
++      (flags & excluded_flags) ? NativeAdrenoBoCacheExcludedFlags : NativeAdrenoBoCacheOversize;
 +   struct darwin_retired_bo storage = {};
-+   VkResult result = cacheable ? darwin_take_cached(dev, size, alignment, flags, mem_property, &storage) :
-+                                darwin_collect_retired(dev);
++   VkResult result = darwin_take_cached(dev, size, alignment, flags, mem_property,
++                                       cacheable, name, cache_reason, &storage);
 +   if (result != VK_SUCCESS) {
 +      return result;
 +   }
@@ -819,7 +1149,7 @@ index 0000000..006c40f
 +      result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
 +      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
 +          result == VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) {
-+         result = darwin_trim_cache(dev);
++         result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
 +         if (result != VK_SUCCESS) {
 +            return result;
 +         }
@@ -833,7 +1163,7 @@ index 0000000..006c40f
 +      NativeAdrenoAbiBoAllocReply reply = {};
 +      kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
 +      if (kr != KERN_SUCCESS) {
-+         result = darwin_trim_cache(dev);
++         result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
 +         if (result != VK_SUCCESS) {
 +            darwin_free_iova(dev, iova, size);
 +            return result;
@@ -867,6 +1197,8 @@ index 0000000..006c40f
 +   struct tu_bo *bo = tu_device_lookup_bo(dev, storage.gem_handle);
 +   assert(bo && bo->gem_handle == 0);
 +
++   char purpose[32] = {};
++   darwin_profile_name(purpose, sizeof(purpose), name);
 +   name = tu_debug_bos_add(dev, size, name);
 +
 +   *bo = (struct tu_bo) {
@@ -888,6 +1220,7 @@ index 0000000..006c40f
 +   bo->darwin_alignment = alignment;
 +   bo->darwin_cacheable = cacheable;
 +   bo->darwin_reused_map = storage.mapping != NULL;
++   memcpy(bo->darwin_profile_name, purpose, sizeof(purpose));
 +
 +   tu_dump_bo_init(dev, bo);
 +   TU_RMV(bo_allocate, dev, bo);
@@ -903,10 +1236,40 @@ index 0000000..006c40f
 +   return VK_SUCCESS;
 +}
 +
++static VkResult
++darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
++               struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
++               VkMemoryPropertyFlags mem_property,
++               enum tu_bo_alloc_flags flags, struct tu_sparse_vma *lazy_vma,
++               const char *name)
++{
++   const uint64_t began = os_time_get_nano() / 1000;
++   NativeAdrenoAbiBoSlowEvent event = {};
++   event.operation = NativeAdrenoBoSlowAllocate;
++   event.bytes = size;
++   event.alignment = os_page_size;
++   event.alloc_flags = flags;
++   event.memory_property = mem_property;
++   event.cache_reason = NativeAdrenoBoCacheFailure;
++   darwin_profile_name(event.name, sizeof(event.name), name);
++
++   VkResult result = darwin_bo_init_recorded(dev, base, out_bo, size, client_iova,
++                                            mem_property, flags, lazy_vma, name, &event.cache_reason);
++   if (result == VK_SUCCESS) {
++      event.handle = (*out_bo)->darwin_handle;
++      event.iova = (*out_bo)->iova;
++   }
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&retire->lock);
++   darwin_profile_slow_locked(retire, began, event, result);
++   pthread_mutex_unlock(&retire->lock);
++   return result;
++}
++
 +/* VK_EXT_external_memory_host: the kernel pins the caller's pages (an IOSurface's) as a BO, which is then mapped into the GPU like any
 + * other. The CPU keeps the caller's own mapping, so there is no CPU-map token and the BO is "mapped" at the caller's pointer. */
 +static VkResult
-+darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
++darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
 +{
 +   if (!(dw.params.flags & NativeAdrenoParamsHostImport))
 +      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
@@ -916,7 +1279,7 @@ index 0000000..006c40f
 +   uint64_t iova;
 +   VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
 +   if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
-+      result = darwin_trim_cache(dev);
++      result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
 +      if (result != VK_SUCCESS) {
 +         return result;
 +      }
@@ -930,7 +1293,7 @@ index 0000000..006c40f
 +   NativeAdrenoAbiBoAllocReply reply = {};
 +   kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
 +   if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
-+      result = darwin_trim_cache(dev);
++      result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
 +      if (result != VK_SUCCESS) {
 +         darwin_free_iova(dev, iova, size);
 +         return result;
@@ -963,10 +1326,35 @@ index 0000000..006c40f
 +   bo->darwin_token = 0;
 +   bo->map = pointer;
 +   bo->never_unmap = true;
++   darwin_profile_name(bo->darwin_profile_name, sizeof(bo->darwin_profile_name), "host import");
 +   tu_dump_bo_init(dev, bo);
 +   TU_RMV(bo_allocate, dev, bo);
 +   *out_bo = bo;
 +   return VK_SUCCESS;
++}
++
++static VkResult
++darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
++{
++   const uint64_t began = os_time_get_nano() / 1000;
++   NativeAdrenoAbiBoSlowEvent event = {};
++   event.operation = NativeAdrenoBoSlowImport;
++   event.cache_reason = NativeAdrenoBoCacheImport;
++   event.bytes = size;
++   event.alignment = os_page_size;
++   darwin_profile_name(event.name, sizeof(event.name), "host import");
++   VkResult result = darwin_bo_init_host_recorded(dev, out_bo, pointer, size);
++   if (result == VK_SUCCESS) {
++      event.handle = (*out_bo)->darwin_handle;
++      event.iova = (*out_bo)->iova;
++   }
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&retire->lock);
++   ++retire->profile.imports;
++   retire->profile.import_bytes += size;
++   darwin_profile_slow_locked(retire, began, event, result);
++   pthread_mutex_unlock(&retire->lock);
++   return result;
 +}
 +
 +static VkResult
@@ -1075,6 +1463,7 @@ index 0000000..006c40f
 +static void
 +darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
 +{
++   const uint64_t began = os_time_get_nano() / 1000;
 +   assert(bo->gem_handle);
 +
 +   u_rwlock_rdlock(&dev->dma_bo_lock);
@@ -1084,6 +1473,16 @@ index 0000000..006c40f
 +      return;
 +   }
 +
++   NativeAdrenoAbiBoSlowEvent event = {};
++   event.operation = NativeAdrenoBoSlowRetire;
++   event.bytes = bo->size;
++   event.alignment = bo->darwin_alignment;
++   event.handle = bo->darwin_handle;
++   event.iova = bo->iova;
++   event.alloc_flags = bo->darwin_alloc_flags;
++   event.memory_property = bo->darwin_mem_property;
++   event.cache_reason = NativeAdrenoBoCacheNotRequested;
++   memcpy(event.name, bo->darwin_profile_name, sizeof(event.name));
 +   tu_debug_bos_del(dev, bo);
 +   tu_dump_bo_del(dev, bo);
 +
@@ -1108,6 +1507,7 @@ index 0000000..006c40f
 +      pthread_mutex_lock(&dw.lock);
 +      uint32_t fence = dw.last_fence;
 +      pthread_mutex_unlock(&dw.lock);
++      event.connection_fence = fence;
 +      unsigned slot = (retire->head + retire->count) % DARWIN_RETIRED_BOS;
 +      retire->entries[slot] = {
 +         .handle = bo->darwin_handle,
@@ -1122,8 +1522,10 @@ index 0000000..006c40f
 +         .alignment = bo->darwin_alignment,
 +         .cacheable = bo->darwin_cacheable,
 +      };
++      memcpy(retire->entries[slot].name, event.name, sizeof(event.name));
 +      ++retire->count;
 +      ++retire->enqueued;
++      retire->pending_bytes += bo->size;
 +
 +      /* The sparse-array entry becomes empty before another allocation can
 +       * obtain this handle from the completed cache. */
@@ -1135,6 +1537,7 @@ index 0000000..006c40f
 +      retire->failure = vk_device_set_lost(&dev->vk, "deferred BO queue remains full; retaining native allocation");
 +      memset(bo, 0, sizeof(*bo));
 +   }
++   darwin_profile_slow_locked(retire, began, event, retire->failure);
 +   pthread_mutex_unlock(&retire->lock);
 +
 +   u_rwlock_rdunlock(&dev->dma_bo_lock);
@@ -1465,15 +1868,59 @@ index 0000000..006c40f
 +   util_idalloc_init(&retire->ids, 256);
 +   util_idalloc_reserve(&retire->ids, 0);
 +   dev->darwin_retire = retire;
++   pthread_mutex_lock(&dw.lock);
++   retire->profile_device = ++dw.next_profile_device;
++   pthread_mutex_unlock(&dw.lock);
++   for (unsigned i = 0; i < NativeAdrenoBoProfileSizeCount; ++i) {
++      retire->sizes[i].upper_bytes = i + 1 == NativeAdrenoBoProfileSizeCount ?
++         UINT64_MAX : 4096ull << i;
++   }
++   darwin_profile_name(retire->usages[NativeAdrenoBoProfileUsageCount - 1].name, 32, "other purposes");
++   if (dw.params.flags & NativeAdrenoParamsBoProfile) {
++      /* The reporter keeps the original send right. A later connection in the
++       * process cannot receive records belonging to this device. */
++      retire->profile_connection = dw.conn;
++      retire->profile_tunnel = dw.tunnel;
++      retire->profile_selector = dw.selector;
++      if (IOConnectAddRef(retire->profile_connection) == KERN_SUCCESS) {
++         if (pthread_cond_init(&retire->report_wake, NULL) == 0) {
++            if (pthread_create(&retire->reporter, NULL, darwin_profile_reporter, retire) == 0) {
++               retire->reporter_started = true;
++            } else {
++               pthread_cond_destroy(&retire->report_wake);
++            }
++         }
++         if (!retire->reporter_started) {
++            IOConnectRelease(retire->profile_connection);
++         }
++      }
++      if (!retire->reporter_started) {
++         ++retire->profile.report_failures;
++         mesa_logw("darwin BO profile reporter could not start");
++      }
++   }
 +   return VK_SUCCESS;
 +}
 +
 +static void
 +darwin_device_finish(struct tu_device *dev)
 +{
-+   /* Closing the connection makes the kernel drain the GPU and free every object this client created. */
-+   dw_close_connection();
 +   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   if (retire) {
++      if (retire->reporter_started) {
++         pthread_mutex_lock(&retire->lock);
++         retire->profile.evict_close += retire->cache_count;
++         retire->reporter_stop = true;
++         pthread_cond_signal(&retire->report_wake);
++         pthread_mutex_unlock(&retire->lock);
++         pthread_join(retire->reporter, NULL);
++         pthread_cond_destroy(&retire->report_wake);
++         IOConnectRelease(retire->profile_connection);
++      }
++   }
++   /* The reporter has sent its final snapshot before the connection is closed.
++    * Closing drains the GPU and releases every allocation still owned here. */
++   dw_close_connection();
 +   if (retire) {
 +      /* Some CreateDevice failure paths already destroyed the VMA heap/mutex.
 +       * Never return ranges here: they are either gone or about to be destroyed. */
