@@ -28,7 +28,7 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
     '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
     '0007-accept-two-plane-rgb-surfaces.patch', '0008-alias-padded-rows-of-written-textures.patch',
-    '0009-bound-idle-command-pools-on-ios.patch']]
+    '0009-bound-idle-command-pools-on-ios.patch', '0010-coordinate-memory-pool-growth.patch']]
 tree_diff = subprocess.check_output(['git', '-C', str(SOURCE), 'diff', '--no-ext-diff', '--abbrev=7', 'HEAD', '--'], text=True)
 def canonical_diff(diff):
     # Independent patches touch disjoint files; Git orders the combined diff by
