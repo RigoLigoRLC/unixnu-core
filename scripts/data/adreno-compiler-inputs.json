@@ -54,8 +54,7 @@
     "patches/mesa/turnip-empty-scissor.patch",
     "patches/mesa/turnip-builtin-shader-pack.patch",
     "patches/mesa/turnip-host-import-images.patch",
-    "patches/mesa/turnip-tile-store-allocation-error.patch",
-    "patches/mesa/turnip-host-import-release.patch"
+    "patches/mesa/turnip-tile-store-allocation-error.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

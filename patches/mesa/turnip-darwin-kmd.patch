@@ -171,10 +171,9 @@ index 82efb07..3b512f8 100644
  tu_allocate_lazy_memory(struct tu_device *dev,
                          struct tu_device_memory *mem)
 diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
-index d32a7d8..ce1d494 100644
 --- a/src/freedreno/vulkan/tu_device.h
 +++ b/src/freedreno/vulkan/tu_device.h
-@@ -300,6 +300,7 @@ struct tu_device
+@@ -300,6 +300,7 @@
  {
     struct vk_device vk;
     struct tu_instance *instance;
@@ -269,19 +268,18 @@ index 4c2bf6a..a8ccd76 100644
  VkResult tu_knl_drm_msm_load(struct tu_instance *instance,
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
 new file mode 100644
-index 0000000..c8af61d
+index 0000000..b03c6ee
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
-@@ -0,0 +1,1195 @@
+@@ -0,0 +1,1110 @@
 +/*
-+ * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, versions 1 and 2).
++ * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
 + * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
 + * SPDX-License-Identifier: MIT
 + */
 +
 +#include <errno.h>
 +#include <pthread.h>
-+#include <stddef.h>
 +#include <string.h>
 +#include <sys/mman.h>
 +#include <unistd.h>
@@ -308,9 +306,6 @@ index 0000000..c8af61d
 +/* 'NTNL': first word of a tunnelled call, as served by the driver (NativeAdrenoPublish.cpp). */
 +#define DW_TUNNEL_MAGIC 0x4e544e4cu
 +
-+/* Query.flags bit 1 selects WaitFence calls that sleep outside the GPU lock. */
-+enum { DARWIN_PARAMS_SLEEPING_WAIT = 1u << 1 };
-+
 +/* One GPU per process: the kernel service has a single connection slot, so the connection and the fence bookkeeping are
 + * process state rather than per tu_device state. */
 +static struct {
@@ -327,11 +322,8 @@ index 0000000..c8af61d
 +   bool tunnel;
 +   uint32_t selector;
 +   uint32_t last_fence;
-+   uint64_t connection_generation;
 +   NativeAdrenoAbiDeviceInfo info;
 +   NativeAdrenoAbiParams params;
-+   unsigned submit_buffers;
-+   size_t submit_bytes;
 +} dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
 +
 +/* Preserve the native handle, CPU view and IOVA until the captured ring fence
@@ -416,7 +408,7 @@ index 0000000..c8af61d
 +   }
 +
 +   kr = dw_call(NativeAdrenoMethodQuery, NULL, 0, &dw.params, sizeof(dw.params));
-+   if (kr == KERN_SUCCESS && dw.params.abi_version != 1 && dw.params.abi_version != 2)
++   if (kr == KERN_SUCCESS && dw.params.abi_version != NativeAdrenoAbiVersion)
 +      kr = kIOReturnUnsupported;
 +   if (kr == KERN_SUCCESS)
 +      kr = dw_call(NativeAdrenoMethodGetDeviceInfo, NULL, 0, &dw.info, sizeof(dw.info));
@@ -426,20 +418,9 @@ index 0000000..c8af61d
 +      return vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
 +                               "NativeAdreno query failed: 0x%x", kr);
 +   }
-+
-+   dw.submit_buffers = dw.params.abi_version == 1 ? 16 : NativeAdrenoAbiMaxBuffers;
-+   dw.submit_bytes = offsetof(NativeAdrenoAbiSubmit, buffers) +
-+                     dw.submit_buffers * sizeof(NativeAdrenoAbiSubmitBuffer);
-+
-+   pthread_mutex_lock(&dw.lock);
-+   ++dw.connection_generation;
-+   if (!dw.connection_generation) {
-+      ++dw.connection_generation;
-+   }
 +   dw.open = true;
 +   dw.inflight_count = 0;
 +   dw.last_fence = 0;
-+   pthread_mutex_unlock(&dw.lock);
 +   return VK_SUCCESS;
 +}
 +
@@ -463,16 +444,15 @@ index 0000000..c8af61d
 +   return vk_device_set_lost(&dev->vk, "%s failed: 0x%x", what, kr);
 +}
 +
-+/* The kernel advertises sleeping waits separately from the ABI version. */
++/* Waits for a fence in short kernel waits so the connection lock is never held for long. */
 +static VkResult
 +dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns)
 +{
 +   for (;;) {
 +      uint64_t now = os_time_get_nano();
-+      uint64_t slice = (dw.params.flags & DARWIN_PARAMS_SLEEPING_WAIT) ? 100000000 : 1000000;
-+      if (abs_timeout_ns != UINT64_MAX) {
-+         slice = abs_timeout_ns <= now ? 0 : MIN2(slice, abs_timeout_ns - now);
-+      }
++      uint64_t slice = 1000000; /* 1 ms */
++      if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
++         slice = 0;
 +      NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
 +      kern_return_t kr = dw_call(NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
 +      if (kr == KERN_SUCCESS)
@@ -787,26 +767,9 @@ index 0000000..c8af61d
 +   uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | kIOMapWriteCombineCache;
 +   kr = IOConnectMapMemory64(dw.conn, reply.token, mach_task_self(), &address, &length, options);
 +   if (kr != KERN_SUCCESS || !address || length < bo->size) {
-+      bo->darwin_token = reply.token;
-+      bo->never_unmap = true;
-+      if (kr == KERN_SUCCESS && address) {
-+         bo->map = (void *)(uintptr_t)address;
-+         kern_return_t cleanup = IOConnectUnmapMemory64(dw.conn, reply.token, mach_task_self(), address);
-+         if (cleanup != KERN_SUCCESS) {
-+            return vk_device_set_lost(&dev->vk, "invalid CPU mapping cleanup failed: 0x%x", cleanup);
-+         }
-+         bo->map = NULL;
-+      }
 +      NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = reply.token};
-+      kern_return_t cleanup = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
-+      if (cleanup != KERN_SUCCESS) {
-+         return vk_device_set_lost(&dev->vk, "CPU mapping lease cleanup failed: 0x%x", cleanup);
-+      }
-+      bo->darwin_token = 0;
-+      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED,
-+                       "IOConnectMapMemory64 failed: 0x%x, address=0x%llx length=%llu expected=%llu",
-+                       kr, (unsigned long long)address, (unsigned long long)length,
-+                       (unsigned long long)bo->size);
++      dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
++      return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "IOConnectMapMemory64 failed: 0x%x", kr);
 +   }
 +
 +   bo->map = (void *)(uintptr_t)address;
@@ -970,8 +933,6 @@ index 0000000..c8af61d
 +   struct vk_sync vk;
 +   enum darwin_sync_state state;
 +   uint32_t fence;
-+   struct tu_device *device;
-+   uint64_t connection_generation;
 +};
 +
 +static VkResult
@@ -980,8 +941,6 @@ index 0000000..c8af61d
 +   struct vk_darwin_sync *s = container_of(sync, struct vk_darwin_sync, vk);
 +   s->state = initial_value ? DARWIN_SYNC_SIGNALED : DARWIN_SYNC_UNSIGNALED;
 +   s->fence = 0;
-+   s->device = container_of(device, struct tu_device, vk);
-+   s->connection_generation = 0;
 +   return VK_SUCCESS;
 +}
 +
@@ -996,7 +955,6 @@ index 0000000..c8af61d
 +   struct vk_darwin_sync *s = container_of(sync, struct vk_darwin_sync, vk);
 +   s->state = DARWIN_SYNC_UNSIGNALED;
 +   s->fence = 0;
-+   s->connection_generation = 0;
 +   return VK_SUCCESS;
 +}
 +
@@ -1007,11 +965,8 @@ index 0000000..c8af61d
 +   struct vk_darwin_sync *s = container_of(src, struct vk_darwin_sync, vk);
 +   d->state = s->state;
 +   d->fence = s->fence;
-+   d->device = s->device;
-+   d->connection_generation = s->connection_generation;
 +   s->state = DARWIN_SYNC_UNSIGNALED;
 +   s->fence = 0;
-+   s->connection_generation = 0;
 +   return VK_SUCCESS;
 +}
 +
@@ -1087,10 +1042,10 @@ index 0000000..c8af61d
 +      for (;;) {
 +         for (uint32_t i = 0; i < wait_count; i++) {
 +            struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
-+            VkResult result = darwin_sync_wait(device, s, 0);
-+            if (result != VK_TIMEOUT) {
-+               return result;
-+            }
++            if (darwin_sync_wait(device, s, 0) == VK_SUCCESS ||
++                (s->state == DARWIN_SYNC_FENCE &&
++                 dw_wait_fence_locked_free(device, s->fence, 0) == VK_SUCCESS))
++               return VK_SUCCESS;
 +         }
 +         if (abs_timeout_ns != UINT64_MAX && os_time_get_nano() >= abs_timeout_ns)
 +            return VK_TIMEOUT;
@@ -1136,8 +1091,8 @@ index 0000000..c8af61d
 +   dw.last_fence = fence;
 +}
 +
-+/* Each kernel submission uses the buffer count and record size selected by Query.
-+ * A full job table waits for the oldest submitted fence before retrying. */
++/* One kernel submission of up to NativeAdrenoAbiMaxBuffers indirect buffers; waits for the oldest job when all eight kernel job slots
++ * are taken. */
 +static VkResult
 +darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *entries,
 +                    unsigned count, uint32_t *fence)
@@ -1151,7 +1106,7 @@ index 0000000..c8af61d
 +
 +   for (unsigned attempt = 0; attempt < 64; attempt++) {
 +      NativeAdrenoAbiSubmitReply reply = {};
-+      kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, dw.submit_bytes, &reply, sizeof(reply));
++      kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
 +      if (kr == KERN_SUCCESS) {
 +         *fence = (uint32_t)reply.fence;
 +         return VK_SUCCESS;
@@ -1170,28 +1125,6 @@ index 0000000..c8af61d
 +   return vk_device_set_lost(&dev->vk, "submit: no free job slot");
 +}
 +
-+/* A fence already submitted by this device on the current connection precedes
-+ * new work on its single ring. Each job's CACHE_FLUSH_TS completes before the
-+ * next job, so the dependency needs ring ordering rather than a CPU wait.
-+ */
-+static bool
-+darwin_sync_submitted_on_ring(struct tu_device *dev, const struct vk_darwin_sync *sync,
-+                             uint32_t *fence)
-+{
-+   pthread_mutex_lock(&dw.lock);
-+   const bool submitted = dw.open && sync->device == dev &&
-+                          sync->state == DARWIN_SYNC_FENCE && sync->fence &&
-+                          sync->connection_generation &&
-+                          sync->connection_generation == dw.connection_generation &&
-+                          sync->fence <= dw.last_fence;
-+   if (submitted) {
-+      *fence = sync->fence;
-+   }
-+   pthread_mutex_unlock(&dw.lock);
-+
-+   return submitted;
-+}
-+
 +static VkResult
 +darwin_queue_submit(struct tu_queue *queue, void *_submit,
 +                    struct vk_sync_wait *waits, uint32_t wait_count,
@@ -1201,18 +1134,9 @@ index 0000000..c8af61d
 +   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
 +   struct tu_device *dev = queue->device;
 +
-+   uint32_t dependency_fence = 0;
++   /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
 +   for (uint32_t i = 0; i < wait_count; i++) {
 +      struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
-+      uint32_t submitted_fence = 0;
-+      if (darwin_sync_submitted_on_ring(dev, s, &submitted_fence)) {
-+         dependency_fence = MAX2(dependency_fence, submitted_fence);
-+         continue;
-+      }
-+
-+      /* A host signal, an unresolved dependency or another connection still
-+       * requires the existing completion wait before work can be submitted.
-+       */
 +      VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
 +      if (result != VK_SUCCESS)
 +         return vk_device_set_lost(&dev->vk, "wait before submit failed");
@@ -1223,8 +1147,8 @@ index 0000000..c8af61d
 +   if (total) {
 +      const NativeAdrenoAbiSubmitBuffer *all =
 +         util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
-+      for (unsigned at = 0; at < total; at += dw.submit_buffers) {
-+         unsigned count = MIN2(total - at, dw.submit_buffers);
++      for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
++         unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
 +         uint32_t chunk_fence = 0;
 +         VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence);
 +         if (result != VK_SUCCESS)
@@ -1236,23 +1160,13 @@ index 0000000..c8af61d
 +      }
 +      p_atomic_set(&queue->fence, fence);
 +   } else {
-+      /* An empty submit still waits for every dependency it signals after,
-+       * including work another Vulkan queue submitted to this connection.
-+       */
-+      const int queue_fence = p_atomic_read(&queue->fence);
-+      fence = MAX2(dependency_fence, queue_fence > 0 ? (uint32_t)queue_fence : 0);
-+      p_atomic_set(&queue->fence, fence);
++      /* Nothing to run: the signals resolve with the last earlier submission. */
++      fence = p_atomic_read(&queue->fence) > 0 ? (uint32_t)p_atomic_read(&queue->fence) : 0;
 +   }
-+
-+   pthread_mutex_lock(&dw.lock);
-+   const uint64_t connection_generation = dw.connection_generation;
-+   pthread_mutex_unlock(&dw.lock);
 +
 +   for (uint32_t i = 0; i < signal_count; i++) {
 +      struct vk_darwin_sync *s = container_of(signals[i].sync, struct vk_darwin_sync, vk);
 +      s->fence = fence;
-+      s->device = dev;
-+      s->connection_generation = fence ? connection_generation : 0;
 +      s->state = fence ? DARWIN_SYNC_FENCE : DARWIN_SYNC_SIGNALED;
 +   }
 +

@@ -23,7 +23,7 @@ parser.add_argument('--quartzcore-display-state', choices=['on', 'off'], default
                     help='read and modify display state at the addresses selected for the A740 OS image')
 parser.add_argument('--turnip-replay', choices=['a740', 'off'], default='a740',
                     help='include the recorded A740 command stream in the unpublished diagnostic path')
-parser.add_argument('--turnip-debug', default='nocb',
+parser.add_argument('--turnip-debug', default='sysmem,nocb',
                     help='default TU_DEBUG for published Metal devices; an empty value leaves it unset')
 parser.add_argument('--turnip-smoke-debug', default='nocb',
                     help='default TU_DEBUG for the unpublished Vulkan diagnostic; an empty value leaves it unset')
