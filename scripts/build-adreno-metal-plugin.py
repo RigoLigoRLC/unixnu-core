@@ -5,6 +5,7 @@ and the launchd probe daemon with its job plist (NativeAdrenoProbeDaemon.cpp).
 Output (ignored, never committed): build/adreno-metal-plugin/NativeAdrenoMetal.bundle with a 4 KiB-page ad-hoc signature, and
 trust.json with its CDHash. The bundle is staged into the Data seed by add-gpu-plugin-data.py and trusted through an extra
 owner trust module (make-owner-trust-bundle.py); neither changes the original trust modules, AMFI or any Apple signature."""
+import argparse
 import json
 import plistlib
 import re
@@ -13,6 +14,36 @@ import subprocess
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--gpu-abi-dir', type=Path, default=Path('drivers/Adreno740'),
+                    help='directory containing the selected kernel GPU NativeAdrenoABI.h, relative to the build tree')
+parser.add_argument('--scanout-copy', choices=['on', 'off'], default='on',
+                    help='copy display frames into the inherited framebuffer with the GPU')
+parser.add_argument('--quartzcore-display-state', choices=['on', 'off'], default='on',
+                    help='read and modify display state at the addresses selected for the A740 OS image')
+parser.add_argument('--turnip-replay', choices=['a740', 'off'], default='a740',
+                    help='include the recorded A740 command stream in the unpublished diagnostic path')
+parser.add_argument('--turnip-debug', default='nocb',
+                    help='default TU_DEBUG for published Metal devices; an empty value leaves it unset')
+parser.add_argument('--turnip-smoke-debug', default='nocb',
+                    help='default TU_DEBUG for the unpublished Vulkan diagnostic; an empty value leaves it unset')
+parser.add_argument('--shader-compiler', type=Path,
+                    help='glslc or glslangValidator executable used to compile the bundled Vulkan shaders')
+parser.add_argument('--skip-shader-validation', action='store_true',
+                    help='compile the bundled Vulkan shaders without invoking spirv-val')
+args = parser.parse_args()
+gpu_abi_dir = (ROOT / args.gpu_abi_dir).resolve()
+if not (gpu_abi_dir / 'NativeAdrenoABI.h').is_file():
+    raise SystemExit('The selected GPU ABI directory must contain NativeAdrenoABI.h')
+if args.turnip_replay == 'a740' and gpu_abi_dir != (ROOT / 'drivers/Adreno740').resolve():
+    raise SystemExit('The recorded command stream requires the A740 ABI; select --turnip-replay off for another GPU')
+board_options = [
+    '-DNATIVE_ADRENO_SCANOUT_COPY=' + str(int(args.scanout_copy == 'on')),
+    '-DNATIVE_ADRENO_QUARTZCORE_DISPLAY_STATE=' + str(int(args.quartzcore_display_state == 'on')),
+    '-DNATIVE_ADRENO_A740_REPLAY=' + str(int(args.turnip_replay == 'a740')),
+    '-DNATIVE_ADRENO_TURNIP_DEBUG=' + json.dumps(args.turnip_debug),
+    '-DNATIVE_ADRENO_TURNIP_SMOKE_DEBUG=' + json.dumps(args.turnip_smoke_debug),
+]
 OUT = ROOT / 'build/adreno-metal-plugin'
 bundle = OUT / 'NativeAdrenoMetal.bundle'
 if OUT.exists():
@@ -25,9 +56,15 @@ VULKAN_INCLUDE = ROOT / '.cache/mesa-work/include'
 TURNIP = ROOT / 'build/mesa-tu-ios/src/freedreno/vulkan/libvulkan_freedreno.dylib'
 if not TURNIP.is_file():
     raise SystemExit('Build Turnip first: python3 scripts/build-turnip-darwin.py --target ios')
-subprocess.run(['python3', ROOT / 'scripts/gen-turnip-smoke-shaders.py'], check=True)
-# Turnip's first submission, recorded on the host, for the plugin's prefix replay (build/turnip-smoke/TurnipReplay.h).
-subprocess.run(['python3', ROOT / 'scripts/gen-turnip-replay.py'], check=True)
+shader_command = ['python3', ROOT / 'scripts/gen-turnip-smoke-shaders.py']
+if args.shader_compiler:
+    shader_command.extend(['--compiler', str((ROOT / args.shader_compiler).resolve())])
+if args.skip_shader_validation:
+    shader_command.append('--skip-validation')
+subprocess.run(shader_command, check=True)
+# The command stream recorded by the host simulator targets A740.
+if args.turnip_replay == 'a740':
+    subprocess.run(['python3', ROOT / 'scripts/gen-turnip-replay.py'], check=True)
 subprocess.run(['python3', ROOT / 'scripts/build-adreno-metal-bridge.py', '--target', 'ios'], check=True)
 BRIDGE = ROOT / 'build/adreno-metal-bridge/ios/libadreno_metal_bridge.a'
 pm4 = OUT / 'AdrenoPM4.o'
@@ -38,7 +75,7 @@ exe = bundle / 'NativeAdrenoMetal'
 PRIME_LIST = ROOT / 'build/prime-list.txt'
 prime_section = [f'-Wl,-sectcreate,__DATA,__primelist,{PRIME_LIST}'] if PRIME_LIST.is_file() else []
 subprocess.run([*(['xcrun', 'clang++'] + base[2:]), '-std=c++17', '-fobjc-arc', '-Wno-deprecated-declarations', '-bundle',
-                '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
+                *board_options, '-I', gpu_abi_dir, '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
                 '-x', 'objective-c++', ROOT / 'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm',
                 ROOT / 'drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm', '-x', 'none', pm4, BRIDGE,
                 '-Wl,-dead_strip', *prime_section, '-lobjc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface', '-o', exe],
@@ -81,7 +118,7 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          'com.apple.private.logging.admin': True, 'com.apple.private.logging.diagnostic': True,
                                          'com.apple.private.logging.stream': True}))
 daemon = OUT / 'adrenoprobed'
-subprocess.run(['xcrun', 'clang++', *base[2:], '-std=c++17', '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE,
+subprocess.run(['xcrun', 'clang++', *base[2:], '-std=c++17', *board_options, '-I', gpu_abi_dir, '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE,
                 '-I', ROOT / 'build/turnip-smoke',
                 ROOT / 'drivers/AdrenoMetal/NativeAdrenoProbeDaemon.cpp', '-x', 'objective-c++', '-fobjc-arc',
                 ROOT / 'drivers/AdrenoMetal/NativeOsLogExport.mm', '-x', 'none', pm4, '-framework', 'Foundation', '-lz', '-o', daemon], check=True)

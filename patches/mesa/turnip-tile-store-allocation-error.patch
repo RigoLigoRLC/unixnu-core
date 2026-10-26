@@ -1,0 +1,142 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 60ad3a8..bcb7724 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -2086,7 +2086,7 @@ tu6_emit_gmem_stores(struct tu_cmd_buffer *cmd,
+ }
+ 
+ template <chip CHIP>
+-static void
++static VkResult
+ tu6_emit_tile_store_cs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+ {
+    const struct tu_render_pass *pass = cmd->state.pass;
+@@ -2096,6 +2096,18 @@ tu6_emit_tile_store_cs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    if (pass->has_fdm)
+       tu_cs_set_writeable(cs, true);
+ 
++   /* The first marker needs two dwords. Reserve its BO and entry before the
++    * packet emitter, whose automatic allocation only asserts on failure.
++    */
++   VkResult result = tu_cs_reserve_space(cs, 2);
++   if (result != VK_SUCCESS) {
++      if (pass->has_fdm) {
++         tu_cs_set_writeable(cs, false);
++      }
++
++      return result;
++   }
++
+    /* We believe setting the marker affects what state HW blocks save/restore
+     * during preemption.  So we only emit it before the stores at the end of the
+     * last subpass, not other resolves.
+@@ -2111,6 +2123,7 @@ tu6_emit_tile_store_cs(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    if (pass->has_fdm)
+       tu_cs_set_writeable(cs, false);
+ 
++   return VK_SUCCESS;
+ }
+ 
+ void
+@@ -3920,7 +3933,14 @@ tu_cmd_render_tiles(struct tu_cmd_buffer *cmd,
+     * called from tu6_render_tile().
+     */
+    tu_cs_begin(&cmd->tile_store_cs);
+-   tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
++   result = tu6_emit_tile_store_cs<CHIP>(cmd, &cmd->tile_store_cs);
++   if (result != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, result);
++      free(tiles);
++
++      return;
++   }
++
+    tu_cs_end(&cmd->tile_store_cs);
+ 
+    tu6_tile_render_begin<CHIP>(cmd, &cmd->cs, rp_ctx, fdm_offsets);
+@@ -4044,6 +4064,10 @@ void
+ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+               const VkOffset2D *fdm_offsets)
+ {
++   if (vk_command_buffer_has_error(&cmd_buffer->vk)) {
++      return;
++   }
++
+    if (cmd_buffer->state.rp.has_tess)
+       tu6_lazy_emit_tessfactor_addr<CHIP>(cmd_buffer);
+ 
+@@ -5304,6 +5328,10 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+ 
++   if (vk_command_buffer_has_error(&cmd_buffer->vk)) {
++      return vk_command_buffer_end(&cmd_buffer->vk);
++   }
++
+    /* We currently flush CCU at the end of the command buffer, like
+     * what the blob does. There's implicit synchronization around every
+     * vkQueueSubmit, but the kernel only flushes the UCHE, and we don't
+@@ -9730,9 +9758,11 @@ tu_CmdEndRenderPass2(VkCommandBuffer commandBuffer,
+    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+    TU_CALLX(cmd_buffer->device, tu_cmd_render)(cmd_buffer, fdm_offsets);
+ 
+-   cmd_buffer->state.cache.pending_flush_bits |=
+-      cmd_buffer->state.renderpass_cache.pending_flush_bits;
+-   TU_CALLX(cmd_buffer->device, tu_subpass_barrier)(cmd_buffer, &cmd_buffer->state.pass->end_barrier, true);
++   if (!vk_command_buffer_has_error(&cmd_buffer->vk)) {
++      cmd_buffer->state.cache.pending_flush_bits |=
++         cmd_buffer->state.renderpass_cache.pending_flush_bits;
++      TU_CALLX(cmd_buffer->device, tu_subpass_barrier)(cmd_buffer, &cmd_buffer->state.pass->end_barrier, true);
++   }
+ 
+    vk_free(&cmd_buffer->vk.pool->alloc, cmd_buffer->state.attachments);
+ 
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index e06cd57..da6c2f3 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -425,6 +425,14 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+        vk_submit->image_opaque_bind_count)
+       return queue_submit_sparse(_queue, vk_submit);
+ 
++   for (unsigned i = 0; i < vk_submit->command_buffer_count; i++) {
++      VkResult result =
++         vk_command_buffer_get_record_result(vk_submit->command_buffers[i]);
++      if (result != VK_SUCCESS) {
++         return result;
++      }
++   }
++
+    dump_cmds = UTIL_DYNARRAY_INIT;
+ 
+    uint32_t perf_pass_index =
+@@ -441,8 +449,28 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+ 
+    VkResult result =
+       tu_insert_dynamic_cmdbufs(device, &cmd_buffers, &cmdbuf_count);
+-   if (result != VK_SUCCESS)
++   if (result != VK_SUCCESS) {
++      pthread_mutex_unlock(&device->submit_mutex);
++
+       return result;
++   }
++
++   /* Dynamic rendering can append command buffers while assembling a submit.
++    * Their recording errors must reach the caller before any kernel submit.
++    */
++   for (unsigned i = 0; i < cmdbuf_count; i++) {
++      result = vk_command_buffer_get_record_result(&cmd_buffers[i]->vk);
++      if (result != VK_SUCCESS) {
++         if (cmd_buffers !=
++             (struct tu_cmd_buffer **) vk_submit->command_buffers) {
++            vk_free(&device->vk.alloc, cmd_buffers);
++         }
++
++         pthread_mutex_unlock(&device->submit_mutex);
++
++         return result;
++      }
++   }
+ 
+    bool has_trace_points = false;
+    static_assert(offsetof(struct tu_cmd_buffer, vk) == 0,

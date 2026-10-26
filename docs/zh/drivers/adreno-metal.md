@@ -26,6 +26,20 @@ render server 的沙盒访问不到 cryptex 路径。120 Hz 下空闲桌面每 2
 encoder 的方法，不能接受 nil。每个进程的第一个问题由出错
 的线程写入驱动的进程文本行。
 
+板级构建向 Turnip 和插件提供同一份 `NativeAdrenoABI.h`。Turnip 按查询到的
+ABI 版本选择提交记录：版本 1 为 16 个 IB、416 字节，版本 2 为 128 个 IB、
+3104 字节。诊断 mailbox 保留 16 个 IB 的记录。host-import 只有收到内核
+移除 GPU 映射的成功确认后，才释放调用者持有的页面。
+
+设备查询按 selector 和参数缓存，前端关闭 no-copy 重绑所需的编码器回放记录。
+带行间距的 render target 只有在高度是 4 的倍数、宽度向上取整至 16 像素后的
+字节数不超过行距、最后一行不越过分配范围时，才直接别名原缓冲区；其余使用
+shadow 图像。
+
+`NATIVE_ADRENO_FRAME_TRACE=0` 与 `NATIVE_ADRENO_PIPELINE_JOURNAL=0` 默认关闭
+逐命令追踪和管线文件日志，保留周期读取的内存统计。前端错误与 host-import
+释放错误各自最多输出 32 条。
+
 ```sh
 python3 scripts/build-turnip-darwin.py --target ios
 python3 scripts/build-adreno-metal-plugin.py

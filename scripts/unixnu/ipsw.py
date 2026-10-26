@@ -124,7 +124,8 @@ class Ipsw:
                         f'the board expects {c["version"]} ({c["build"]}) for {c["product"]}')
         for item in m['BuildIdentities']:
             if (item['Info']['DeviceClass'] == c['device_class'] and item['Info']['RestoreBehavior'] == 'Erase'
-                    and int(item['ApChipID'], 16) == c['chip_id'] and int(item['ApBoardID'], 16) == c['board_id']):
+                    and int(item['ApChipID'], 16) == c['chip_id'] and int(item['ApBoardID'], 16) == c['board_id']
+                    and ('security_domain' not in c or int(item['ApSecurityDomain'], 16) == c['security_domain'])):
                 return item
         raise Error(f'no Erase build identity for {c["device_class"]} in this IPSW')
 

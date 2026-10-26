@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 import shutil
 import subprocess
+import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']['commit']
@@ -30,29 +31,47 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     # The rest stack in order, each on the source the ones before it leave.
     '0009-keep-final-pass.patch', '0010-fewer-allocations-per-draw.patch', '0011-keep-draw-commands.patch',
     '0012-keep-draw-lists.patch', '0013-skip-unchanged-rebinds.patch', '0014-map-tracker-keys.patch',
-    '0015-two-plane-shadow-as-memory-lies.patch', '0016-tile-stores-within-rows.patch']]
+    '0015-two-plane-shadow-as-memory-lies.patch', '0016-tile-stores-within-rows.patch',
+    '0017-bound-idle-command-pools-on-ios.patch',
+    '0018-describe-kept-passes-and-shadow-initialization.patch',
+    '0019-confirm-host-import-release.patch',
+    '0020-tile-stores-stay-in-texture-rows.patch',
+    '0021-bound-host-import-release-errors.patch']]
 
 
-def git_tree(*steps):
-    # The source tree a scratch index holds after HEAD and the given commands, without touching the source's own index.
-    index = ROOT / 'build/adreno-metal-bridge-index'
-    env = dict(os.environ, GIT_INDEX_FILE=str(index))
-    subprocess.run(['git', '-C', str(SOURCE), 'read-tree', 'HEAD'], env=env, check=True)
-    for step in steps:
-        subprocess.run(['git', '-C', str(SOURCE)] + step, env=env, check=True)
-    tree = subprocess.check_output(['git', '-C', str(SOURCE), 'write-tree'], env=env, text=True).strip()
-    index.unlink()
-    return tree
+def source_diff():
+    # A temporary index includes files introduced by patches without staging the checkout.
+    with tempfile.TemporaryDirectory(prefix='m2v-source-diff-', dir=ROOT / '.cache') as temporary:
+        source_env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+        git_source = ['git', '-C', str(SOURCE)]
+        subprocess.run(git_source + ['read-tree', PIN], env=source_env, check=True)
+        subprocess.run(git_source + ['add', '--intent-to-add', '--', '.'], env=source_env, check=True)
+        return subprocess.check_output(
+            git_source + ['diff', '--no-ext-diff', '--abbrev=7', PIN, '--'],
+            env=source_env, text=True)
 
 
-# The tree after each prefix of the recorded patches; the source must be one of them.
-states = [git_tree(*[['apply', '--cached', str(patch)] for patch in PATCHES[:count]]) for count in range(len(PATCHES) + 1)]
-current = git_tree(['add', '-A'])
-if current not in states:
+tree_diff = source_diff()
+states = ['']
+with tempfile.TemporaryDirectory(prefix='m2v-patches-', dir=ROOT / '.cache') as temporary:
+    patch_env = dict(os.environ, GIT_INDEX_FILE=str(Path(temporary) / 'index'))
+    git_source = ['git', '-C', str(SOURCE)]
+    subprocess.run(git_source + ['read-tree', PIN], env=patch_env, check=True)
+
+    # Each index contains the complete source after one more recorded patch.
+    # Later patches can modify a file already changed by an earlier patch.
+    for patch in PATCHES:
+        subprocess.run(git_source + ['apply', '--cached', str(patch)], env=patch_env, check=True)
+        states.append(subprocess.check_output(
+            git_source + ['diff', '--cached', '--no-ext-diff', '--abbrev=7', PIN, '--'],
+            env=patch_env, text=True))
+
+expected = states[-1]
+if tree_diff not in states:
     raise SystemExit('Translator source differs from the pinned revision plus its recorded patches')
-for patch in PATCHES[states.index(current):]:
+for patch in PATCHES[states.index(tree_diff):]:
     subprocess.run(['git', '-C', str(SOURCE), 'apply', str(patch)], check=True)
-if git_tree(['add', '-A']) != states[-1]:
+if source_diff() != expected:
     raise SystemExit('Translator patch result differs from its exact recorded source')
 out = ROOT / 'build/adreno-metal-bridge'
 out.mkdir(parents=True, exist_ok=True)
@@ -82,7 +101,7 @@ if args.manifest_only:
 triple = 'aarch64-apple-ios' if args.target == 'ios' else 'aarch64-apple-darwin'
 # The translator source the runtime is built from (its pin and recorded patches), which keys the shader cache: shader priming keeps what it
 # finished while this stays the same (PrimeShaders.h).
-runtime_id = hashlib.sha256((PIN + '\n' + states[-1]).encode()).hexdigest()[:32]
+runtime_id = hashlib.sha256((PIN + '\n' + expected).encode()).hexdigest()[:32]
 env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
 target_dir = ROOT / 'build/m2v-target'
 log = out / ('build-%s.log' % args.target)

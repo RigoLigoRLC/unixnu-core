@@ -208,10 +208,13 @@ U32 = {'phandle', 'linux,phandle', '#address-cells', '#size-cells', '#interrupt-
        'native-ufs-stream-id', 'native-ufs-interrupt', 'cluster-type', 'die-cluster-id', 'cluster-core-id'}
 U32.update({
     'native-adreno-chip-id', 'native-adreno-gmem-bytes', 'native-adreno-frequency-hz',
+    'native-adreno-ddr-type',
     'native-adreno-highest-bank-bit', 'native-adreno-gpu-bank', 'native-adreno-gpu-asid',
     'native-adreno-gpu-slot', 'native-adreno-gpu-sid', 'native-adreno-gpu-sid-mask',
     'native-adreno-gmu-bank', 'native-adreno-gmu-asid', 'native-adreno-gmu-slot',
     'native-adreno-gmu-sid', 'native-adreno-gmu-sid-mask',
+    'native-adreno-lpac-bank', 'native-adreno-lpac-asid', 'native-adreno-lpac-slot',
+    'native-adreno-lpac-sid', 'native-adreno-lpac-sid-mask',
 })
 U64 = {'redistributor-stride'}
 FLAGS = {'interrupt-controller', 'dma-coherent'}
@@ -330,14 +333,24 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
         raise Error('payload.dram_size differs from the hardware DTS')
     chosen = [('random-seed', os.urandom(64)), ('dram-base', struct.pack('<Q', dram_base)),
               ('dram-size', struct.pack('<Q', dram_size)), *empty_nvram_proxy()]
+    personalized = options.get('personalization_from_ipsw', False)
     if unique_chip_id:
         seed = int(str(unique_chip_id), 16)
         chip = int(str(options['chip_id']), 16)
         if not 0 < seed < 1 << 64 or not 0 < chip < 1 << 32:
             raise Error('Platform identity requires a nonzero u64 seed and u32 chip ID')
-        chosen += [('unique-chip-id', struct.pack('<Q', seed)), ('chip-id', struct.pack('<I', chip))]
+        chip_property = 'unixnu,platform-uuid-chip-id' if personalized else 'chip-id'
+        chosen += [('unique-chip-id', struct.pack('<Q', seed)), (chip_property, struct.pack('<I', chip))]
     elif options.get('unique_chip_id') == 'required':
         raise Error('Pass --unique-chip-id HEX for this board')
+    if personalized:
+        identity = config.get('ipsw', {})
+        for property_name, config_name in (('chip-id', 'chip_id'), ('board-id', 'board_id'),
+                                           ('security-domain', 'security_domain')):
+            value = identity.get(config_name)
+            if type(value) is not int or not 0 <= value < 1 << 32 or (config_name == 'chip_id' and not value):
+                raise Error(f'IPSW personalization requires [ipsw] {config_name} as a u32 from its build identity')
+            chosen.append((property_name, struct.pack('<I', value)))
     if options.get('owned_memory_size'):
         if options['owned_memory_size'] == 'auto':
             maximum = min(dram_size, 0x200000000) & ~0x1fffff

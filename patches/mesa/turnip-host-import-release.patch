@@ -1,0 +1,130 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 527a4d4..fec54fa 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -3499,12 +3499,32 @@ vk_icdGetInstanceProcAddr(VkInstance instance, const char *pName)
+ }
+ 
+ #ifdef __APPLE__
++/* The native Metal owner needs an error-bearing acknowledgement before its
++ * deallocator can release imported pages. vkFreeMemory itself returns void. */
++static VKAPI_ATTR VkResult VKAPI_CALL
++tu_ReleaseHostMemoryUNIXNU(VkDevice _device, VkDeviceMemory _memory)
++{
++#ifdef TU_HAS_DARWIN
++   VK_FROM_HANDLE(tu_device, device, _device);
++   VK_FROM_HANDLE(tu_device_memory, memory, _memory);
++   if (!memory || !memory->bo || !memory->bo->darwin_host_import)
++      return VK_ERROR_INVALID_EXTERNAL_HANDLE;
++
++   return tu_darwin_release_host_bo(device, memory->bo);
++#else
++   return VK_ERROR_FEATURE_NOT_PRESENT;
++#endif
++}
++
+ /* iPadOS has no Khronos loader: a consumer that opens a loader by path (the metal2vulkan runtime behind the native Metal device) opens this
+  * library and looks up the loader's name. Turnip is the only driver there, so the loader's entry is the driver's own. */
+ PUBLIC
+ VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
+ vkGetInstanceProcAddr(VkInstance instance, const char *pName)
+ {
++   if (pName && !strcmp(pName, "vkReleaseHostMemoryUNIXNU"))
++      return (PFN_vkVoidFunction)tu_ReleaseHostMemoryUNIXNU;
++
+    return tu_GetInstanceProcAddr(instance, pName);
+ }
+ #endif
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index a8ccd76..2583594 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -63,6 +63,8 @@ struct tu_bo {
+     * CPU mapping (IOConnectMapMemory64 memory type). */
+    uint64_t darwin_handle;
+    uint32_t darwin_token;
++   bool darwin_host_import;
++   bool darwin_host_detached;
+ #endif
+ 
+    bool implicit_sync : 1;
+@@ -277,6 +279,10 @@ void tu_sparse_vma_finish(struct tu_device *device,
+ VkResult tu_knl_kgsl_load(struct tu_instance *instance, int fd);
+ VkResult tu_knl_darwin_load(struct tu_instance *instance);
+ 
++#ifdef TU_HAS_DARWIN
++VkResult tu_darwin_release_host_bo(struct tu_device *dev, struct tu_bo *bo);
++#endif
++
+ struct _drmVersion;
+ VkResult tu_knl_drm_msm_load(struct tu_instance *instance,
+                              int fd, struct _drmVersion *version,
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 9a6252e..214e4c8 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -464,6 +464,7 @@ darwin_bo_init_host(struct tu_device *dev, struct tu_bo **out_bo, void *pointer,
+    bo->darwin_token = 0;
+    bo->map = pointer;
+    bo->never_unmap = true;
++   bo->darwin_host_import = true;
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
+    *out_bo = bo;
+@@ -573,6 +574,31 @@ darwin_wait_idle(struct tu_device *dev)
+    return VK_SUCCESS;
+ }
+ 
++VkResult
++tu_darwin_release_host_bo(struct tu_device *dev, struct tu_bo *bo)
++{
++   if (!bo->darwin_host_import)
++      return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
++   if (bo->darwin_host_detached)
++      return VK_SUCCESS;
++
++   /* The caller has ended every use of this VkDeviceMemory. The captured
++    * fence covers those submissions; later unrelated work does not extend it. */
++   VkResult waited = darwin_wait_idle(dev);
++   if (waited != VK_SUCCESS)
++      return vk_device_set_lost(&dev->vk, "host import release fence failed: %d", waited);
++
++   NativeAdrenoAbiBoFree request = {.handle = bo->darwin_handle};
++   kern_return_t kr = dw_call(NativeAdrenoMethodBoFree, &request, sizeof(request), NULL, 0);
++   if (kr != KERN_SUCCESS)
++      return vk_device_set_lost(&dev->vk, "host import release BoFree failed: 0x%x", kr);
++
++   /* Successful BoFree removes the SMMU mapping and cache-maintenance entry
++    * before completing and releasing the descriptor that pins the owner. */
++   bo->darwin_host_detached = true;
++   return VK_SUCCESS;
++}
++
+ static void
+ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ {
+@@ -585,6 +611,24 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       return;
+    }
+ 
++   if (bo->darwin_host_import) {
++      VkResult released = tu_darwin_release_host_bo(dev, bo);
++      if (released != VK_SUCCESS) {
++         /* The native owner handshake retains its deallocator on this error.
++          * Preserve the BO record and IOVA with the kernel's pinned pages. */
++         u_rwlock_rdunlock(&dev->dma_bo_lock);
++         return;
++      }
++
++      tu_debug_bos_del(dev, bo);
++      tu_dump_bo_del(dev, bo);
++      TU_RMV(bo_destroy, dev, bo);
++      darwin_free_iova(dev, bo->iova, bo->size);
++      memset(bo, 0, sizeof(*bo));
++      u_rwlock_rdunlock(&dev->dma_bo_lock);
++      return;
++   }
++
+    tu_debug_bos_del(dev, bo);
+    tu_dump_bo_del(dev, bo);
+ 
