@@ -125,10 +125,10 @@ index 1d33085..75e6c5d 100644
                                           image->vk.format);
  
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index bcb7724..54e8554 100644
+index bcb7724..29e396b 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
-@@ -33,6 +33,99 @@ enum tu_cmd_buffer_status {
+@@ -33,6 +33,101 @@ enum tu_cmd_buffer_status {
     TU_CMD_BUFFER_STATUS_ACTIVE = 1,
  };
  
@@ -220,15 +220,17 @@ index bcb7724..54e8554 100644
 +      *record = set;
 +   }
 +
-+   if (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
++   if (set->layout->binding_flags & (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++                                     VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT)) {
 +      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND;
++   }
 +#endif
 +}
 +
  static struct tu_bo *
  tu_cmd_buffer_setup_status_tracking(struct tu_device *device)
  {
-@@ -267,6 +360,11 @@ static void
+@@ -267,6 +362,11 @@ static void
  tu_emit_vis_stream_patchpoint(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                                uint32_t offset)
  {
@@ -240,7 +242,7 @@ index bcb7724..54e8554 100644
     struct tu_vis_stream_patchpoint patchpoint = {
        .render_pass_idx = cmd->state.tile_render_pass_count,
        .data = cs->cur,
-@@ -457,6 +555,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+@@ -457,6 +557,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
  {
     tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
  
@@ -252,7 +254,7 @@ index bcb7724..54e8554 100644
     if (!force_disable_cb) {
        struct tu_cb_control_point info = {
           .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
-@@ -478,6 +581,11 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+@@ -478,6 +583,11 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
  {
     tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
  
@@ -264,7 +266,7 @@ index bcb7724..54e8554 100644
     struct tu_cb_control_point info = {
        .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
        .patchpoint = cs->cur,
-@@ -555,6 +663,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
+@@ -555,6 +665,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
  
        tu_cs_patchable_end(cs, false, &cb_state);
  
@@ -276,7 +278,7 @@ index bcb7724..54e8554 100644
        tu_add_cb_barrier_info(cmd_buffer);
  
        struct tu_cb_control_point cb_patch = {
-@@ -2504,6 +2617,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+@@ -2504,6 +2619,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
        tu_cs_emit_pkt7(cs, CP_BV_BR_COUNT_OPS, 2);
        tu_cs_emit(cs, CP_BV_BR_COUNT_OPS_0_OP(PIPE_SET_BR_OFFSET));
  
@@ -288,7 +290,7 @@ index bcb7724..54e8554 100644
        struct tu_vis_stream_patchpoint *patchpoint =
           &cmd->vis_stream_count_patchpoint;
        patchpoint->data = cs->cur;
-@@ -3236,6 +3354,11 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
+@@ -3236,6 +3356,11 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
     }
     tu_cs_patchable_end(cs, true, &no_cb_state);
  
@@ -300,7 +302,7 @@ index bcb7724..54e8554 100644
     struct tu_cb_control_point enable_cb_patch = {
        .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
        .patchpoint = cb_state.nop_header,
-@@ -4177,6 +4300,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+@@ -4177,6 +4302,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
     struct tu_cmd_buffer *cmd_buffer =
        container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
  
@@ -310,7 +312,7 @@ index bcb7724..54e8554 100644
     tu_cs_finish(&cmd_buffer->cs);
     tu_cs_finish(&cmd_buffer->draw_cs);
     tu_cs_finish(&cmd_buffer->tile_store_cs);
-@@ -4203,6 +4329,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+@@ -4203,6 +4331,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
                                          &cmd_buffer->descriptors[i].push_set.layout->vk);
        vk_free(&cmd_buffer->device->vk.alloc,
                cmd_buffer->descriptors[i].push_set.mapped_ptr);
@@ -319,7 +321,7 @@ index bcb7724..54e8554 100644
     }
  
     util_dynarray_foreach (&cmd_buffer->msrtss_color_temporaries,
-@@ -4253,6 +4381,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+@@ -4253,6 +4383,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
     struct tu_cmd_buffer *cmd_buffer =
        container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
  
@@ -330,7 +332,7 @@ index bcb7724..54e8554 100644
     VkResult status_check_result = VK_SUCCESS;
     if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
        status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
-@@ -4281,6 +4413,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+@@ -4281,6 +4415,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
                                          &cmd_buffer->descriptors[i].push_set.layout->vk);
        }
        vk_free(&cmd_buffer->device->vk.alloc, cmd_buffer->descriptors[i].push_set.mapped_ptr);
@@ -338,7 +340,7 @@ index bcb7724..54e8554 100644
        memset(&cmd_buffer->descriptors[i].push_set, 0, sizeof(cmd_buffer->descriptors[i].push_set));
        cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
        cmd_buffer->descriptors[i].max_sets_bound = 0;
-@@ -4576,6 +4709,7 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+@@ -4576,6 +4711,7 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
           cmd->state.vb[firstBinding + i].size = 0;
        } else {
           struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
@@ -346,7 +348,7 @@ index bcb7724..54e8554 100644
           cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
           cmd->state.vb[firstBinding + i].size =
              vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
-@@ -4602,6 +4736,8 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+@@ -4602,6 +4738,8 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buf, buffer);
  
@@ -355,7 +357,7 @@ index bcb7724..54e8554 100644
     size = buf ? vk_buffer_range(&buf->vk, offset, size) : 0;
  
     uint32_t index_size, index_shift;
-@@ -4770,6 +4906,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+@@ -4770,6 +4908,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
        if (!set)
           continue;
  
@@ -364,7 +366,7 @@ index bcb7724..54e8554 100644
        if (set->layout->has_inline_uniforms)
           cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
  
-@@ -4913,6 +5051,8 @@ tu_CmdBindDescriptorBuffersEXT(
+@@ -4913,6 +5053,8 @@ tu_CmdBindDescriptorBuffersEXT(
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
  
@@ -373,7 +375,7 @@ index bcb7724..54e8554 100644
     for (unsigned i = 0; i < bufferCount; i++)
        cmd->state.descriptor_buffer_iova[i] = pBindingInfos[i].address;
  }
-@@ -5027,6 +5167,19 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
+@@ -5027,6 +5169,19 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
     vk_descriptor_set_layout_ref(&layout->vk);
     set->layout = layout;
  
@@ -393,7 +395,7 @@ index bcb7724..54e8554 100644
     if (set->host_size < layout->size) {
        void *new_buf =
           vk_realloc(&device->vk.alloc, set->mapped_ptr, layout->size, 8,
-@@ -5170,6 +5323,7 @@ tu_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+@@ -5170,6 +5325,7 @@ tu_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
  
     for (uint32_t i = 0; i < bindingCount; i++) {
        VK_FROM_HANDLE(tu_buffer, buf, pBuffers[i]);
@@ -401,7 +403,7 @@ index bcb7724..54e8554 100644
        uint64_t iova = vk_buffer_address(&buf->vk, pOffsets[i]);
        uint32_t size = vk_buffer_range(&buf->vk, pOffsets[i],
                                        pSizes ? pSizes[i] : VK_WHOLE_SIZE);
-@@ -5220,6 +5374,8 @@ tu_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+@@ -5220,6 +5376,8 @@ tu_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
  
        VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
  
@@ -410,7 +412,7 @@ index bcb7724..54e8554 100644
        tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
        tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(VPC_SO_BUFFER_OFFSET(CHIP, idx).reg) |
                       CP_MEM_TO_REG_0_UNK31 |
-@@ -5273,6 +5429,8 @@ tu_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+@@ -5273,6 +5431,8 @@ tu_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
  
        VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
  
@@ -419,7 +421,7 @@ index bcb7724..54e8554 100644
        /* VPC_SO_FLUSH_BASE has dwords counter, but counter should be in bytes */
        tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
        tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(tu_scratch_reg<CHIP>(0).reg) |
-@@ -5328,7 +5486,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -5328,7 +5488,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
  
@@ -428,7 +430,7 @@ index bcb7724..54e8554 100644
        return vk_command_buffer_end(&cmd_buffer->vk);
     }
  
-@@ -5378,6 +5536,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -5378,6 +5538,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
     tu_cs_end(&cmd_buffer->draw_cs);
     tu_cs_end(&cmd_buffer->draw_epilogue_cs);
  
@@ -436,7 +438,7 @@ index bcb7724..54e8554 100644
     return vk_command_buffer_end(&cmd_buffer->vk);
  }
  TU_GENX(tu_EndCommandBuffer);
-@@ -6322,6 +6481,19 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+@@ -6322,6 +6483,19 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
     for (uint32_t i = 0; i < commandBufferCount; i++) {
        VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
  
@@ -456,7 +458,7 @@ index bcb7724..54e8554 100644
        if (secondary->usage_flags &
            VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) {
           assert(tu_cs_is_empty(&secondary->cs));
-@@ -6389,6 +6561,10 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+@@ -6389,6 +6563,10 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                 tu_cs_reserve_space(cs, 5);
                 tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
                 tu_cs_emit_qw(cs, patchpoint.iova);
@@ -467,7 +469,7 @@ index bcb7724..54e8554 100644
                 patchpoint.iova = tu_cs_get_cur_iova(cs);
                 patchpoint.data = cs->cur;
                 tu_cs_emit_qw(cs, 0);
-@@ -7024,6 +7200,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+@@ -7024,6 +7202,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
  
     tu_choose_gmem_layout(cmd);
  
@@ -481,7 +483,7 @@ index bcb7724..54e8554 100644
     /* Note: because this is external, any flushes will happen before draw_cs
      * gets called. However deferred flushes could have to happen later as part
      * of the subpass.
-@@ -7185,6 +7368,13 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+@@ -7185,6 +7370,13 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
        return;
     }
  
@@ -495,7 +497,7 @@ index bcb7724..54e8554 100644
     tu_choose_gmem_layout(cmd);
  
     cmd->state.renderpass_cache.pending_flush_bits =
-@@ -8337,6 +8527,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8337,6 +8529,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                  /* note: draw_count is 0 for indirect */
                  uint32_t draw_count)
  {
@@ -509,7 +511,7 @@ index bcb7724..54e8554 100644
     const struct tu_program_state *program = &cmd->state.program;
     struct tu_render_pass_state *rp = &cmd->state.rp;
  
-@@ -8971,6 +9168,8 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
+@@ -8971,6 +9170,8 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _buffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -518,7 +520,7 @@ index bcb7724..54e8554 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
-@@ -9002,6 +9201,8 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+@@ -9002,6 +9203,8 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _buffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -527,7 +529,7 @@ index bcb7724..54e8554 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
-@@ -9038,6 +9239,9 @@ tu_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
+@@ -9038,6 +9241,9 @@ tu_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -537,7 +539,7 @@ index bcb7724..54e8554 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     /* It turns out that the firmware we have for a650 only partially fixed the
-@@ -9077,6 +9281,9 @@ tu_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
+@@ -9077,6 +9283,9 @@ tu_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -547,7 +549,7 @@ index bcb7724..54e8554 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     draw_wfm(cmd);
-@@ -9112,6 +9319,8 @@ tu_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
+@@ -9112,6 +9321,8 @@ tu_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _counterBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -556,7 +558,7 @@ index bcb7724..54e8554 100644
     /* All known firmware versions do not wait for WFI's with CP_DRAW_AUTO.
      * Plus, for the common case where the counter buffer is written by
      * vkCmdEndTransformFeedback, we need to wait for the CP_WAIT_MEM_WRITES to
-@@ -9382,6 +9591,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+@@ -9382,6 +9593,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     struct tu_cs *cs = &cmd->cs;
     struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
  
@@ -567,7 +569,7 @@ index bcb7724..54e8554 100644
     bool emit_instrlen_workaround =
        shader->variant->instrlen >
        cmd->device->physical_device->info->props.instr_cache_size;
-@@ -9693,6 +9906,8 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
+@@ -9693,6 +9908,8 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buffer, _buffer);
     struct tu_dispatch_info info = {};
  
@@ -576,7 +578,7 @@ index bcb7724..54e8554 100644
     info.indirect = vk_buffer_address(&buffer->vk, offset);
  
     tu_dispatch<CHIP>(cmd_buffer, &info);
-@@ -9723,6 +9938,8 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
+@@ -9723,6 +9940,8 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
     info.unaligned = true;
     info.indirect = size_addr;
  
@@ -585,7 +587,7 @@ index bcb7724..54e8554 100644
     TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
  }
  
-@@ -9896,6 +10113,7 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -9896,6 +10115,7 @@ tu_barrier(struct tu_cmd_buffer *cmd,
           const VkBufferMemoryBarrier2 *barrier =
              &dep_info->pBufferMemoryBarriers[i];
           VK_FROM_HANDLE(tu_buffer, buffer, barrier->buffer);
@@ -593,7 +595,7 @@ index bcb7724..54e8554 100644
           bool sparse_aliasing =
              buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
           VkPipelineStageFlags2 sanitized_src_stage =
-@@ -9926,6 +10144,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -9926,6 +10146,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
              &dep_info->pImageMemoryBarriers[i];
           VK_FROM_HANDLE(tu_image, image, barrier->image);
  
@@ -602,7 +604,7 @@ index bcb7724..54e8554 100644
           VkImageLayout old_layout = barrier->oldLayout;
  
           bool sparse_aliasing =
-@@ -10113,6 +10333,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
+@@ -10113,6 +10335,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
        tu_emit_cache_flush<CHIP>(cmd);
  
     VK_FROM_HANDLE(tu_buffer, buf, pConditionalRenderingBegin->buffer);
@@ -610,7 +612,7 @@ index bcb7724..54e8554 100644
     uint64_t iova = vk_buffer_address(&buf->vk, pConditionalRenderingBegin->offset);
  
     /* qcom doesn't support 32-bit reference values, only 64-bit, but Vulkan
-@@ -10219,6 +10440,8 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
+@@ -10219,6 +10442,8 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
  
@@ -619,7 +621,7 @@ index bcb7724..54e8554 100644
     uint64_t va = vk_buffer_address(&buffer->vk, dstOffset);
  
     struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
-@@ -10295,6 +10518,8 @@ tu_write_buffer_cp(VkCommandBuffer commandBuffer,
+@@ -10295,6 +10520,8 @@ tu_write_buffer_cp(VkCommandBuffer commandBuffer,
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
  
@@ -1294,10 +1296,22 @@ index 6a66de1..6dce578 100644
        assert(cs->pkt == this);
  
 diff --git a/src/freedreno/vulkan/tu_descriptor_set.cc b/src/freedreno/vulkan/tu_descriptor_set.cc
-index 2ff6826..6b03fe0 100644
+index 2ff6826..d8b03ff 100644
 --- a/src/freedreno/vulkan/tu_descriptor_set.cc
 +++ b/src/freedreno/vulkan/tu_descriptor_set.cc
-@@ -193,6 +193,8 @@ tu_CreateDescriptorSetLayout(
+@@ -161,6 +161,11 @@ tu_CreateDescriptorSetLayout(
+       return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
+ 
+    set_layout->flags = pCreateInfo->flags;
++   if (variable_flags) {
++      for (uint32_t i = 0; i < variable_flags->bindingCount; i++) {
++         set_layout->binding_flags |= variable_flags->pBindingFlags[i];
++      }
++   }
+    set_layout->vk.destroy = tu_descriptor_set_layout_destroy;
+ 
+    /* We just allocate all the immutable samplers at the end of the struct */
+@@ -193,6 +198,8 @@ tu_CreateDescriptorSetLayout(
        set_layout->binding[b].array_size =
           binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
           1 : binding->descriptorCount;
@@ -1306,7 +1320,7 @@ index 2ff6826..6b03fe0 100644
        set_layout->binding[b].offset = set_layout->size;
        set_layout->binding[b].dynamic_offset_offset = dynamic_offset_size;
        set_layout->binding[b].shader_stages = binding->stageFlags;
-@@ -694,6 +696,24 @@ tu_descriptor_set_create(struct tu_device *device,
+@@ -694,6 +701,24 @@ tu_descriptor_set_create(struct tu_device *device,
        }
     }
  
@@ -1331,7 +1345,7 @@ index 2ff6826..6b03fe0 100644
     vk_descriptor_set_layout_ref(&layout->vk);
     list_addtail(&set->pool_link, &pool->desc_sets);
     pool->entry_count++;
-@@ -716,6 +736,7 @@ tu_descriptor_set_destroy(struct tu_device *device,
+@@ -716,6 +741,7 @@ tu_descriptor_set_destroy(struct tu_device *device,
     }
  
     pool->entry_count--;
@@ -1339,7 +1353,7 @@ index 2ff6826..6b03fe0 100644
     vk_object_free(&device->vk, NULL, set);
  }
  
-@@ -810,7 +831,9 @@ tu_CreateDescriptorPool(VkDevice _device,
+@@ -810,7 +836,9 @@ tu_CreateDescriptorPool(VkDevice _device,
     if (bo_size) {
        if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
           ret = tu_bo_init_new(device, &pool->base, &pool->bo, bo_size,
@@ -1350,7 +1364,7 @@ index 2ff6826..6b03fe0 100644
           if (ret)
              goto fail_alloc;
  
-@@ -853,6 +876,8 @@ tu_destroy_descriptor_pool_entries(struct tu_device *device,
+@@ -853,6 +881,8 @@ tu_destroy_descriptor_pool_entries(struct tu_device *device,
        vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
        if (!pool->host_memory_base)
           tu_descriptor_set_destroy(device, pool, set);
@@ -1359,7 +1373,7 @@ index 2ff6826..6b03fe0 100644
     }
  
     list_inithead(&pool->desc_sets);
-@@ -971,6 +996,8 @@ tu_FreeDescriptorSets(VkDevice _device,
+@@ -971,6 +1001,8 @@ tu_FreeDescriptorSets(VkDevice _device,
  
        if (set && !pool->host_memory_base)
           tu_descriptor_set_destroy(device, pool, set);
@@ -1368,7 +1382,7 @@ index 2ff6826..6b03fe0 100644
     }
     return VK_SUCCESS;
  }
-@@ -1347,6 +1374,78 @@ tu_GetDescriptorEXT(
+@@ -1347,6 +1379,78 @@ tu_GetDescriptorEXT(
  }
  TU_GENX(tu_GetDescriptorEXT);
  
@@ -1447,7 +1461,7 @@ index 2ff6826..6b03fe0 100644
  template <chip CHIP>
  void
  tu_update_descriptor_sets(const struct tu_device *device,
-@@ -1424,6 +1523,26 @@ tu_update_descriptor_sets(const struct tu_device *device,
+@@ -1424,6 +1528,26 @@ tu_update_descriptor_sets(const struct tu_device *device,
  
        ptr += binding_layout->size / 4 * writeset->dstArrayElement;
        for (j = 0; j < writeset->descriptorCount; ++j) {
@@ -1474,7 +1488,7 @@ index 2ff6826..6b03fe0 100644
           switch(writeset->descriptorType) {
           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
-@@ -1560,6 +1679,16 @@ tu_update_descriptor_sets(const struct tu_device *device,
+@@ -1560,6 +1684,16 @@ tu_update_descriptor_sets(const struct tu_device *device,
        for (j = 0; j < copyset->descriptorCount; ++j) {
           memcpy(dst_ptr, src_ptr, copy_size);
  
@@ -1491,7 +1505,7 @@ index 2ff6826..6b03fe0 100644
           src_ptr += src_binding_layout->size / 4;
           dst_ptr += dst_binding_layout->size / 4;
        }
-@@ -1708,6 +1837,7 @@ tu_CreateDescriptorUpdateTemplate(
+@@ -1708,6 +1842,7 @@ tu_CreateDescriptorUpdateTemplate(
        templ->entry[j++] = (struct tu_descriptor_update_template_entry) {
           .descriptor_type = entry->descriptorType,
           .descriptor_count = entry->descriptorCount,
@@ -1499,7 +1513,7 @@ index 2ff6826..6b03fe0 100644
           .dst_offset = dst_offset,
           .dst_stride = dst_stride,
           .immutable_samplers = immutable_samplers,
-@@ -1769,6 +1899,8 @@ tu_update_descriptor_set_with_template(
+@@ -1769,6 +1904,8 @@ tu_update_descriptor_set_with_template(
        ptr += templ->entry[i].dst_offset;
        unsigned dst_offset = templ->entry[i].dst_offset;
        for (unsigned j = 0; j < templ->entry[i].descriptor_count; ++j) {
@@ -1509,7 +1523,7 @@ index 2ff6826..6b03fe0 100644
           case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: {
              assert(!(set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR));
 diff --git a/src/freedreno/vulkan/tu_descriptor_set.h b/src/freedreno/vulkan/tu_descriptor_set.h
-index 6a6a1ff..630fac8 100644
+index 6a6a1ff..2f93aa7 100644
 --- a/src/freedreno/vulkan/tu_descriptor_set.h
 +++ b/src/freedreno/vulkan/tu_descriptor_set.h
 @@ -7,6 +7,7 @@
@@ -1528,15 +1542,21 @@ index 6a6a1ff..630fac8 100644
  
     /* The size in bytes of each Vulkan descriptor. */
     uint32_t size;
-@@ -72,6 +74,7 @@ struct tu_descriptor_set_layout
+@@ -70,8 +72,13 @@ struct tu_descriptor_set_layout
+    /* The create flags for this descriptor set layout */
+    VkDescriptorSetLayoutCreateFlags flags;
  
++   /* The combined binding flags identify resource records that may change
++    * while submission reads descriptors from other bindings or array slots. */
++   VkDescriptorBindingFlags binding_flags;
++
     /* Number of bindings in this descriptor set */
     uint32_t binding_count;
 +   uint32_t resource_count;
  
     /* Total size of the descriptor set with room for all array entries */
     uint32_t size;
-@@ -137,6 +140,9 @@ struct tu_descriptor_set
+@@ -137,6 +144,9 @@ struct tu_descriptor_set
     uint32_t host_size;
  
     uint32_t *dynamic_descriptors;
@@ -1546,7 +1566,7 @@ index 6a6a1ff..630fac8 100644
  };
  VK_DEFINE_NONDISP_HANDLE_CASTS(tu_descriptor_set, base, VkDescriptorSet,
                                 VK_OBJECT_TYPE_DESCRIPTOR_SET)
-@@ -170,6 +176,7 @@ struct tu_descriptor_update_template_entry
+@@ -170,6 +180,7 @@ struct tu_descriptor_update_template_entry
  
     /* The number of descriptors to update */
     uint32_t descriptor_count;
@@ -1658,7 +1678,7 @@ index 392f2a7..f902017 100644
                          void *metadata, uint32_t metadata_size);
  int tu_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo,
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index a5ccf3f..d957141 100644
+index a5ccf3f..6ca25e8 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -7,6 +7,7 @@
@@ -2165,21 +2185,22 @@ index a5ccf3f..d957141 100644
     event.connection_fence = fence;
     pthread_mutex_lock(&retire->lock);
     struct darwin_bo_node *node = &retire->nodes[bo->gem_handle];
-@@ -1569,8 +1786,89 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1569,8 +1786,91 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
  struct tu_darwin_queue_submit {
     struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
 +   struct util_dynarray ranges; /* tu_resource_range */
 +   struct util_dynarray resources; /* darwin_submit_resource */
++   struct util_dynarray native_ranges; /* NativeAdrenoAbiSubmitResourceV2 */
 +   VkResult result;
 +   uint32_t fallback_reasons;
-+};
-+
+ };
+ 
 +struct darwin_submit_resource {
 +   struct tu_bo *bo;
 +   uint32_t access;
- };
- 
++};
++
 +static NativeAdrenoAbiSubmitCaps
 +darwin_submit_caps(struct tu_device *dev)
 +{
@@ -2234,7 +2255,8 @@ index a5ccf3f..d957141 100644
 +
 +   util_dynarray_foreach (&cmd->resource_descriptor_sets, struct tu_descriptor_set *, set_ptr) {
 +      const struct tu_descriptor_set *set = *set_ptr;
-+      if (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) {
++      if (set->layout->binding_flags & (VK_DESCRIPTOR_BINDING_UPDATE_AFTER_BIND_BIT |
++                                        VK_DESCRIPTOR_BINDING_UPDATE_UNUSED_WHILE_PENDING_BIT)) {
 +         submit->fallback_reasons |= TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND;
 +         continue;
 +      }
@@ -2255,7 +2277,7 @@ index a5ccf3f..d957141 100644
  static void *
  darwin_submit_create(struct tu_device *device)
  {
-@@ -1582,7 +1880,12 @@ static void
+@@ -1582,7 +1882,13 @@ static void
  darwin_submit_finish(struct tu_device *device, void *_submit)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -2265,10 +2287,11 @@ index a5ccf3f..d957141 100644
     util_dynarray_fini(&submit->commands);
 +   util_dynarray_fini(&submit->ranges);
 +   util_dynarray_fini(&submit->resources);
++   util_dynarray_fini(&submit->native_ranges);
     vk_free(&device->vk.alloc, submit);
  }
  
-@@ -1591,8 +1894,15 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1591,8 +1897,15 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
                            struct tu_cs_entry *entries, unsigned num_entries)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -2284,7 +2307,7 @@ index a5ccf3f..d957141 100644
     for (unsigned i = 0; i < num_entries; i++) {
        cmds[i] = (NativeAdrenoAbiSubmitBuffer) {
           .handle = entries[i].bo->darwin_handle,
-@@ -1602,6 +1912,86 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1602,6 +1915,150 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
     }
  }
  
@@ -2294,6 +2317,36 @@ index a5ccf3f..d957141 100644
 +   const struct darwin_submit_resource *a = (const struct darwin_submit_resource *)left;
 +   const struct darwin_submit_resource *b = (const struct darwin_submit_resource *)right;
 +   return a->bo->iova < b->bo->iova ? -1 : a->bo->iova > b->bo->iova;
++}
++
++static int
++darwin_native_range_compare(const void *left, const void *right)
++{
++   const NativeAdrenoAbiSubmitResourceV2 *a = (const NativeAdrenoAbiSubmitResourceV2 *)left;
++   const NativeAdrenoAbiSubmitResourceV2 *b = (const NativeAdrenoAbiSubmitResourceV2 *)right;
++   if (a->handle != b->handle)
++      return a->handle < b->handle ? -1 : 1;
++   if (a->access != b->access)
++      return a->access < b->access ? -1 : 1;
++   return a->offset < b->offset ? -1 : a->offset > b->offset;
++}
++
++static VkResult
++darwin_add_native_range(struct tu_darwin_queue_submit *submit, struct tu_bo *bo,
++                       uint64_t offset, uint64_t bytes, uint32_t access)
++{
++   if (bo->darwin_alloc_flags & TU_BO_ALLOC_GPU_READ_ONLY)
++      access &= ~TU_RESOURCE_WRITE;
++   if (!access)
++      return VK_SUCCESS;
++
++   NativeAdrenoAbiSubmitResourceV2 *range = (NativeAdrenoAbiSubmitResourceV2 *)
++      util_dynarray_grow(&submit->native_ranges, NativeAdrenoAbiSubmitResourceV2, 1);
++   if (!range)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   *range = {bo->darwin_handle, offset, bytes, access, 0};
++   return VK_SUCCESS;
 +}
 +
 +static VkResult
@@ -2346,6 +2399,21 @@ index a5ccf3f..d957141 100644
 +         continue;
 +      }
 +      objects[lo - 1].access |= range->access;
++      VkResult result = darwin_add_native_range(submit, objects[lo - 1].bo,
++         range->iova - objects[lo - 1].bo->iova, range->size, range->access);
++      if (result != VK_SUCCESS)
++         return result;
++   }
++
++   for (uint32_t i = 0; i < count; i++) {
++      struct tu_bo *bo = objects[i].bo;
++      if (!(bo->darwin_alloc_flags & TU_BO_ALLOC_INTERNAL_RESOURCE))
++         continue;
++
++      VkResult result = darwin_add_native_range(submit, bo, 0, bo->size,
++                                                TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++      if (result != VK_SUCCESS)
++         return result;
 +   }
 +
 +   uint32_t kept = 0;
@@ -2365,13 +2433,32 @@ index a5ccf3f..d957141 100644
 +      }
 +   }
 +   submit->resources.size = kept * sizeof(*objects);
++
++   NativeAdrenoAbiSubmitResourceV2 *ranges =
++      (NativeAdrenoAbiSubmitResourceV2 *)submit->native_ranges.data;
++   const uint32_t range_count =
++      util_dynarray_num_elements(&submit->native_ranges, NativeAdrenoAbiSubmitResourceV2);
++   qsort(ranges, range_count, sizeof(*ranges), darwin_native_range_compare);
++   uint32_t merged = 0;
++   for (uint32_t i = 0; i < range_count; i++) {
++      if (merged && ranges[merged - 1].handle == ranges[i].handle &&
++          ranges[merged - 1].access == ranges[i].access &&
++          ranges[i].offset <= ranges[merged - 1].offset + ranges[merged - 1].bytes) {
++         const uint64_t end = MAX2(ranges[merged - 1].offset + ranges[merged - 1].bytes,
++                                  ranges[i].offset + ranges[i].bytes);
++         ranges[merged - 1].bytes = end - ranges[merged - 1].offset;
++      } else {
++         ranges[merged++] = ranges[i];
++      }
++   }
++   submit->native_ranges.size = merged * sizeof(*ranges);
 +   return VK_SUCCESS;
 +}
 +
  static void
  darwin_submit_add_bind(struct tu_device *device, void *_submit,
                         struct tu_sparse_vma *vma, uint64_t vma_offset,
-@@ -1816,6 +2206,115 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+@@ -1816,6 +2273,132 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
     return vk_device_set_lost(&dev->vk, "submit: no free job slot");
  }
  
@@ -2382,7 +2469,8 @@ index a5ccf3f..d957141 100644
 +   struct tu_device *dev = queue->device;
 +   struct darwin_connection &dw = *darwin_connection_for(dev);
 +   const uint32_t ib_count = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
-+   const uint32_t resource_count = util_dynarray_num_elements(&submit->resources, struct darwin_submit_resource);
++   const uint32_t resource_count =
++      util_dynarray_num_elements(&submit->native_ranges, NativeAdrenoAbiSubmitResourceV2);
 +   const size_t bytes = sizeof(NativeAdrenoAbiSubmitV2) +
 +      ib_count * sizeof(NativeAdrenoAbiSubmitIbV2) +
 +      resource_count * sizeof(NativeAdrenoAbiSubmitResourceV2);
@@ -2420,19 +2508,35 @@ index a5ccf3f..d957141 100644
 +   NativeAdrenoAbiSubmitResourceV2 *resources =
 +      (NativeAdrenoAbiSubmitResourceV2 *)((uint8_t *)header + header->resource_offset);
 +   const struct darwin_submit_resource *objects = (const struct darwin_submit_resource *)submit->resources.data;
++   const uint32_t object_count = util_dynarray_num_elements(&submit->resources, struct darwin_submit_resource);
 +   const NativeAdrenoAbiSubmitBuffer *commands = (const NativeAdrenoAbiSubmitBuffer *)submit->commands.data;
-+   for (uint32_t i = 0; i < resource_count; i++) {
-+      resources[i] = {objects[i].bo->darwin_handle, 0, objects[i].bo->size, objects[i].access, 0};
-+   }
++   memcpy(resources, submit->native_ranges.data, resource_count * sizeof(*resources));
 +   for (uint32_t i = 0; i < ib_count; i++) {
-+      uint32_t resource = 0;
-+      while (resource < resource_count && objects[resource].bo->darwin_handle != commands[i].handle)
-+         resource++;
-+      if (resource == resource_count) {
++      uint32_t object = 0;
++      while (object < object_count && objects[object].bo->darwin_handle != commands[i].handle) {
++         object++;
++      }
++      if (object == object_count) {
 +         vk_free(&dev->vk.alloc, packet);
 +         return vk_device_set_lost(&dev->vk, "native IB has no live retained BO");
 +      }
-+      ibs[i] = {resource, 0, commands[i].iova - objects[resource].bo->iova, commands[i].bytes};
++
++      const uint64_t offset = commands[i].iova - objects[object].bo->iova;
++      uint32_t resource = 0;
++      while (resource < resource_count) {
++         const NativeAdrenoAbiSubmitResourceV2 &range = resources[resource];
++         if (range.handle == commands[i].handle && (range.access & TU_RESOURCE_READ) &&
++             offset >= range.offset && offset - range.offset <= range.bytes &&
++             commands[i].bytes <= range.bytes - (offset - range.offset)) {
++            break;
++         }
++         resource++;
++      }
++      if (resource == resource_count) {
++         vk_free(&dev->vk.alloc, packet);
++         return vk_device_set_lost(&dev->vk, "native IB has no readable resource range");
++      }
++      ibs[i] = {resource, 0, offset, commands[i].bytes};
 +   }
 +
 +   VkResult result = VK_SUCCESS;
@@ -2487,7 +2591,7 @@ index a5ccf3f..d957141 100644
  static VkResult
  darwin_queue_submit(struct tu_queue *queue, void *_submit,
                      struct vk_sync_wait *waits, uint32_t wait_count,
-@@ -1826,6 +2325,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1826,6 +2409,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     struct tu_device *dev = queue->device;
     struct darwin_connection &dw = *darwin_connection_for(dev);
  
@@ -2497,7 +2601,7 @@ index a5ccf3f..d957141 100644
     /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
     for (uint32_t i = 0; i < wait_count; i++) {
        struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
-@@ -1837,14 +2339,23 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1837,14 +2423,23 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     uint32_t fence = 0;
     const unsigned total = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
     if (total) {
@@ -2523,7 +2627,7 @@ index a5ccf3f..d957141 100644
           pthread_mutex_lock(&dw.lock);
           darwin_note_fence(&dw, chunk_fence);
           pthread_mutex_unlock(&dw.lock);
-@@ -1869,6 +2380,20 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1869,6 +2464,20 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
  
  /* ---- device ---- */
  
@@ -2544,7 +2648,7 @@ index a5ccf3f..d957141 100644
  static VkResult
  darwin_device_init(struct tu_device *dev)
  {
-@@ -2090,6 +2615,7 @@ static const struct tu_knl darwin_knl_funcs = {
+@@ -2090,6 +2699,7 @@ static const struct tu_knl darwin_knl_funcs = {
     .queue_wait_fence = darwin_queue_wait_fence,
     .sparse_vma_init = darwin_sparse_vma_init,
     .sparse_vma_finish = darwin_sparse_vma_finish,
