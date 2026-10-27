@@ -1,8 +1,16 @@
 diff --git a/src/freedreno/vulkan/tu_autotune.cc b/src/freedreno/vulkan/tu_autotune.cc
-index d748039..2f2293e 100644
+index d748039..fae6ea3 100644
 --- a/src/freedreno/vulkan/tu_autotune.cc
 +++ b/src/freedreno/vulkan/tu_autotune.cc
-@@ -394,6 +394,10 @@ tu_autotune::submission_entry::try_get_cs(uint32_t new_fence)
+@@ -367,6 +367,7 @@ static void
+ write_fence_cs(struct tu_device *dev, struct tu_cs *cs, uint32_t fence)
+ {
+    uint64_t dst_iova = dev->global_bo->iova + gb_offset(autotune_fence);
++   tu_cs_use_range(cs, dst_iova, sizeof(uint32_t), TU_RESOURCE_WRITE);
+    if (CHIP >= A7XX) {
+       tu_cs_emit_pkt7(cs, CP_EVENT_WRITE7, 4);
+       tu_cs_emit(cs, CP_EVENT_WRITE7_0(.event = CACHE_FLUSH_TS, .write_src = EV_WRITE_USER_32B, .write_dst = EV_DST_RAM,
+@@ -394,6 +395,10 @@ tu_autotune::submission_entry::try_get_cs(uint32_t new_fence)
     tu_cs_begin(&fence_cs);
     TU_CALLX(device, write_fence_cs)(device, &fence_cs, new_fence);
     tu_cs_end(&fence_cs);
@@ -13,7 +21,42 @@ index d748039..2f2293e 100644
     assert(fence_cs.entry_count == 1); /* We expect the initial allocation to be large enough. */
     fence = new_fence;
  
-@@ -1606,6 +1610,10 @@ tu_autotune::on_submit(struct tu_cmd_buffer **cmd_buffers, uint32_t cmd_buffer_c
+@@ -658,6 +663,7 @@ struct tu_autotune::rp_entry {
+ 
+    void emit_metric_timestamp(struct tu_cs *cs, uint64_t timestamp_iova)
+    {
++      tu_cs_use_range(cs, timestamp_iova, sizeof(uint64_t), TU_RESOURCE_WRITE);
+       tu_cs_emit_pkt7(cs, CP_REG_TO_MEM, 3);
+       tu_cs_emit(cs, CP_REG_TO_MEM_0_REG(TU_CALLX(device, __CP_ALWAYS_ON_COUNTER)({}).reg) | CP_REG_TO_MEM_0_CNT(2) |
+                         CP_REG_TO_MEM_0_64B);
+@@ -669,6 +675,7 @@ struct tu_autotune::rp_entry {
+    void emit_rp_start(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    {
+       assert(map && bo.iova);
++      tu_cmd_use_range(cmd, {bo.iova, bo.size, TU_RESOURCE_READ | TU_RESOURCE_WRITE});
+       uint64_t bo_iova = bo.iova;
+       if (config.test(metric_flag::SAMPLES))
+          emit_metric_samples_start(cmd, cs, bo_iova + offsetof(rp_gpu_data, samples_start));
+@@ -680,6 +687,7 @@ struct tu_autotune::rp_entry {
+    void emit_rp_end(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    {
+       assert(map && bo.iova);
++      tu_cmd_use_range(cmd, {bo.iova, bo.size, TU_RESOURCE_READ | TU_RESOURCE_WRITE});
+       uint64_t bo_iova = bo.iova;
+       if (config.test(metric_flag::SAMPLES))
+          emit_metric_samples_end(cmd, cs, bo_iova + offsetof(rp_gpu_data, samples_start),
+@@ -791,6 +799,10 @@ tu_autotune::rp_entry_batch::snapshot_preempt_data(struct tu_cs *cs)
+ 
+    tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
+    tu_cs_emit(cs, sizeof(rp_batch_preempt_gpu_data) / sizeof(uint32_t));
++   tu_cs_use_range(cs, preempt_latency.device->global_bo->iova + base_offset,
++                   sizeof(rp_batch_preempt_gpu_data), TU_RESOURCE_READ);
++   tu_cs_use_range(cs, preempt_latency.bo.iova, sizeof(rp_batch_preempt_gpu_data),
++                   TU_RESOURCE_WRITE);
+    tu_cs_emit_qw(cs, preempt_latency.device->global_bo->iova + base_offset);
+    tu_cs_emit_qw(cs, preempt_latency.bo.iova);
+ }
+@@ -1606,6 +1618,10 @@ tu_autotune::on_submit(struct tu_cmd_buffer **cmd_buffers, uint32_t cmd_buffer_c
     /* Generate a new fence and the CS for it. */
     const uint32_t new_fence = next_fence++;
     auto fence_cs = get_cs_for_fence(new_fence);
@@ -25,7 +68,7 @@ index d748039..2f2293e 100644
        /* Transfer the entries from the command buffers to the active queue. */
        struct tu_cmd_buffer *cmdbuf = cmd_buffers[i];
 diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
-index 1d33085..671b659 100644
+index 1d33085..d5786bf 100644
 --- a/src/freedreno/vulkan/tu_clear_blit.cc
 +++ b/src/freedreno/vulkan/tu_clear_blit.cc
 @@ -2734,6 +2734,9 @@ tu_CmdBlitImage2(VkCommandBuffer commandBuffer,
@@ -58,7 +101,17 @@ index 1d33085..671b659 100644
     trace_start_copy_image_to_buffer(&cmd->trace, &cmd->cs, cmd, src_image->vk.format);
  
     bool unaligned_store = false;
-@@ -3476,6 +3485,9 @@ tu_CmdCopyImage2(VkCommandBuffer commandBuffer,
+@@ -3384,6 +3393,9 @@ tu_copy_image_to_image(struct tu_cmd_buffer *cmd,
+          return;
+       }
+ 
++      tu_cmd_use_range(cmd, {staging_bo->iova, staging_layout.size,
++                             TU_RESOURCE_READ | TU_RESOURCE_WRITE});
++
+       struct fdl6_view staging;
+       const struct fdl_layout *staging_layout_ptr = &staging_layout;
+       const struct fdl_view_args copy_to_args = {
+@@ -3476,6 +3488,9 @@ tu_CmdCopyImage2(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_image, src_image, pCopyImageInfo->srcImage);
     VK_FROM_HANDLE(tu_image, dst_image, pCopyImageInfo->dstImage);
  
@@ -68,7 +121,7 @@ index 1d33085..671b659 100644
     trace_start_copy_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
                            dst_image->vk.format);
  
-@@ -3749,6 +3761,9 @@ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+@@ -3749,6 +3764,9 @@ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
     VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
  
@@ -78,7 +131,7 @@ index 1d33085..671b659 100644
     trace_start_copy_buffer(&cmd->trace, &cmd->cs, cmd);
  
     /* Choose the largest common block size for all copy regions
-@@ -3799,6 +3814,8 @@ tu_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
+@@ -3799,6 +3817,8 @@ tu_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
  
@@ -87,7 +140,7 @@ index 1d33085..671b659 100644
     struct tu_cs_memory tmp;
     VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dataSize, 64), 64 / 4, &tmp);
     if (result != VK_SUCCESS) {
-@@ -3892,8 +3909,11 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
+@@ -3892,8 +3912,11 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
                   VkDeviceSize fillSize,
                   uint32_t data)
  {
@@ -99,7 +152,7 @@ index 1d33085..671b659 100644
     fillSize = vk_buffer_range(&buffer->vk, dstOffset, fillSize);
  
     VkDeviceAddress dst_va = vk_buffer_address(&buffer->vk, dstOffset);
-@@ -3910,6 +3930,9 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
+@@ -3910,6 +3933,9 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, src_image, pResolveImageInfo->srcImage);
     VK_FROM_HANDLE(tu_image, dst_image, pResolveImageInfo->dstImage);
@@ -109,7 +162,7 @@ index 1d33085..671b659 100644
     const struct blit_ops *ops = &r2d_ops<CHIP>;
     struct tu_cs *cs = &cmd->cs;
  
-@@ -4306,6 +4329,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
+@@ -4306,6 +4332,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, image, image_h);
  
@@ -118,7 +171,7 @@ index 1d33085..671b659 100644
     trace_start_clear_color_image(&cmd->trace, &cmd->cs, cmd, image->vk.format);
  
     bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
-@@ -4348,6 +4373,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
+@@ -4348,6 +4376,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, image, image_h);
  
@@ -128,10 +181,10 @@ index 1d33085..671b659 100644
                                           image->vk.format);
  
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index bcb7724..540a056 100644
+index bcb7724..43fb96e 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
-@@ -33,6 +33,101 @@ enum tu_cmd_buffer_status {
+@@ -33,6 +33,127 @@ enum tu_cmd_buffer_status {
     TU_CMD_BUFFER_STATUS_ACTIVE = 1,
  };
  
@@ -142,6 +195,15 @@ index bcb7724..540a056 100644
 +   if (!range.iova || !range.size)
 +      return;
 +
++   const uint32_t count = util_dynarray_num_elements(&cmd->resource_ranges, struct tu_resource_range);
++   struct tu_resource_range *ranges = (struct tu_resource_range *)cmd->resource_ranges.data;
++   for (uint32_t i = count; i > 0 && count - i < 16; i--) {
++      if (ranges[i - 1].iova == range.iova && ranges[i - 1].size == range.size) {
++         ranges[i - 1].access |= range.access;
++         return;
++      }
++   }
++
 +   struct tu_resource_range *record = (struct tu_resource_range *)
 +      util_dynarray_grow(&cmd->resource_ranges, struct tu_resource_range, 1);
 +   if (!record) {
@@ -151,6 +213,23 @@ index bcb7724..540a056 100644
 +
 +   *record = range;
 +#endif
++}
++
++void
++tu_cmd_use_bo(struct tu_cmd_buffer *cmd, const struct tu_bo *bo, uint32_t access)
++{
++   if (bo)
++      tu_cmd_use_range(cmd, {bo->iova, bo->size, access});
++}
++
++static void
++tu_cmd_use_shader(struct tu_cmd_buffer *cmd, const struct tu_shader *shader)
++{
++   if (!shader)
++      return;
++
++   tu_cmd_use_range(cmd, {shader->bo.iova, shader->bo.size, TU_RESOURCE_READ});
++   tu_cmd_use_bo(cmd, shader->pvtmem_bo, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
 +}
 +
 +void
@@ -233,7 +312,23 @@ index bcb7724..540a056 100644
  static struct tu_bo *
  tu_cmd_buffer_setup_status_tracking(struct tu_device *device)
  {
-@@ -267,6 +362,11 @@ static void
+@@ -91,6 +212,7 @@ tu_cmd_buffer_status_gpu_write(struct tu_cmd_buffer *cmd_buffer,
+    if (cmd_buffer->status_bo == NULL)
+       return;
+ 
++   tu_cmd_use_bo(cmd_buffer, cmd_buffer->status_bo, TU_RESOURCE_WRITE);
+    static_assert(sizeof(uint32_t) == sizeof(status),
+                  "Code below needs adjusting");
+    tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 3);
+@@ -212,6 +334,7 @@ tu6_lazy_emit_tessfactor_addr(struct tu_cmd_buffer *cmd)
+    cmd->state.tessfactor_addr_set = true;
+ 
+    tu_cs_emit_regs(&cmd->cs, PC_TESS_BASE(CHIP, .qword = cmd->device->tess_bo->iova));
++   tu_cmd_use_bo(cmd, cmd->device->tess_bo, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
+    /* Updating PC_TESS_BASE could race with the next draw which uses it. */
+    if (CHIP == A6XX)
+       cmd->state.cache.flush_bits |= TU_CMD_FLAG_WAIT_FOR_IDLE;
+@@ -267,6 +390,11 @@ static void
  tu_emit_vis_stream_patchpoint(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
                                uint32_t offset)
  {
@@ -245,7 +340,7 @@ index bcb7724..540a056 100644
     struct tu_vis_stream_patchpoint patchpoint = {
        .render_pass_idx = cmd->state.tile_render_pass_count,
        .data = cs->cur,
-@@ -457,6 +557,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+@@ -457,6 +585,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
  {
     tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
  
@@ -257,7 +352,7 @@ index bcb7724..540a056 100644
     if (!force_disable_cb) {
        struct tu_cb_control_point info = {
           .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
-@@ -478,6 +583,11 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+@@ -478,6 +611,11 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
  {
     tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
  
@@ -269,7 +364,7 @@ index bcb7724..540a056 100644
     struct tu_cb_control_point info = {
        .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
        .patchpoint = cs->cur,
-@@ -555,6 +665,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
+@@ -555,6 +693,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
  
        tu_cs_patchable_end(cs, false, &cb_state);
  
@@ -281,7 +376,23 @@ index bcb7724..540a056 100644
        tu_add_cb_barrier_info(cmd_buffer);
  
        struct tu_cb_control_point cb_patch = {
-@@ -2504,6 +2619,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+@@ -1175,6 +1318,7 @@ tu6_apply_depth_bounds_workaround(struct tu_device *device,
+ void
+ tu_cs_emit_draw_state(struct tu_cs *cs, uint32_t id, struct tu_draw_state state)
+ {
++   tu_cs_use_range(cs, state.iova, state.size * sizeof(uint32_t), TU_RESOURCE_READ);
+    uint32_t enable_mask;
+    switch (id) {
+    case TU_DRAW_STATE_VS:
+@@ -2438,6 +2582,7 @@ static void
+ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+ {
+    struct tu_device *dev = cmd->device;
++   tu_cmd_use_bo(cmd, dev->global_bo, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
+    const struct tu_physical_device *phys_dev = dev->physical_device;
+ 
+    if (CHIP == A6XX) {
+@@ -2504,6 +2649,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
        tu_cs_emit_pkt7(cs, CP_BV_BR_COUNT_OPS, 2);
        tu_cs_emit(cs, CP_BV_BR_COUNT_OPS_0_OP(PIPE_SET_BR_OFFSET));
  
@@ -293,7 +404,43 @@ index bcb7724..540a056 100644
        struct tu_vis_stream_patchpoint *patchpoint =
           &cmd->vis_stream_count_patchpoint;
        patchpoint->data = cs->cur;
-@@ -3236,6 +3356,11 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
+@@ -2519,6 +2669,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    bool track_preempt_latency = dev->autotune->emit_preempt_latency_tracking_setup(cmd, cs);
+ 
+    tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
++   tu_cs_use_range(cs, dev->bin_preamble_entry.bo->iova + dev->bin_preamble_entry.offset,
++                   dev->bin_preamble_entry.size, TU_RESOURCE_READ);
+    tu_cs_emit_qw(cs, cmd->device->bin_preamble_entry.bo->iova +
+                      cmd->device->bin_preamble_entry.offset);
+    tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(cmd->device->bin_preamble_entry.size /
+@@ -2529,6 +2681,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       tu7_thread_control(cs, CP_SET_THREAD_BV);
+ 
+       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
++      tu_cs_use_range(cs, dev->bin_preamble_bv_entry.bo->iova + dev->bin_preamble_bv_entry.offset,
++                      dev->bin_preamble_bv_entry.size, TU_RESOURCE_READ);
+       tu_cs_emit_qw(cs, cmd->device->bin_preamble_bv_entry.bo->iova +
+                         cmd->device->bin_preamble_bv_entry.offset);
+       tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(cmd->device->bin_preamble_bv_entry.size /
+@@ -2543,6 +2697,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    }
+ 
+    if (dev->switch_back_amble_entry.size > 0 && track_preempt_latency) {
++      tu_cs_use_range(cs, dev->switch_back_amble_entry.bo->iova + dev->switch_back_amble_entry.offset,
++                      dev->switch_back_amble_entry.size, TU_RESOURCE_READ);
+       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
+       tu_cs_emit_qw(cs, dev->switch_back_amble_entry.bo->iova + dev->switch_back_amble_entry.offset);
+       tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(dev->switch_back_amble_entry.size / sizeof(uint32_t)) |
+@@ -2554,6 +2710,8 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+    }
+    
+    if (dev->switch_away_amble_entry.size > 0 && track_preempt_latency) {
++      tu_cs_use_range(cs, dev->switch_away_amble_entry.bo->iova + dev->switch_away_amble_entry.offset,
++                      dev->switch_away_amble_entry.size, TU_RESOURCE_READ);
+       tu_cs_emit_pkt7(cs, CP_SET_AMBLE, 3);
+       tu_cs_emit_qw(cs, dev->switch_away_amble_entry.bo->iova + dev->switch_away_amble_entry.offset);
+       tu_cs_emit(cs, CP_SET_AMBLE_2_DWORDS(dev->switch_away_amble_entry.size / sizeof(uint32_t)) |
+@@ -3236,6 +3394,11 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
     }
     tu_cs_patchable_end(cs, true, &no_cb_state);
  
@@ -305,7 +452,7 @@ index bcb7724..540a056 100644
     struct tu_cb_control_point enable_cb_patch = {
        .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
        .patchpoint = cb_state.nop_header,
-@@ -4177,6 +4302,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+@@ -4177,6 +4340,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
     struct tu_cmd_buffer *cmd_buffer =
        container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
  
@@ -315,7 +462,7 @@ index bcb7724..540a056 100644
     tu_cs_finish(&cmd_buffer->cs);
     tu_cs_finish(&cmd_buffer->draw_cs);
     tu_cs_finish(&cmd_buffer->tile_store_cs);
-@@ -4203,6 +4331,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+@@ -4203,6 +4369,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
                                          &cmd_buffer->descriptors[i].push_set.layout->vk);
        vk_free(&cmd_buffer->device->vk.alloc,
                cmd_buffer->descriptors[i].push_set.mapped_ptr);
@@ -324,7 +471,7 @@ index bcb7724..540a056 100644
     }
  
     util_dynarray_foreach (&cmd_buffer->msrtss_color_temporaries,
-@@ -4253,6 +4383,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+@@ -4253,6 +4421,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
     struct tu_cmd_buffer *cmd_buffer =
        container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
  
@@ -335,7 +482,7 @@ index bcb7724..540a056 100644
     VkResult status_check_result = VK_SUCCESS;
     if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
        status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
-@@ -4281,6 +4415,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+@@ -4281,6 +4453,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
                                          &cmd_buffer->descriptors[i].push_set.layout->vk);
        }
        vk_free(&cmd_buffer->device->vk.alloc, cmd_buffer->descriptors[i].push_set.mapped_ptr);
@@ -343,7 +490,7 @@ index bcb7724..540a056 100644
        memset(&cmd_buffer->descriptors[i].push_set, 0, sizeof(cmd_buffer->descriptors[i].push_set));
        cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
        cmd_buffer->descriptors[i].max_sets_bound = 0;
-@@ -4576,6 +4711,7 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+@@ -4576,6 +4749,7 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
           cmd->state.vb[firstBinding + i].size = 0;
        } else {
           struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
@@ -351,7 +498,7 @@ index bcb7724..540a056 100644
           cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
           cmd->state.vb[firstBinding + i].size =
              vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
-@@ -4602,6 +4738,8 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+@@ -4602,6 +4776,8 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buf, buffer);
  
@@ -360,7 +507,7 @@ index bcb7724..540a056 100644
     size = buf ? vk_buffer_range(&buf->vk, offset, size) : 0;
  
     uint32_t index_size, index_shift;
-@@ -4770,6 +4908,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+@@ -4770,6 +4946,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
        if (!set)
           continue;
  
@@ -369,7 +516,7 @@ index bcb7724..540a056 100644
        if (set->layout->has_inline_uniforms)
           cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
  
-@@ -4913,6 +5053,8 @@ tu_CmdBindDescriptorBuffersEXT(
+@@ -4913,6 +5091,8 @@ tu_CmdBindDescriptorBuffersEXT(
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
  
@@ -378,7 +525,16 @@ index bcb7724..540a056 100644
     for (unsigned i = 0; i < bufferCount; i++)
        cmd->state.descriptor_buffer_iova[i] = pBindingInfos[i].address;
  }
-@@ -5027,6 +5169,19 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
+@@ -4979,6 +5159,8 @@ tu_bind_descriptor_buffer_embedded_samplers(
+    struct tu_descriptor_set_layout *set_layout =
+       layout->set[info->set].layout;
+ 
++   tu_cmd_use_bo(cmd, set_layout->embedded_samplers, TU_RESOURCE_READ);
++
+    struct tu_descriptor_state *descriptors_state =
+       tu_get_descriptors_state(cmd, bind_point);
+ 
+@@ -5027,6 +5209,19 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
     vk_descriptor_set_layout_ref(&layout->vk);
     set->layout = layout;
  
@@ -398,7 +554,7 @@ index bcb7724..540a056 100644
     if (set->host_size < layout->size) {
        void *new_buf =
           vk_realloc(&device->vk.alloc, set->mapped_ptr, layout->size, 8,
-@@ -5170,6 +5325,7 @@ tu_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+@@ -5170,6 +5365,7 @@ tu_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
  
     for (uint32_t i = 0; i < bindingCount; i++) {
        VK_FROM_HANDLE(tu_buffer, buf, pBuffers[i]);
@@ -406,7 +562,7 @@ index bcb7724..540a056 100644
        uint64_t iova = vk_buffer_address(&buf->vk, pOffsets[i]);
        uint32_t size = vk_buffer_range(&buf->vk, pOffsets[i],
                                        pSizes ? pSizes[i] : VK_WHOLE_SIZE);
-@@ -5220,6 +5376,8 @@ tu_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+@@ -5220,6 +5416,8 @@ tu_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
  
        VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
  
@@ -415,7 +571,7 @@ index bcb7724..540a056 100644
        tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
        tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(VPC_SO_BUFFER_OFFSET(CHIP, idx).reg) |
                       CP_MEM_TO_REG_0_UNK31 |
-@@ -5273,6 +5431,8 @@ tu_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+@@ -5273,6 +5471,8 @@ tu_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
  
        VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
  
@@ -424,7 +580,7 @@ index bcb7724..540a056 100644
        /* VPC_SO_FLUSH_BASE has dwords counter, but counter should be in bytes */
        tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
        tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(tu_scratch_reg<CHIP>(0).reg) |
-@@ -5328,7 +5488,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -5328,7 +5528,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
  
@@ -433,7 +589,7 @@ index bcb7724..540a056 100644
        return vk_command_buffer_end(&cmd_buffer->vk);
     }
  
-@@ -5378,6 +5538,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+@@ -5378,6 +5578,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
     tu_cs_end(&cmd_buffer->draw_cs);
     tu_cs_end(&cmd_buffer->draw_epilogue_cs);
  
@@ -441,7 +597,16 @@ index bcb7724..540a056 100644
     return vk_command_buffer_end(&cmd_buffer->vk);
  }
  TU_GENX(tu_EndCommandBuffer);
-@@ -6322,6 +6483,19 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+@@ -5490,6 +5691,8 @@ tu_CmdBindPipeline(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_pipeline, pipeline, _pipeline);
+ 
++   tu_cmd_use_range(cmd, {pipeline->bo.iova, pipeline->bo.size, TU_RESOURCE_READ});
++
+    if (pipelineBindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
+       cmd->state.shaders[MESA_SHADER_COMPUTE] =
+          pipeline->shaders[MESA_SHADER_COMPUTE];
+@@ -6322,6 +6525,29 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
     for (uint32_t i = 0; i < commandBufferCount; i++) {
        VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
  
@@ -453,6 +618,16 @@ index bcb7724..540a056 100644
 +      util_dynarray_foreach (&secondary->resource_ranges, struct tu_resource_range, range) {
 +         tu_cmd_use_range(cmd, *range);
 +      }
++      const struct tu_cs *streams[] = {
++         &secondary->cs, &secondary->draw_cs, &secondary->tile_store_cs,
++         &secondary->draw_epilogue_cs, &secondary->sub_cs,
++         &secondary->pre_chain.draw_cs, &secondary->pre_chain.draw_epilogue_cs,
++      };
++      for (const struct tu_cs *stream : streams) {
++         util_dynarray_foreach (&stream->resource_ranges, struct tu_resource_range, range) {
++            tu_cmd_use_range(cmd, *range);
++         }
++      }
 +      util_dynarray_foreach (&secondary->resource_descriptor_sets, struct tu_descriptor_set *, set) {
 +         tu_cmd_use_descriptor_set(cmd, *set);
 +      }
@@ -461,7 +636,7 @@ index bcb7724..540a056 100644
        if (secondary->usage_flags &
            VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) {
           assert(tu_cs_is_empty(&secondary->cs));
-@@ -6389,6 +6563,10 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+@@ -6389,6 +6615,10 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
                 tu_cs_reserve_space(cs, 5);
                 tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
                 tu_cs_emit_qw(cs, patchpoint.iova);
@@ -472,7 +647,7 @@ index bcb7724..540a056 100644
                 patchpoint.iova = tu_cs_get_cur_iova(cs);
                 patchpoint.data = cs->cur;
                 tu_cs_emit_qw(cs, 0);
-@@ -7024,6 +7202,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+@@ -7024,6 +7254,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
  
     tu_choose_gmem_layout(cmd);
  
@@ -486,7 +661,7 @@ index bcb7724..540a056 100644
     /* Note: because this is external, any flushes will happen before draw_cs
      * gets called. However deferred flushes could have to happen later as part
      * of the subpass.
-@@ -7185,6 +7370,13 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+@@ -7185,6 +7422,13 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
        return;
     }
  
@@ -500,12 +675,13 @@ index bcb7724..540a056 100644
     tu_choose_gmem_layout(cmd);
  
     cmd->state.renderpass_cache.pending_flush_bits =
-@@ -8337,6 +8529,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+@@ -8337,6 +8581,14 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
                  /* note: draw_count is 0 for indirect */
                  uint32_t draw_count)
  {
 +   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT; stage++) {
 +      const struct tu_shader *shader = cmd->state.shaders[stage];
++      tu_cmd_use_shader(cmd, shader);
 +      if (shader && shader->uses_buffer_device_address) {
 +         cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
 +      }
@@ -514,7 +690,7 @@ index bcb7724..540a056 100644
     const struct tu_program_state *program = &cmd->state.program;
     struct tu_render_pass_state *rp = &cmd->state.rp;
  
-@@ -8971,6 +9170,8 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
+@@ -8971,6 +9223,8 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _buffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -523,7 +699,7 @@ index bcb7724..540a056 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
-@@ -9002,6 +9203,8 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+@@ -9002,6 +9256,8 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _buffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -532,7 +708,7 @@ index bcb7724..540a056 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
-@@ -9038,6 +9241,9 @@ tu_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
+@@ -9038,6 +9294,9 @@ tu_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -542,7 +718,7 @@ index bcb7724..540a056 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     /* It turns out that the firmware we have for a650 only partially fixed the
-@@ -9077,6 +9283,9 @@ tu_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
+@@ -9077,6 +9336,9 @@ tu_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -552,7 +728,7 @@ index bcb7724..540a056 100644
     tu6_emit_empty_vs_params<CHIP>(cmd);
  
     draw_wfm(cmd);
-@@ -9112,6 +9321,8 @@ tu_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
+@@ -9112,6 +9374,8 @@ tu_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buf, _counterBuffer);
     struct tu_cs *cs = &cmd->draw_cs;
  
@@ -561,10 +737,12 @@ index bcb7724..540a056 100644
     /* All known firmware versions do not wait for WFI's with CP_DRAW_AUTO.
      * Plus, for the common case where the counter buffer is written by
      * vkCmdEndTransformFeedback, we need to wait for the CP_WAIT_MEM_WRITES to
-@@ -9382,6 +9593,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+@@ -9382,6 +9646,12 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
     struct tu_cs *cs = &cmd->cs;
     struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
  
++   tu_cmd_use_shader(cmd, shader);
++
 +   if (shader->uses_buffer_device_address) {
 +      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
 +   }
@@ -572,7 +750,7 @@ index bcb7724..540a056 100644
     bool emit_instrlen_workaround =
        shader->variant->instrlen >
        cmd->device->physical_device->info->props.instr_cache_size;
-@@ -9693,6 +9908,8 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
+@@ -9693,6 +9963,8 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_buffer, buffer, _buffer);
     struct tu_dispatch_info info = {};
  
@@ -581,7 +759,7 @@ index bcb7724..540a056 100644
     info.indirect = vk_buffer_address(&buffer->vk, offset);
  
     tu_dispatch<CHIP>(cmd_buffer, &info);
-@@ -9723,6 +9940,8 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
+@@ -9723,6 +9995,8 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
     info.unaligned = true;
     info.indirect = size_addr;
  
@@ -590,7 +768,7 @@ index bcb7724..540a056 100644
     TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
  }
  
-@@ -9896,6 +10115,7 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -9896,6 +10170,7 @@ tu_barrier(struct tu_cmd_buffer *cmd,
           const VkBufferMemoryBarrier2 *barrier =
              &dep_info->pBufferMemoryBarriers[i];
           VK_FROM_HANDLE(tu_buffer, buffer, barrier->buffer);
@@ -598,7 +776,7 @@ index bcb7724..540a056 100644
           bool sparse_aliasing =
              buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
           VkPipelineStageFlags2 sanitized_src_stage =
-@@ -9926,6 +10146,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+@@ -9926,6 +10201,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
              &dep_info->pImageMemoryBarriers[i];
           VK_FROM_HANDLE(tu_image, image, barrier->image);
  
@@ -607,7 +785,15 @@ index bcb7724..540a056 100644
           VkImageLayout old_layout = barrier->oldLayout;
  
           bool sparse_aliasing =
-@@ -10113,6 +10335,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
+@@ -10058,6 +10335,7 @@ void
+ tu_write_event(struct tu_cmd_buffer *cmd, struct tu_event *event,
+                VkPipelineStageFlags2 stageMask, unsigned value)
+ {
++   tu_cmd_use_range(cmd, {event->bo.iova, event->bo.size, TU_RESOURCE_WRITE});
+    struct tu_cs *cs = &cmd->cs;
+ 
+    /* vkCmdSetEvent/vkCmdResetEvent cannot be called inside a render pass */
+@@ -10113,6 +10391,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
        tu_emit_cache_flush<CHIP>(cmd);
  
     VK_FROM_HANDLE(tu_buffer, buf, pConditionalRenderingBegin->buffer);
@@ -615,7 +801,7 @@ index bcb7724..540a056 100644
     uint64_t iova = vk_buffer_address(&buf->vk, pConditionalRenderingBegin->offset);
  
     /* qcom doesn't support 32-bit reference values, only 64-bit, but Vulkan
-@@ -10219,6 +10442,8 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
+@@ -10219,6 +10498,8 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
  
@@ -624,7 +810,7 @@ index bcb7724..540a056 100644
     uint64_t va = vk_buffer_address(&buffer->vk, dstOffset);
  
     struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
-@@ -10295,6 +10520,8 @@ tu_write_buffer_cp(VkCommandBuffer commandBuffer,
+@@ -10295,6 +10576,8 @@ tu_write_buffer_cp(VkCommandBuffer commandBuffer,
  {
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
  
@@ -634,7 +820,7 @@ index bcb7724..540a056 100644
  
     struct tu_cs *cs = &cmd->cs;
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
-index 17bebeb..55f0594 100644
+index 17bebeb..697c483 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.h
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.h
 @@ -661,6 +661,10 @@ struct tu_cmd_buffer
@@ -648,7 +834,7 @@ index 17bebeb..55f0594 100644
     struct u_trace_iterator trace_renderpass_start;
     struct u_trace trace, rp_trace;
  
-@@ -756,6 +760,20 @@ VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
+@@ -756,6 +760,21 @@ VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
  
  extern const struct vk_command_buffer_ops tu_cmd_buffer_ops;
  
@@ -660,6 +846,7 @@ index 17bebeb..55f0594 100644
 +};
 +
 +void tu_cmd_use_range(struct tu_cmd_buffer *cmd, struct tu_resource_range range);
++void tu_cmd_use_bo(struct tu_cmd_buffer *cmd, const struct tu_bo *bo, uint32_t access);
 +void tu_cmd_use_buffer(struct tu_cmd_buffer *cmd, const struct tu_buffer *buffer,
 +                       uint32_t access);
 +void tu_cmd_use_image(struct tu_cmd_buffer *cmd, const struct tu_image *image,
@@ -670,10 +857,73 @@ index 17bebeb..55f0594 100644
  tu_attachment_gmem_offset(struct tu_cmd_buffer *cmd,
                            const struct tu_render_pass_attachment *att,
 diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
-index 47e1939..65fa5b1 100644
+index 47e1939..839a651 100644
 --- a/src/freedreno/vulkan/tu_cs.cc
 +++ b/src/freedreno/vulkan/tu_cs.cc
-@@ -128,6 +128,10 @@ tu_cs_get_offset(const struct tu_cs *cs)
+@@ -9,6 +9,54 @@
+ #include "tu_rmv.h"
+ #include "tu_suballoc.h"
+ 
++void
++tu_cs_use_range(struct tu_cs *cs, uint64_t iova, uint64_t bytes, uint32_t access)
++{
++#ifdef TU_HAS_DARWIN
++   if (!iova || !bytes || cs->record_result != VK_SUCCESS)
++      return;
++
++   while (cs->parent) {
++      cs = cs->parent;
++   }
++   if (cs->mode == TU_CS_MODE_EXTERNAL)
++      return;
++
++   const uint32_t count = util_dynarray_num_elements(&cs->resource_ranges, struct tu_resource_range);
++   struct tu_resource_range *ranges = (struct tu_resource_range *)cs->resource_ranges.data;
++   for (uint32_t i = count; i > 0 && count - i < 16; i--) {
++      if (ranges[i - 1].iova == iova && ranges[i - 1].size == bytes) {
++         ranges[i - 1].access |= access;
++         return;
++      }
++   }
++
++   struct tu_resource_range *range = (struct tu_resource_range *)
++      util_dynarray_grow(&cs->resource_ranges, struct tu_resource_range, 1);
++   if (!range) {
++      tu_cs_set_error(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++   *range = {iova, bytes, access};
++#endif
++}
++
++void
++tu_cs_use_resources(struct tu_cs *cs, const struct tu_cs *target)
++{
++#ifdef TU_HAS_DARWIN
++   while (cs->parent) {
++      cs = cs->parent;
++   }
++   if (cs == target)
++      return;
++
++   util_dynarray_foreach (&target->resource_ranges, struct tu_resource_range, range) {
++      tu_cs_use_range(cs, range->iova, range->size, range->access);
++   }
++#endif
++}
++
+ /* There is a limit to IB size supported by HW,
+  * which appears to be 0x0fffff.
+  */
+@@ -96,6 +144,7 @@ tu_cs_finish(struct tu_cs *cs)
+    free(cs->entries);
+    free(cs->read_only.bos);
+    free(cs->read_write.bos);
++   util_dynarray_fini(&cs->resource_ranges);
+ }
+ 
+ static struct tu_bo *
+@@ -128,6 +177,10 @@ tu_cs_get_offset(const struct tu_cs *cs)
  uint64_t
  tu_cs_get_cur_iova(const struct tu_cs *cs)
  {
@@ -684,7 +934,7 @@ index 47e1939..65fa5b1 100644
     if (cs->mode == TU_CS_MODE_EXTERNAL)
        return cs->external_iova + ((char *) cs->cur - (char *) cs->start);
     return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
-@@ -155,8 +159,9 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+@@ -155,8 +208,9 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
        uint32_t new_capacity = MAX2(4, 2 * bos->bo_capacity);
        struct tu_bo **new_bos = (struct tu_bo **)
           realloc(bos->bos, new_capacity * sizeof(struct tu_bo *));
@@ -696,13 +946,14 @@ index 47e1939..65fa5b1 100644
  
        bos->bo_capacity = new_capacity;
        bos->bos = new_bos;
-@@ -168,16 +173,17 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+@@ -168,16 +222,18 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
        tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
                       (enum tu_bo_alloc_flags)(COND(!cs->writeable,
                                                     TU_BO_ALLOC_GPU_READ_ONLY) |
 -                                              TU_BO_ALLOC_ALLOW_DUMP),
 +                                              TU_BO_ALLOC_ALLOW_DUMP |
-+                                              TU_BO_ALLOC_INTERNAL_RESOURCE),
++                                              TU_BO_ALLOC_INTERNAL_RESOURCE |
++                                              TU_BO_ALLOC_COMMAND_STREAM),
                       cs->name);
     if (result != VK_SUCCESS) {
 -      return result;
@@ -717,7 +968,7 @@ index 47e1939..65fa5b1 100644
     }
  
     TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
-@@ -196,6 +202,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+@@ -196,6 +252,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
  static VkResult
  tu_cs_reserve_entry(struct tu_cs *cs)
  {
@@ -728,7 +979,7 @@ index 47e1939..65fa5b1 100644
     /* entries are only for TU_CS_MODE_GROW */
     assert(cs->mode == TU_CS_MODE_GROW);
  
-@@ -204,8 +214,9 @@ tu_cs_reserve_entry(struct tu_cs *cs)
+@@ -204,8 +264,9 @@ tu_cs_reserve_entry(struct tu_cs *cs)
        uint32_t new_capacity = MAX2(4, cs->entry_capacity * 2);
        struct tu_cs_entry *new_entries = (struct tu_cs_entry *)
           realloc(cs->entries, new_capacity * sizeof(struct tu_cs_entry));
@@ -740,7 +991,7 @@ index 47e1939..65fa5b1 100644
  
        cs->entry_capacity = new_capacity;
        cs->entries = new_entries;
-@@ -222,6 +233,13 @@ tu_cs_reserve_entry(struct tu_cs *cs)
+@@ -222,6 +283,13 @@ tu_cs_reserve_entry(struct tu_cs *cs)
  static void
  tu_cs_add_entry(struct tu_cs *cs)
  {
@@ -754,7 +1005,7 @@ index 47e1939..65fa5b1 100644
     /* entries are only for TU_CS_MODE_GROW */
     assert(cs->mode == TU_CS_MODE_GROW);
  
-@@ -251,6 +269,10 @@ tu_cs_add_entry(struct tu_cs *cs)
+@@ -251,10 +319,15 @@ tu_cs_add_entry(struct tu_cs *cs)
  VkResult
  tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
  {
@@ -765,7 +1016,12 @@ index 47e1939..65fa5b1 100644
     VkResult result;
  
     assert(cs->mode == TU_CS_MODE_GROW);
-@@ -276,6 +298,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
+    assert(target->mode == TU_CS_MODE_GROW);
++   tu_cs_use_resources(cs, target);
+ 
+    if (!tu_cs_is_empty(cs))
+       tu_cs_add_entry(cs);
+@@ -276,6 +349,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
  void
  tu_cs_begin(struct tu_cs *cs)
  {
@@ -776,7 +1032,7 @@ index 47e1939..65fa5b1 100644
     assert(cs->mode != TU_CS_MODE_SUB_STREAM);
     assert(tu_cs_is_empty(cs));
  }
-@@ -287,6 +313,10 @@ tu_cs_begin(struct tu_cs *cs)
+@@ -287,6 +364,10 @@ tu_cs_begin(struct tu_cs *cs)
  void
  tu_cs_end(struct tu_cs *cs)
  {
@@ -787,7 +1043,7 @@ index 47e1939..65fa5b1 100644
     assert(cs->mode != TU_CS_MODE_SUB_STREAM);
  
     if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
-@@ -296,12 +326,20 @@ tu_cs_end(struct tu_cs *cs)
+@@ -296,12 +377,20 @@ tu_cs_end(struct tu_cs *cs)
  void
  tu_cs_set_writeable(struct tu_cs *cs, bool writeable)
  {
@@ -808,7 +1064,7 @@ index 47e1939..65fa5b1 100644
        struct tu_bo_array *old_bos = cs->writeable ? &cs->read_write : &cs->read_only;
        struct tu_bo_array *new_bos = writeable ? &cs->read_write : &cs->read_only;
  
-@@ -331,6 +369,13 @@ VkResult
+@@ -331,6 +420,13 @@ VkResult
  tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
                                 uint32_t size, struct tu_cs *sub_cs)
  {
@@ -822,7 +1078,7 @@ index 47e1939..65fa5b1 100644
     assert(cs->mode == TU_CS_MODE_SUB_STREAM);
     assert(size);
  
-@@ -341,21 +386,27 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+@@ -341,21 +437,27 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
         */
        result = tu_cs_reserve_space(cs, count * size);
     } else {
@@ -857,7 +1113,7 @@ index 47e1939..65fa5b1 100644
  }
  
  /**
-@@ -369,6 +420,14 @@ tu_cs_alloc(struct tu_cs *cs,
+@@ -369,6 +471,14 @@ tu_cs_alloc(struct tu_cs *cs,
              uint32_t size,
              struct tu_cs_memory *memory)
  {
@@ -872,7 +1128,7 @@ index 47e1939..65fa5b1 100644
     assert(cs->mode == TU_CS_MODE_SUB_STREAM);
     assert(size && size <= 1024);
  
-@@ -385,8 +444,9 @@ tu_cs_alloc(struct tu_cs *cs,
+@@ -385,8 +495,9 @@ tu_cs_alloc(struct tu_cs *cs,
     /* TODO: smarter way to deal with alignment? */
  
     VkResult result = tu_cs_reserve_space(cs, count * size + (size-1));
@@ -884,7 +1140,18 @@ index 47e1939..65fa5b1 100644
  
     struct tu_bo *bo = tu_cs_current_bo(cs);
     size_t offset = align(tu_cs_get_offset(cs), size);
-@@ -410,6 +470,10 @@ tu_cs_alloc(struct tu_cs *cs,
+@@ -394,6 +505,10 @@ tu_cs_alloc(struct tu_cs *cs,
+    memory->map = (uint32_t *) bo->map + offset;
+    memory->iova = bo->iova + offset * sizeof(uint32_t);
+    memory->writeable = cs->writeable;
++   tu_cs_use_range(cs, memory->iova, count * size * sizeof(uint32_t),
++                   TU_RESOURCE_READ | (cs->writeable ? TU_RESOURCE_WRITE : 0));
++   if (cs->record_result != VK_SUCCESS)
++      return cs->record_result;
+ 
+    cs->start = cs->cur = (uint32_t*) bo->map + offset + count * size;
+ 
+@@ -410,6 +525,10 @@ tu_cs_alloc(struct tu_cs *cs,
  struct tu_cs_entry
  tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
  {
@@ -895,7 +1162,19 @@ index 47e1939..65fa5b1 100644
     assert(cs->mode == TU_CS_MODE_SUB_STREAM);
     assert(sub_cs->start == cs->cur && sub_cs->end == cs->reserved_end);
     tu_cs_sanity_check(sub_cs);
-@@ -436,10 +500,13 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+@@ -424,6 +543,11 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+       .offset = tu_cs_get_offset(cs) * sizeof(uint32_t),
+    };
+ 
++   tu_cs_use_range(cs, entry.bo->iova + entry.offset, entry.size,
++                   TU_RESOURCE_READ | (sub_cs->writeable ? TU_RESOURCE_WRITE : 0));
++   if (cs->record_result != VK_SUCCESS)
++      return {};
++
+    cs->start = cs->cur;
+ 
+    return entry;
+@@ -436,10 +560,13 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
  VkResult
  tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
  {
@@ -912,7 +1191,7 @@ index 47e1939..65fa5b1 100644
        }
  
        /* add an entry for the exiting command packets */
-@@ -448,6 +515,9 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+@@ -448,6 +575,9 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
           assert(cs->mode != TU_CS_MODE_SUB_STREAM);
  
           tu_cs_add_entry(cs);
@@ -922,7 +1201,7 @@ index 47e1939..65fa5b1 100644
        }
  
        for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
-@@ -455,14 +525,18 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+@@ -455,14 +585,18 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
           *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
  
           /* space for CP_COND_REG_EXEC in next bo */
@@ -943,18 +1222,19 @@ index 47e1939..65fa5b1 100644
  
        if (cs->cond_stack_depth) {
           cs->reserved_end = cs->cur + reserved_size;
-@@ -503,6 +577,10 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+@@ -503,6 +637,11 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
  void
  tu_cs_reset(struct tu_cs *cs)
  {
 +   cs->record_result = VK_SUCCESS;
 +   cs->cond_stack_depth = 0;
 +   cs->pkt = nullptr;
++   util_dynarray_clear(&cs->resource_ranges);
 +
     if (cs->mode == TU_CS_MODE_EXTERNAL) {
        assert(!cs->read_only.bo_count && !cs->read_write.bo_count &&
               !cs->refcount_bo && !cs->entry_count);
-@@ -520,7 +598,7 @@ tu_cs_reset(struct tu_cs *cs)
+@@ -520,7 +659,7 @@ tu_cs_reset(struct tu_cs *cs)
        tu_bo_finish(cs->device, cs->read_write.bos[i]);
     }
  
@@ -963,7 +1243,7 @@ index 47e1939..65fa5b1 100644
  
     if (cs->read_only.bo_count) {
        cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
-@@ -545,8 +623,16 @@ tu_cs_emit_data_nop(struct tu_cs *cs,
+@@ -545,8 +684,16 @@ tu_cs_emit_data_nop(struct tu_cs *cs,
                      uint32_t size,
                      uint32_t align_dwords)
  {
@@ -981,7 +1261,7 @@ index 47e1939..65fa5b1 100644
     uint64_t iova = tu_cs_get_cur_iova(cs);
     uint64_t iova_aligned = align64(iova, align_dwords * sizeof(uint32_t));
 diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
-index 6a66de1..6dce578 100644
+index 6a66de1..da3d794 100644
 --- a/src/freedreno/vulkan/tu_cs.h
 +++ b/src/freedreno/vulkan/tu_cs.h
 @@ -92,6 +92,8 @@ struct tu_cs
@@ -993,7 +1273,15 @@ index 6a66de1..6dce578 100644
     enum tu_cs_mode mode;
     bool writeable;
     uint32_t next_bo_size;
-@@ -120,6 +122,25 @@ struct tu_cs
+@@ -101,6 +103,7 @@ struct tu_cs
+    uint32_t entry_capacity;
+ 
+    struct tu_bo_array read_only, read_write;
++   struct util_dynarray resource_ranges;
+ 
+    /* Optional BO that this CS is sub-allocated from for TU_CS_MODE_SUB_STREAM */
+    struct tu_bo *refcount_bo;
+@@ -120,6 +123,25 @@ struct tu_cs
     tu_crb crb(uint32_t nregs);
  };
  
@@ -1019,7 +1307,20 @@ index 6a66de1..6dce578 100644
  void
  tu_breadcrumbs_init(struct tu_device *device);
  
-@@ -177,6 +198,10 @@ static inline struct tu_draw_state
+@@ -144,6 +166,12 @@ tu_cs_init_suballoc(struct tu_cs *cs, struct tu_device *device,
+ void
+ tu_cs_finish(struct tu_cs *cs);
+ 
++void
++tu_cs_use_range(struct tu_cs *cs, uint64_t iova, uint64_t bytes, uint32_t access);
++
++void
++tu_cs_use_resources(struct tu_cs *cs, const struct tu_cs *target);
++
+ void
+ tu_cs_begin(struct tu_cs *cs);
+ 
+@@ -177,6 +205,10 @@ static inline struct tu_draw_state
  tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
  {
     struct tu_cs_entry entry = tu_cs_end_sub_stream(cs, sub_cs);
@@ -1030,7 +1331,7 @@ index 6a66de1..6dce578 100644
     return (struct tu_draw_state) {
        .iova = entry.bo->iova + entry.offset,
        .size = entry.size / sizeof(uint32_t),
-@@ -195,10 +220,17 @@ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+@@ -195,10 +227,17 @@ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
  {
     struct tu_cs_memory memory;
  
@@ -1050,7 +1351,7 @@ index 6a66de1..6dce578 100644
     tu_cs_begin(cs);
     tu_cs_reserve_space(cs, size);
  
-@@ -222,6 +254,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
+@@ -222,6 +261,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
  static inline uint32_t
  tu_cs_get_size(const struct tu_cs *cs)
  {
@@ -1061,7 +1362,7 @@ index 6a66de1..6dce578 100644
     return cs->cur - cs->start;
  }
  
-@@ -263,6 +299,10 @@ tu_cs_get_call_size(const struct tu_cs *cs)
+@@ -263,6 +306,10 @@ tu_cs_get_call_size(const struct tu_cs *cs)
  static inline void
  tu_cs_sanity_check(const struct tu_cs *cs)
  {
@@ -1072,7 +1373,7 @@ index 6a66de1..6dce578 100644
     assert(cs->start <= cs->cur);
     assert(cs->cur <= cs->reserved_end);
     assert(cs->reserved_end <= cs->end);
-@@ -277,6 +317,14 @@ tu_cs_emit_sync_breadcrumb(struct tu_cs *cs, uint8_t opcode, uint16_t cnt);
+@@ -277,6 +324,14 @@ tu_cs_emit_sync_breadcrumb(struct tu_cs *cs, uint8_t opcode, uint16_t cnt);
  static inline void
  tu_cs_emit(struct tu_cs *cs, uint32_t value)
  {
@@ -1087,7 +1388,7 @@ index 6a66de1..6dce578 100644
     assert(cs->cur < cs->reserved_end);
     *cs->cur = value;
     ++cs->cur;
-@@ -294,6 +342,15 @@ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+@@ -294,6 +349,15 @@ tu_cs_emit(struct tu_cs *cs, uint32_t value)
  static inline void
  tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
  {
@@ -1103,7 +1404,7 @@ index 6a66de1..6dce578 100644
     assert(cs->cur + length <= cs->reserved_end);
     memcpy(cs->cur, values, sizeof(uint32_t) * length);
     cs->cur += length;
-@@ -305,27 +362,38 @@ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+@@ -305,27 +369,38 @@ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
  static inline uint32_t
  tu_cs_get_space(const struct tu_cs *cs)
  {
@@ -1148,7 +1449,7 @@ index 6a66de1..6dce578 100644
  }
  
  /**
-@@ -334,6 +402,10 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+@@ -334,6 +409,10 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
  static inline void
  tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
  {
@@ -1159,7 +1460,7 @@ index 6a66de1..6dce578 100644
     assert(!cs->pkt); /* No mixing with the packet builders.*/
     tu_cs_reserve(cs, cnt + 1);
     tu_cs_emit(cs, pm4_pkt4_hdr(regindx, cnt));
-@@ -345,6 +417,10 @@ tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
+@@ -345,6 +424,10 @@ tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
  static inline void
  tu_cs_emit_pkt7(struct tu_cs *cs, uint8_t opcode, uint16_t cnt)
  {
@@ -1170,7 +1471,7 @@ index 6a66de1..6dce578 100644
     assert(!cs->pkt); /* No mixing with the packet builders.*/
  #if TU_BREADCRUMBS_ENABLED
     tu_cs_emit_sync_breadcrumb(cs, opcode, cnt + 1);
-@@ -380,6 +456,16 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+@@ -380,11 +463,22 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
  static inline void
  tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
  {
@@ -1187,7 +1488,21 @@ index 6a66de1..6dce578 100644
     assert(entry->bo);
     assert(entry->size && entry->offset + entry->size <= entry->bo->size);
     assert(entry->size % sizeof(uint32_t) == 0);
-@@ -408,6 +494,10 @@ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+    assert(entry->offset % sizeof(uint32_t) == 0);
+ 
++   tu_cs_use_range(cs, entry->bo->iova + entry->offset, entry->size, TU_RESOURCE_READ);
+    tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+    tu_cs_emit_qw(cs, entry->bo->iova + entry->offset);
+    tu_cs_emit(cs, entry->size / sizeof(uint32_t));
+@@ -395,6 +489,7 @@ static inline void
+ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+ {
+    if (state.size) {
++      tu_cs_use_range(cs, state.iova, state.size * sizeof(uint32_t), TU_RESOURCE_READ);
+       tu_cs_emit_pkt7(cs, CP_INDIRECT_BUFFER, 3);
+       tu_cs_emit_qw(cs, state.iova);
+       tu_cs_emit(cs, state.size);
+@@ -408,7 +503,12 @@ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
  static inline void
  tu_cs_emit_call(struct tu_cs *cs, const struct tu_cs *target)
  {
@@ -1196,9 +1511,11 @@ index 6a66de1..6dce578 100644
 +   }
 +
     assert(target->mode == TU_CS_MODE_GROW);
++   tu_cs_use_resources(cs, target);
     for (uint32_t i = 0; i < target->entry_count; i++)
        tu_cs_emit_ib(cs, target->entries + i);
-@@ -465,7 +555,10 @@ struct tu_cs_patchable_state {
+ }
+@@ -465,7 +565,10 @@ struct tu_cs_patchable_state {
  static struct tu_cs_patchable_state
  tu_cs_patchable_start(struct tu_cs *cs, uint32_t reserved_size)
  {
@@ -1210,7 +1527,7 @@ index 6a66de1..6dce578 100644
     uint32_t *nop_header = cs->cur;
     tu_cs_emit_pkt7(cs, CP_NOP, 0);
     return (struct tu_cs_patchable_state) {
-@@ -482,6 +575,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
+@@ -482,6 +585,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
                      bool enabled_by_default,
                      struct tu_cs_patchable_state *state)
  {
@@ -1221,7 +1538,7 @@ index 6a66de1..6dce578 100644
     assert(cs->end == state->_end);
     state->dwords = cs->cur - state->nop_header - 1;
     state->disable_patch = pm4_pkt7_hdr(CP_NOP, state->dwords);
-@@ -495,6 +592,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
+@@ -495,6 +602,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
  static inline void
  tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
  {
@@ -1232,7 +1549,7 @@ index 6a66de1..6dce578 100644
     assert(cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE);
  
     ASSERTED enum compare_mode mode =
-@@ -520,6 +621,10 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+@@ -520,6 +631,10 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
  static inline void
  tu_cond_exec_end(struct tu_cs *cs)
  {
@@ -1243,7 +1560,7 @@ index 6a66de1..6dce578 100644
     assert(cs->cond_stack_depth > 0);
     cs->cond_stack_depth--;
  
-@@ -649,6 +754,9 @@ struct tu_reg_value {
+@@ -649,6 +764,9 @@ struct tu_reg_value {
     STATIC_ASSERT(ARRAY_SIZE(regs) <= 16);               \
                                                          \
     tu_cs_emit_pkt4((cs), regs[0].reg, count);             \
@@ -1253,7 +1570,7 @@ index 6a66de1..6dce578 100644
     uint32_t *p = (cs)->cur;                               \
     __ONE_REG( 0, regs);                                 \
     __ONE_REG( 1, regs);                                 \
-@@ -677,7 +785,11 @@ struct tu_pkt {
+@@ -677,7 +795,11 @@ struct tu_pkt {
     tu_pkt(tu_cs *cs, enum adreno_pm4_type3_packets pkt, unsigned ndwords)
         : cs(cs), pkt(pkt)
     {
@@ -1266,7 +1583,7 @@ index 6a66de1..6dce578 100644
        start = cs->cur;
        cs->cur++; /* Leave a slot for the packet header when we're done. */
        assert(!cs->pkt);
-@@ -702,12 +814,16 @@ struct tu_pkt {
+@@ -702,12 +824,16 @@ struct tu_pkt {
  
     void append(uint32_t value)
     {
@@ -1285,7 +1602,7 @@ index 6a66de1..6dce578 100644
     }
  
   public:
-@@ -722,6 +838,12 @@ struct tu_pkt {
+@@ -722,6 +848,12 @@ struct tu_pkt {
           return;
        }
  
@@ -1578,10 +1895,29 @@ index 6a6a1ff..2f93aa7 100644
     /* Into mapped_ptr or dynamic_descriptors, in units of the respective array
      */
 diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
-index 88f7287..dc491ae 100644
+index 88f7287..e86e2b5 100644
 --- a/src/freedreno/vulkan/tu_device.cc
 +++ b/src/freedreno/vulkan/tu_device.cc
-@@ -2666,7 +2666,10 @@ static VkResult
+@@ -2283,6 +2283,8 @@ tu_trace_record_ts(struct u_trace *ut, void *cs, void *timestamps,
+    struct tu_suballoc_bo *bo = (struct tu_suballoc_bo *) timestamps;
+    struct tu_cs *ts_cs = (struct tu_cs *) cs;
+ 
++   tu_cs_use_range(ts_cs, bo->iova + offset_B, sizeof(uint64_t), TU_RESOURCE_WRITE);
++
+    if (CHIP == A6XX) {
+       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
+       tu_cs_emit(ts_cs, CP_EVENT_WRITE_0_EVENT(RB_DONE_TS) |
+@@ -2354,6 +2356,9 @@ tu_copy_buffer(struct u_trace_context *utctx, void *cmdstream,
+ 
+    struct tu_suballoc_bo *bo_to = (struct tu_suballoc_bo *) ts_to;
+ 
++   tu_cs_use_range(cs, src_iova, size_B, TU_RESOURCE_READ);
++   tu_cs_use_range(cs, bo_to->iova + to_offset_B, size_B, TU_RESOURCE_WRITE);
++
+    tu_cs_emit_pkt7(cs, CP_MEMCPY, 5);
+    tu_cs_emit(cs, size_B / sizeof(uint32_t));
+    tu_cs_emit_qw(cs, src_iova);
+@@ -2666,7 +2671,10 @@ static VkResult
  tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
  {
     struct tu_cs shader_cs;
@@ -1593,7 +1929,7 @@ index 88f7287..dc491ae 100644
  
     uint32_t raw_shader[] = {
        0x00040000, 0x40600000, // mul.f hr0.x, hr0.x, hr1.x
-@@ -2678,10 +2681,17 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+@@ -2678,10 +2686,17 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
  
     tu_cs_emit_array(&shader_cs, raw_shader, ARRAY_SIZE(raw_shader));
     struct tu_cs_entry shader_entry = tu_cs_end_sub_stream(&device->sub_cs, &shader_cs);
@@ -1612,7 +1948,7 @@ index 88f7287..dc491ae 100644
  
     tu_cs_emit_regs(&sub_cs, SP_UPDATE_CNTL(A7XX,
              .vs_state = true, .hs_state = true, .ds_state = true,
-@@ -2747,7 +2757,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+@@ -2747,7 +2762,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
     device->cmdbuf_start_a725_quirk_entry =
        tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
  
@@ -1621,7 +1957,7 @@ index 88f7287..dc491ae 100644
  }
  
  static VkResult
-@@ -3138,6 +3148,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+@@ -3138,6 +3153,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
  
           device->perfcntrs_pass_cs_entries[i] =
              tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
@@ -1632,8 +1968,20 @@ index 88f7287..dc491ae 100644
        }
     }
  
+diff --git a/src/freedreno/vulkan/tu_event.cc b/src/freedreno/vulkan/tu_event.cc
+index cdbd89a..aabfc00 100644
+--- a/src/freedreno/vulkan/tu_event.cc
++++ b/src/freedreno/vulkan/tu_event.cc
+@@ -176,6 +176,7 @@ tu_CmdWaitEvents2(VkCommandBuffer commandBuffer,
+       }
+ 
+       tu_cs_emit_pkt7(cs, CP_WAIT_REG_MEM, 6);
++      tu_cs_use_range(cs, event->bo.iova, event->bo.size, TU_RESOURCE_READ);
+       tu_cs_emit(cs, CP_WAIT_REG_MEM_0_FUNCTION(WRITE_EQ) |
+                      CP_WAIT_REG_MEM_0_POLL(POLL_MEMORY));
+       tu_cs_emit_qw(cs, event->bo.iova); /* POLL_ADDR_LO/HI */
 diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
-index 392f2a7..f902017 100644
+index 392f2a7..d26c97b 100644
 --- a/src/freedreno/vulkan/tu_knl.h
 +++ b/src/freedreno/vulkan/tu_knl.h
 @@ -20,6 +20,20 @@ struct tu_u_trace_syncobj;
@@ -1657,7 +2005,15 @@ index 392f2a7..f902017 100644
  enum tu_bo_alloc_flags {
     TU_BO_ALLOC_NO_FLAGS = 0,
     TU_BO_ALLOC_ALLOW_DUMP = 1 << 0,
-@@ -61,6 +75,7 @@ struct tu_bo {
+@@ -29,6 +43,7 @@ enum tu_bo_alloc_flags {
+    TU_BO_ALLOC_DMABUF = 1 << 4,
+    TU_BO_ALLOC_SHAREABLE = 1 << 5,
+    TU_BO_ALLOC_IMPLICIT_SYNC = 1 << 6,
++   TU_BO_ALLOC_COMMAND_STREAM = 1 << 7,
+ };
+ 
+ enum tu_mem_sync_op {
+@@ -61,6 +76,7 @@ struct tu_bo {
  #ifdef TU_HAS_DARWIN
     /* The kernel handle is opaque. gem_handle indexes this device's BO array. */
     uint64_t darwin_handle;
@@ -1665,14 +2021,17 @@ index 392f2a7..f902017 100644
     /* The token selects this BO's IOConnectMapMemory64 descriptor. */
     uint32_t darwin_token;
     /* A V2 map ID owns the kernel's completed CPU mapping and its BO lease. */
-@@ -262,6 +277,14 @@ tu_bo_sync_cache(struct tu_device *dev,
+@@ -262,6 +278,17 @@ tu_bo_sync_cache(struct tu_device *dev,
  
  void tu_bo_allow_dump(struct tu_device *dev, struct tu_bo *bo);
  
 +#ifdef TU_HAS_DARWIN
 +struct tu_cmd_buffer;
++struct tu_cs;
 +VkResult tu_darwin_submit_add_resources(struct tu_device *dev, void *submit,
 +                                        struct tu_cmd_buffer *cmd);
++VkResult tu_darwin_submit_add_cs_resources(struct tu_device *dev, void *submit,
++                                           const struct tu_cs *cs);
 +VKAPI_ATTR VkBool32 VKAPI_CALL
 +tu_NativeAdrenoDeviceCacheMaintenance(VkDevice device);
 +#endif
@@ -1681,7 +2040,7 @@ index 392f2a7..f902017 100644
                          void *metadata, uint32_t metadata_size);
  int tu_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo,
 diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
-index a5ccf3f..6ca25e8 100644
+index a5ccf3f..39e6a9d 100644
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -7,6 +7,7 @@
@@ -1692,7 +2051,15 @@ index a5ccf3f..6ca25e8 100644
  #include <string.h>
  #include <sys/mman.h>
  #include <unistd.h>
-@@ -54,6 +55,8 @@ struct darwin_connection {
+@@ -18,6 +19,7 @@
+ 
+ #include "util/os_time.h"
+ #include "util/list.h"
++#include "util/rb_tree.h"
+ #include "util/timespec.h"
+ #include "util/u_debug.h"
+ #include "util/u_idalloc.h"
+@@ -54,6 +56,8 @@ struct darwin_connection {
     uint32_t last_fence;
     NativeAdrenoAbiDeviceInfo info;
     NativeAdrenoAbiParams params;
@@ -1701,7 +2068,15 @@ index a5ccf3f..6ca25e8 100644
  };
  
  static pthread_mutex_t profile_device_lock = PTHREAD_MUTEX_INITIALIZER;
-@@ -87,6 +90,7 @@ struct darwin_retired_bo {
+@@ -66,6 +70,7 @@ enum {
+    DARWIN_CACHE_SIZE_CLASSES = 64,
+    DARWIN_CACHE_ATTRIBUTE_BUCKETS = 16,
+    DARWIN_BO_CACHE_BYTES = 128 * 1024 * 1024,
++   DARWIN_GENERAL_CACHE_BYTES = DARWIN_BO_CACHE_BYTES / 2,
+    DARWIN_BO_CACHE_MAX_OBJECT_BYTES = 64 * 1024 * 1024,
+    DARWIN_RECLAIM_HIGH_BYTES = 64 * 1024 * 1024,
+    DARWIN_RECLAIM_LOW_BYTES = 32 * 1024 * 1024,
+@@ -87,6 +92,7 @@ struct darwin_retired_bo {
  };
  
  enum darwin_bo_state {
@@ -1709,26 +2084,47 @@ index a5ccf3f..6ca25e8 100644
     DARWIN_BO_ACTIVE,
     DARWIN_BO_PENDING,
     DARWIN_BO_CACHED,
-@@ -104,7 +108,7 @@ struct darwin_bo_node {
+@@ -103,8 +109,10 @@ struct darwin_bo_node {
+    struct darwin_retired_bo bo;
     struct list_head link;
     struct list_head bucket_link;
++   struct list_head cache_group_link;
++   struct rb_node active_iova;
     enum darwin_bo_state state;
 -   uint64_t retry_generation;
 +   uint64_t retry_after_ns;
  };
  
  /* darwin_retire_state owns one node per native handle, including active BOs.
-@@ -120,6 +124,9 @@ struct darwin_retire_state {
+@@ -116,17 +124,26 @@ struct darwin_retire_state {
+    pthread_mutex_t lock;
+    struct util_idalloc ids;
+    struct darwin_bo_node nodes[DARWIN_NATIVE_BO_LIMIT + 1];
++   struct rb_tree active_bos;
+    struct list_head pending, cache, reclaim, retry, released;
++   struct list_head cache_general, cache_commands;
     struct list_head buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
     struct list_head pending_buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
     unsigned count, node_count;
+-   unsigned trim_waiters;
 +   unsigned reclaim_count, released_count;
++   unsigned retry_count;
 +   unsigned budget_calls;
 +   NativeAdrenoAbiResourceBudget mapping_budget;
-    unsigned trim_waiters;
++   unsigned reclaim_waiters;
     unsigned cache_count;
     VkResult failure;
-@@ -178,6 +185,8 @@ dw_call(struct tu_device *dev, uint32_t method, const void *in, size_t in_size,
+    uint64_t enqueued, reaped, pressure_waits;
+    uint64_t cache_bytes, cache_peak_bytes, cache_hits, cache_misses, cache_evictions;
++   uint64_t general_cache_bytes;
++   uint64_t released_objects_total, released_bytes_total;
+    uint64_t pending_bytes;
+    uint64_t reclaim_bytes;
++   uint64_t retry_bytes;
+    uint64_t work_generation, progress_generation;
+    pthread_t worker;
+    pthread_cond_t work_wake, progress;
+@@ -178,6 +195,8 @@ dw_call(struct tu_device *dev, uint32_t method, const void *in, size_t in_size,
     return dw_call(darwin_connection_for(dev), method, in, in_size, out, out_size);
  }
  
@@ -1737,7 +2133,7 @@ index a5ccf3f..6ca25e8 100644
  static VkResult
  darwin_unmap_cpu_storage(struct tu_device *dev, uint64_t handle, void **mapping,
                           uint32_t *token, uint64_t *map_id)
-@@ -323,6 +332,8 @@ darwin_profile_reporter(void *argument)
+@@ -323,6 +342,8 @@ darwin_profile_reporter(void *argument)
     uint64_t sequence = 0;
     uint64_t sent_slow = 0;
     for (;;) {
@@ -1746,7 +2142,29 @@ index a5ccf3f..6ca25e8 100644
        NativeAdrenoAbiBoCacheCounters counters;
        NativeAdrenoAbiBoCacheBudget budget = {};
        NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
-@@ -681,6 +692,7 @@ darwin_evict_oldest_locked(struct darwin_retire_state *retire,
+@@ -666,21 +687,26 @@ darwin_remove_cached_locked(struct darwin_retire_state *retire, struct darwin_bo
+ {
+    list_del(&node->link);
+    list_del(&node->bucket_link);
++   list_del(&node->cache_group_link);
+    --retire->cache_count;
+    retire->cache_bytes -= node->bo.size;
++   if (!(node->bo.alloc_flags & TU_BO_ALLOC_COMMAND_STREAM)) {
++      retire->general_cache_bytes -= node->bo.size;
++   }
+ }
+ 
+ static void
+-darwin_evict_oldest_locked(struct darwin_retire_state *retire,
+-                          enum darwin_cache_evict_reason reason)
++darwin_evict_cached_locked(struct darwin_retire_state *retire,
++                           struct darwin_bo_node *node,
++                           enum darwin_cache_evict_reason reason)
+ {
+-   struct darwin_bo_node *node = list_first_entry(&retire->cache, struct darwin_bo_node, link);
+    darwin_remove_cached_locked(retire, node);
+    node->state = DARWIN_BO_RECLAIM;
+    list_addtail(&node->link, &retire->reclaim);
     ++retire->count;
     retire->pending_bytes += node->bo.size;
     retire->reclaim_bytes += node->bo.size;
@@ -1754,10 +2172,24 @@ index a5ccf3f..6ca25e8 100644
     ++retire->cache_evictions;
     switch (reason) {
     case DARWIN_EVICT_OBJECTS:
-@@ -702,6 +714,55 @@ darwin_evict_oldest_locked(struct darwin_retire_state *retire,
+@@ -702,19 +728,94 @@ darwin_evict_oldest_locked(struct darwin_retire_state *retire,
  
  }
  
++/* The two LRUs follow Freedreno's separate general BO and ringbuffer caches.
++ * Ordinary resources leave half the byte budget available for command streams. */
++static struct darwin_bo_node *
++darwin_oldest_cached_locked(struct darwin_retire_state *retire)
++{
++   struct list_head *group = !list_is_empty(&retire->cache_general) ?
++      &retire->cache_general : &retire->cache_commands;
++   if (list_is_empty(group)) {
++      return NULL;
++   }
++
++   return list_first_entry(group, struct darwin_bo_node, cache_group_link);
++}
++
 +/* The completed cache releases enough mappings to fit this connection's
 + * share after already queued destruction has finished. Active and pending
 + * BOs keep their storage until their owners and GPU jobs release it. */
@@ -1769,7 +2201,8 @@ index a5ccf3f..6ca25e8 100644
 +      DARWIN_NATIVE_BO_LIMIT / 2;
 +   unsigned retained = retire->node_count - retire->reclaim_count - retire->released_count;
 +   while (retire->cache_count && retained > target) {
-+      darwin_evict_oldest_locked(retire, DARWIN_EVICT_OBJECTS);
++      darwin_evict_cached_locked(retire, darwin_oldest_cached_locked(retire),
++                                 DARWIN_EVICT_OBJECTS);
 +      --retained;
 +   }
 +}
@@ -1810,7 +2243,9 @@ index a5ccf3f..6ca25e8 100644
  static void
  darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_bo_node *node)
  {
-@@ -710,6 +771,7 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
+    struct darwin_retired_bo *bo = &node->bo;
+-   if (!bo->cacheable || retire->trim_waiters) {
++   if (!bo->cacheable) {
        node->state = DARWIN_BO_RECLAIM;
        list_addtail(&node->link, &retire->reclaim);
        retire->reclaim_bytes += bo->size;
@@ -1818,7 +2253,35 @@ index a5ccf3f..6ca25e8 100644
        return;
     }
  
-@@ -730,6 +792,7 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
++   const bool command_stream = bo->alloc_flags & TU_BO_ALLOC_COMMAND_STREAM;
++   if (!command_stream) {
++      while (bo->size > DARWIN_GENERAL_CACHE_BYTES - retire->general_cache_bytes) {
++         struct darwin_bo_node *oldest = list_first_entry(&retire->cache_general,
++            struct darwin_bo_node, cache_group_link);
++         darwin_evict_cached_locked(retire, oldest, DARWIN_EVICT_BYTES);
++      }
++   }
++
+    while (bo->size > DARWIN_BO_CACHE_BYTES - retire->cache_bytes) {
+-      darwin_evict_oldest_locked(retire, DARWIN_EVICT_BYTES);
++      darwin_evict_cached_locked(retire, darwin_oldest_cached_locked(retire),
++                                 DARWIN_EVICT_BYTES);
+    }
+ 
+    unsigned size_class;
+@@ -723,13 +824,19 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
+    node->state = DARWIN_BO_CACHED;
+    list_addtail(&node->link, &retire->cache);
+    list_addtail(&node->bucket_link, &retire->buckets[size_class][attributes]);
++   list_addtail(&node->cache_group_link,
++                command_stream ? &retire->cache_commands : &retire->cache_general);
+    ++retire->cache_count;
+    retire->cache_bytes += bo->size;
++   if (!command_stream) {
++      retire->general_cache_bytes += bo->size;
++   }
+    retire->cache_peak_bytes = MAX2(retire->cache_peak_bytes, retire->cache_bytes);
+    retire->profile.peak_objects = MAX2(retire->profile.peak_objects, retire->cache_count);
     ++retire->profile.puts;
     --retire->count;
     retire->pending_bytes -= bo->size;
@@ -1826,16 +2289,18 @@ index a5ccf3f..6ca25e8 100644
  }
  
  static void
-@@ -758,7 +821,7 @@ darwin_retire_worker(void *argument)
+@@ -758,15 +865,32 @@ darwin_retire_worker(void *argument)
        }
  
        list_for_each_entry_safe(struct darwin_bo_node, node, &retire->retry, link) {
 -         if (node->retry_generation != retire->work_generation) {
 +         if (os_time_get_nano() >= node->retry_after_ns) {
              list_del(&node->link);
++            --retire->retry_count;
++            retire->retry_bytes -= node->bo.size;
              node->state = DARWIN_BO_RECLAIM;
              list_addtail(&node->link, &retire->reclaim);
-@@ -766,7 +829,22 @@ darwin_retire_worker(void *argument)
+          }
        }
        if (retire->failure != VK_SUCCESS ||
            (list_is_empty(&retire->pending) && list_is_empty(&retire->reclaim))) {
@@ -1859,25 +2324,41 @@ index a5ccf3f..6ca25e8 100644
           processed = 0;
           turn_bytes = 0;
           observed_fence = 0;
-@@ -799,6 +877,8 @@ darwin_retire_worker(void *argument)
+@@ -775,7 +899,8 @@ darwin_retire_worker(void *argument)
+       }
+ 
+       const bool destroy = !list_is_empty(&retire->reclaim) &&
+-         (list_is_empty(&retire->pending) || retire->reclaim_bytes >= DARWIN_RECLAIM_HIGH_BYTES);
++         (retire->reclaim_waiters || list_is_empty(&retire->pending) ||
++          retire->reclaim_bytes >= DARWIN_RECLAIM_HIGH_BYTES);
+       struct list_head *queue = destroy ? &retire->reclaim : &retire->pending;
+       struct darwin_bo_node *node = list_first_entry(queue, struct darwin_bo_node, link);
+       list_del(&node->link);
+@@ -799,6 +924,10 @@ darwin_retire_worker(void *argument)
              --retire->count;
              retire->pending_bytes -= node->bo.size;
              retire->reclaim_bytes -= node->bo.size;
 +            --retire->reclaim_count;
 +            ++retire->released_count;
++            ++retire->released_objects_total;
++            retire->released_bytes_total += node->bo.size;
           } else {
              observed_fence = node->bo.fence;
              if (node->bo.cacheable) {
-@@ -814,7 +894,7 @@ darwin_retire_worker(void *argument)
+@@ -814,8 +943,11 @@ darwin_retire_worker(void *argument)
           list_add(&node->link, &retire->pending);
        } else if (result == VK_NOT_READY && destroy) {
           node->state = DARWIN_BO_RECLAIM;
 -         node->retry_generation = retire->work_generation;
 +         node->retry_after_ns = os_time_get_nano() + 1000000;
           list_addtail(&node->link, &retire->retry);
++         ++retire->retry_count;
++         retire->retry_bytes += node->bo.size;
++         pthread_cond_broadcast(&retire->progress);
        } else {
           if (!destroy && node->bo.cacheable) {
-@@ -863,6 +943,7 @@ darwin_recycle_released_locked(struct tu_device *dev, struct darwin_retire_state
+             list_del(&node->bucket_link);
+@@ -863,11 +995,15 @@ darwin_recycle_released_locked(struct tu_device *dev, struct darwin_retire_state
        darwin_free_iova(dev, node->bo.iova, node->bo.size);
        util_idalloc_free(&retire->ids, node->bo.gem_handle);
        --retire->node_count;
@@ -1885,7 +2366,25 @@ index a5ccf3f..6ca25e8 100644
        *node = {};
     }
  }
-@@ -885,7 +966,7 @@ darwin_allocate_bo_id(struct tu_device *dev)
+ 
+-static VkResult darwin_trim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason);
++static VkResult darwin_reclaim_cache(struct tu_device *dev,
++                                     enum darwin_cache_evict_reason reason,
++                                     unsigned objects, uint64_t bytes,
++                                     uint64_t deadline_ns = 0);
+ 
+ static uint32_t
+ darwin_allocate_bo_id(struct tu_device *dev)
+@@ -877,7 +1013,7 @@ darwin_allocate_bo_id(struct tu_device *dev)
+    darwin_recycle_released_locked(dev, retire);
+    if (retire->node_count == DARWIN_NATIVE_BO_LIMIT) {
+       pthread_mutex_unlock(&retire->lock);
+-      darwin_trim_cache(dev, DARWIN_EVICT_OBJECTS);
++      darwin_reclaim_cache(dev, DARWIN_EVICT_OBJECTS, 1, 0);
+       pthread_mutex_lock(&retire->lock);
+       darwin_recycle_released_locked(dev, retire);
+    }
+@@ -885,7 +1021,7 @@ darwin_allocate_bo_id(struct tu_device *dev)
     if (retire->failure == VK_SUCCESS && retire->node_count < DARWIN_NATIVE_BO_LIMIT) {
        id = util_idalloc_alloc(&retire->ids);
        retire->nodes[id].bo.gem_handle = id;
@@ -1894,7 +2393,7 @@ index a5ccf3f..6ca25e8 100644
        ++retire->node_count;
     }
     pthread_mutex_unlock(&retire->lock);
-@@ -917,6 +998,8 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+@@ -917,6 +1053,8 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
                      bool eligible, const char *name, uint32_t *reason,
                      struct darwin_retired_bo *out)
  {
@@ -1903,7 +2402,7 @@ index a5ccf3f..6ca25e8 100644
     struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
     pthread_mutex_lock(&retire->lock);
     NativeAdrenoAbiBoCacheCounters *profile = &retire->profile;
-@@ -956,7 +1039,7 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+@@ -956,7 +1094,7 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
  
           *out = node->bo;
           darwin_remove_cached_locked(retire, node);
@@ -1912,7 +2411,116 @@ index a5ccf3f..6ca25e8 100644
           ++retire->cache_hits;
           ++profile->hits;
           ++size_bin->hits;
-@@ -1079,12 +1162,15 @@ static VkResult
+@@ -1016,30 +1154,91 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+    return result;
+ }
+ 
+-/* Allocation pressure transfers completed cache entries to the worker and
+- * waits for real storage release. A five-second deadline bounds admission;
+- * timeout preserves queued ownership and lets the caller retry once against
+- * the storage that has actually been released. */
++static struct darwin_bo_node *
++darwin_reclaim_candidate_locked(struct darwin_retire_state *retire, uint64_t bytes)
++{
++   if (!bytes) {
++      return darwin_oldest_cached_locked(retire);
++   }
++
++   struct list_head *groups[] = {&retire->cache_general, &retire->cache_commands};
++   for (struct list_head *group : groups) {
++      struct darwin_bo_node *fit = NULL;
++      struct darwin_bo_node *largest = NULL;
++      list_for_each_entry(struct darwin_bo_node, node, group, cache_group_link) {
++         if (node->bo.size >= bytes && (!fit || node->bo.size < fit->bo.size)) {
++            fit = node;
++         }
++         if (!largest || node->bo.size > largest->bo.size) {
++            largest = node;
++         }
++      }
++      if (fit || largest) {
++         return fit ? fit : largest;
++      }
++   }
++
++   return NULL;
++}
++
++/* Allocation callers request the storage needed by their failed operation.
++ * Existing queued releases count toward that request. Pending BOs become
++ * candidates only after the worker observes their fences and caches them.
++ * The caller retries the kernel allocation after release, lack of candidates,
++ * or the five-second deadline; unreleased nodes remain owned by the worker. */
+ static VkResult
+-darwin_trim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason)
++darwin_reclaim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason,
++                     unsigned objects, uint64_t bytes, uint64_t deadline_ns)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+-   struct timespec deadline;
+-   clock_gettime(CLOCK_REALTIME, &deadline);
+-   deadline.tv_sec += 5;
+-   pthread_mutex_lock(&retire->lock);
+-   ++retire->trim_waiters;
+-   while (retire->failure == VK_SUCCESS && retire->cache_count) {
+-      darwin_evict_oldest_locked(retire, reason);
++   if (!deadline_ns) {
++      deadline_ns = os_time_get_nano() + 5000000000ull;
+    }
+-   darwin_wake_worker_locked(retire);
+-   while (retire->failure == VK_SUCCESS && !retire->worker_stop && retire->count) {
+-      ++retire->pressure_waits;
+-      if (pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline) == ETIMEDOUT) {
++   pthread_mutex_lock(&retire->lock);
++   const uint64_t began_objects = retire->released_objects_total;
++   const uint64_t began_bytes = retire->released_bytes_total;
++   ++retire->reclaim_waiters;
++   while (retire->failure == VK_SUCCESS && !retire->worker_stop) {
++      const uint64_t released_objects = retire->released_objects_total - began_objects;
++      const uint64_t released_bytes = retire->released_bytes_total - began_bytes;
++      if (released_objects >= objects && released_bytes >= bytes) {
++         break;
++      }
++
++      const uint64_t remaining_objects = objects > released_objects ?
++         objects - released_objects : 0;
++      const uint64_t remaining_bytes = bytes > released_bytes ? bytes - released_bytes : 0;
++      while (retire->cache_count &&
++             (retire->reclaim_count - retire->retry_count < remaining_objects ||
++              retire->reclaim_bytes - retire->retry_bytes < remaining_bytes)) {
++         const uint64_t queued_bytes = retire->reclaim_bytes - retire->retry_bytes;
++         const uint64_t needed_bytes = remaining_bytes > queued_bytes ?
++            remaining_bytes - queued_bytes : 0;
++         struct darwin_bo_node *node = darwin_reclaim_candidate_locked(retire, needed_bytes);
++         darwin_evict_cached_locked(retire, node, reason);
++      }
++
++      if (!retire->reclaim_count && list_is_empty(&retire->pending)) {
+          break;
+       }
++
++      const uint64_t now = os_time_get_nano();
++      if (now >= deadline_ns) {
++         break;
++      }
++      struct timespec deadline;
++      clock_gettime(CLOCK_REALTIME, &deadline);
++      deadline.tv_nsec += MIN2(deadline_ns - now, 100000000ull);
++      if (deadline.tv_nsec >= 1000000000) {
++         ++deadline.tv_sec;
++         deadline.tv_nsec -= 1000000000;
++      }
++
++      darwin_wake_worker_locked(retire);
++      ++retire->pressure_waits;
++      pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline);
+    }
+-   --retire->trim_waiters;
++   --retire->reclaim_waiters;
+    darwin_recycle_released_locked(dev, retire);
+    VkResult result = retire->failure;
+    pthread_mutex_unlock(&retire->lock);
+@@ -1079,12 +1278,15 @@ static VkResult
  darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
                     uint64_t size, uint32_t gem_handle, kern_return_t map_error)
  {
@@ -1929,7 +2537,7 @@ index a5ccf3f..6ca25e8 100644
     }
     /* A failed map may have modified tables. Unknown cleanup never authorizes
      * reusing its IOVA, even though no tu_bo could be published to the caller. */
-@@ -1093,6 +1179,20 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+@@ -1093,6 +1295,22 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
     retire->nodes[gem_handle].bo = {
        .handle = handle, .iova = iova, .size = size, .gem_handle = gem_handle,
     };
@@ -1940,8 +2548,10 @@ index a5ccf3f..6ca25e8 100644
 +      list_addtail(&node->link, &retire->retry);
 +      ++retire->count;
 +      ++retire->reclaim_count;
++      ++retire->retry_count;
 +      retire->pending_bytes += size;
 +      retire->reclaim_bytes += size;
++      retire->retry_bytes += size;
 +      darwin_wake_worker_locked(retire);
 +      pthread_mutex_unlock(&retire->lock);
 +      return vk_errorf(dev, map_result, "BoMap failed: 0x%x; storage release pending", map_error);
@@ -1950,7 +2560,7 @@ index a5ccf3f..6ca25e8 100644
     retire->nodes[gem_handle].state = DARWIN_BO_QUARANTINED;
     retire->failure = vk_device_set_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
     VkResult result = retire->failure;
-@@ -1100,8 +1200,126 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+@@ -1100,8 +1318,154 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
     return result;
  }
  
@@ -2015,36 +2625,31 @@ index a5ccf3f..6ca25e8 100644
 +   NativeAdrenoAbiBoMapReply mapped = {};
 +   const uint64_t deadline_ns = os_time_get_nano() + 5000000000ull;
 +   kern_return_t kr = darwin_map_with_alias_wait(dev, &map, &mapped, deadline_ns);
-+   const bool mapping_pressure = kr == kIOReturnNoSpace &&
-+      (dw.params.flags & NativeAdrenoParamsResourceBudget);
-+   if (mapping_pressure || kr == kIOReturnNoResources) {
++   bool retried_allocation = false;
++   while (os_time_get_nano() < deadline_ns) {
++      const bool mapping_pressure = kr == kIOReturnNoSpace &&
++         (dw.params.flags & NativeAdrenoParamsResourceBudget);
++      const bool allocation_pressure = !retried_allocation &&
++         (kr == kIOReturnNoResources || kr == kIOReturnNoMemory);
++      if (!mapping_pressure && !allocation_pressure) {
++         break;
++      }
++
++      retried_allocation |= allocation_pressure;
 +      darwin_refresh_mapping_budget(dev, true);
-+      VkResult reclaimed = darwin_trim_cache(dev, DARWIN_EVICT_OBJECTS);
++      VkResult reclaimed = darwin_reclaim_cache(dev,
++         mapping_pressure ? DARWIN_EVICT_OBJECTS : DARWIN_EVICT_ALLOCATION,
++         1, mapping_pressure ? 0 : size, deadline_ns);
 +      if (reclaimed != VK_SUCCESS) {
 +         VkResult cleanup = darwin_map_failure(dev, handle, iova, size, gem_handle, kr);
 +         return cleanup == VK_ERROR_DEVICE_LOST ? cleanup : reclaimed;
 +      }
-+      const unsigned attempts = mapping_pressure ? 3 : 1;
-+      for (unsigned attempt = 0; attempt < attempts; ++attempt) {
-+         kr = darwin_map_with_alias_wait(dev, &map, &mapped, deadline_ns);
-+         if (kr != kIOReturnNoSpace || attempt + 1 == attempts) {
-+            break;
++      kr = darwin_map_with_alias_wait(dev, &map, &mapped, deadline_ns);
++      if (kr == kIOReturnNoSpace) {
++         const uint64_t now = os_time_get_nano();
++         if (now < deadline_ns) {
++            usleep((useconds_t) MIN2(1000ull, (deadline_ns - now + 999) / 1000));
 +         }
-+
-+         struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
-+         struct timespec deadline;
-+         clock_gettime(CLOCK_REALTIME, &deadline);
-+         deadline.tv_nsec += 100000000;
-+         if (deadline.tv_nsec >= 1000000000) {
-+            ++deadline.tv_sec;
-+            deadline.tv_nsec -= 1000000000;
-+         }
-+         pthread_mutex_lock(&retire->lock);
-+         if (!retire->worker_stop && retire->failure == VK_SUCCESS) {
-+            pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline);
-+         }
-+         pthread_mutex_unlock(&retire->lock);
-+         darwin_refresh_mapping_budget(dev, true);
 +      }
 +   }
 +
@@ -2057,6 +2662,29 @@ index a5ccf3f..6ca25e8 100644
 +
  /* ---- buffer objects ---- */
  
++/* The caller holds retire->lock through lookup and reference acquisition. */
++static struct tu_bo *
++darwin_lookup_bo_locked(struct darwin_retire_state *retire, uint64_t iova, uint64_t bytes)
++{
++   struct rb_node *entry = retire->active_bos.root;
++   while (entry) {
++      struct darwin_bo_node *node = rb_node_data(struct darwin_bo_node, entry, active_iova);
++      if (iova < node->bo.iova) {
++         entry = entry->left;
++      } else if (iova - node->bo.iova >= node->bo.size) {
++         entry = entry->right;
++      } else {
++         if (!bytes || bytes > node->bo.size - (iova - node->bo.iova)) {
++            return NULL;
++         }
++
++         return tu_device_lookup_bo(retire->device, node->bo.gem_handle);
++      }
++   }
++
++   return NULL;
++}
++
 +/* The BO becomes visible to submission only after its native allocation,
 + * mapping and tu_bo fields are complete. Last-reference removal uses this
 + * same lock before changing the node back to reserved ownership. */
@@ -2070,6 +2698,16 @@ index a5ccf3f..6ca25e8 100644
 +   node->bo.iova = bo->iova;
 +   node->bo.size = bo->size;
 +   node->bo.alloc_flags = bo->darwin_alloc_flags;
++   struct rb_node *parent = NULL;
++   struct rb_node *entry = retire->active_bos.root;
++   bool left = false;
++   while (entry) {
++      parent = entry;
++      struct darwin_bo_node *other = rb_node_data(struct darwin_bo_node, entry, active_iova);
++      left = node->bo.iova < other->bo.iova;
++      entry = left ? entry->left : entry->right;
++   }
++   rb_tree_insert_at(&retire->active_bos, parent, &node->active_iova, left);
 +   node->state = DARWIN_BO_ACTIVE;
 +   pthread_mutex_unlock(&retire->lock);
 +}
@@ -2077,7 +2715,30 @@ index a5ccf3f..6ca25e8 100644
  static VkResult
  darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
                 struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
-@@ -1175,17 +1393,10 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+@@ -1143,9 +1507,8 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       }
+       uint64_t iova;
+       result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+-      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+-          result == VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) {
+-         result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
++      if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
++         result = darwin_reclaim_cache(dev, DARWIN_EVICT_IOVA, 1, size);
+          if (result != VK_SUCCESS) {
+             darwin_cancel_bo_id(dev, storage.gem_handle);
+             return result;
+@@ -1160,8 +1523,8 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       NativeAdrenoAbiBoAlloc alloc = {.bytes = size, .align_log2 = 12, .contiguous = 0};
+       NativeAdrenoAbiBoAllocReply reply = {};
+       kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+-      if (kr != KERN_SUCCESS) {
+-         result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
++      if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
++         result = darwin_reclaim_cache(dev, DARWIN_EVICT_ALLOCATION, 1, size);
+          if (result != VK_SUCCESS) {
+             darwin_free_iova(dev, iova, size);
+             darwin_cancel_bo_id(dev, storage.gem_handle);
+@@ -1175,17 +1538,10 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
           return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
        }
  
@@ -2099,7 +2760,7 @@ index a5ccf3f..6ca25e8 100644
        }
  
        storage.handle = reply.handle;
-@@ -1213,6 +1424,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+@@ -1213,6 +1569,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
        .unique_id = storage.handle,
     };
     bo->darwin_handle = storage.handle;
@@ -2107,7 +2768,7 @@ index a5ccf3f..6ca25e8 100644
     bo->darwin_token = storage.token;
     bo->darwin_map_id = storage.map_id;
     bo->darwin_alloc_flags = flags;
-@@ -1228,6 +1440,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+@@ -1228,6 +1585,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
        TU_RMV(bo_map, dev, bo);
     }
  
@@ -2115,7 +2776,7 @@ index a5ccf3f..6ca25e8 100644
     *out_bo = bo;
     if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {
        TU_RMV(internal_resource_create, dev, bo);
-@@ -1271,6 +1484,8 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+@@ -1271,6 +1629,8 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
  static VkResult
  darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
  {
@@ -2124,7 +2785,25 @@ index a5ccf3f..6ca25e8 100644
     struct darwin_connection &dw = *darwin_connection_for(dev);
     if (!(dw.params.flags & NativeAdrenoParamsHostImport))
        return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
-@@ -1317,11 +1532,9 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+@@ -1288,7 +1648,7 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+    uint64_t iova;
+    VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+-      result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
++      result = darwin_reclaim_cache(dev, DARWIN_EVICT_IOVA, 1, size);
+       if (result != VK_SUCCESS) {
+          darwin_cancel_bo_id(dev, gem_handle);
+          return result;
+@@ -1304,7 +1664,7 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+    NativeAdrenoAbiBoAllocReply reply = {};
+    kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+    if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
+-      result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
++      result = darwin_reclaim_cache(dev, DARWIN_EVICT_ALLOCATION, 1, size);
+       if (result != VK_SUCCESS) {
+          darwin_free_iova(dev, iova, size);
+          darwin_cancel_bo_id(dev, gem_handle);
+@@ -1317,11 +1677,9 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
        darwin_cancel_bo_id(dev, gem_handle);
        return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
     }
@@ -2139,7 +2818,7 @@ index a5ccf3f..6ca25e8 100644
     }
  
     struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
-@@ -1335,11 +1548,14 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+@@ -1335,11 +1693,14 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
        .unique_id = reply.handle,
     };
     bo->darwin_handle = reply.handle;
@@ -2154,7 +2833,7 @@ index a5ccf3f..6ca25e8 100644
     tu_dump_bo_init(dev, bo);
     TU_RMV(bo_allocate, dev, bo);
     *out_bo = bo;
-@@ -1492,16 +1708,21 @@ darwin_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo, void *metadata,
+@@ -1492,16 +1853,23 @@ darwin_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo, void *metadata,
  static void
  darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  {
@@ -2171,13 +2850,15 @@ index a5ccf3f..6ca25e8 100644
        u_rwlock_rdunlock(&dev->dma_bo_lock);
        return;
     }
-+   retire->nodes[bo->gem_handle].state = DARWIN_BO_RESERVED;
++   struct darwin_bo_node *active = &retire->nodes[bo->gem_handle];
++   rb_tree_remove(&retire->active_bos, &active->active_iova);
++   active->state = DARWIN_BO_RESERVED;
 +   const uint32_t fence = p_atomic_read(&bo->darwin_last_fence);
 +   pthread_mutex_unlock(&retire->lock);
  
     NativeAdrenoAbiBoSlowEvent event = {};
     event.operation = NativeAdrenoBoSlowRetire;
-@@ -1520,10 +1741,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1520,10 +1888,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
        TU_RMV(bo_unmap, dev, bo);
     TU_RMV(bo_destroy, dev, bo);
  
@@ -2188,7 +2869,7 @@ index a5ccf3f..6ca25e8 100644
     event.connection_fence = fence;
     pthread_mutex_lock(&retire->lock);
     struct darwin_bo_node *node = &retire->nodes[bo->gem_handle];
-@@ -1569,8 +1786,91 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+@@ -1569,8 +1933,121 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
  
  struct tu_darwin_queue_submit {
     struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
@@ -2241,11 +2922,41 @@ index a5ccf3f..6ca25e8 100644
 +}
 +
 +VkResult
++tu_darwin_submit_add_cs_resources(struct tu_device *dev, void *_submit,
++                                  const struct tu_cs *cs)
++{
++   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS)
++      return submit->result = tu_cs_get_record_result(cs);
++
++   const size_t count = util_dynarray_num_elements(&cs->resource_ranges, struct tu_resource_range);
++   if (!count)
++      return submit->result;
++
++   void *target = util_dynarray_grow_bytes(&submit->ranges, count, sizeof(struct tu_resource_range));
++   if (!target)
++      return submit->result = VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   memcpy(target, cs->resource_ranges.data, count * sizeof(struct tu_resource_range));
++   return submit->result;
++}
++
++VkResult
 +tu_darwin_submit_add_resources(struct tu_device *dev, void *_submit,
 +                               struct tu_cmd_buffer *cmd)
 +{
 +   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
 +   submit->fallback_reasons |= cmd->resource_fallback_reasons;
++
++   const struct tu_cs *streams[] = {
++      &cmd->cs, &cmd->draw_cs, &cmd->tile_store_cs, &cmd->draw_epilogue_cs,
++      &cmd->sub_cs, &cmd->pre_chain.draw_cs, &cmd->pre_chain.draw_epilogue_cs,
++   };
++   for (const struct tu_cs *cs : streams) {
++      VkResult result = tu_darwin_submit_add_cs_resources(dev, submit, cs);
++      if (result != VK_SUCCESS)
++         return result;
++   }
 +
 +   const size_t count = util_dynarray_num_elements(&cmd->resource_ranges, struct tu_resource_range);
 +   if (count) {
@@ -2280,7 +2991,7 @@ index a5ccf3f..6ca25e8 100644
  static void *
  darwin_submit_create(struct tu_device *device)
  {
-@@ -1582,7 +1882,13 @@ static void
+@@ -1582,7 +2059,13 @@ static void
  darwin_submit_finish(struct tu_device *device, void *_submit)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -2294,7 +3005,7 @@ index a5ccf3f..6ca25e8 100644
     vk_free(&device->vk.alloc, submit);
  }
  
-@@ -1591,8 +1897,15 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1591,8 +2074,15 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
                            struct tu_cs_entry *entries, unsigned num_entries)
  {
     struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
@@ -2310,18 +3021,10 @@ index a5ccf3f..6ca25e8 100644
     for (unsigned i = 0; i < num_entries; i++) {
        cmds[i] = (NativeAdrenoAbiSubmitBuffer) {
           .handle = entries[i].bo->darwin_handle,
-@@ -1602,6 +1915,150 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+@@ -1602,6 +2092,121 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
     }
  }
  
-+static int
-+darwin_resource_compare(const void *left, const void *right)
-+{
-+   const struct darwin_submit_resource *a = (const struct darwin_submit_resource *)left;
-+   const struct darwin_submit_resource *b = (const struct darwin_submit_resource *)right;
-+   return a->bo->iova < b->bo->iova ? -1 : a->bo->iova > b->bo->iova;
-+}
-+
 +static int
 +darwin_native_range_compare(const void *left, const void *right)
 +{
@@ -2357,23 +3060,7 @@ index a5ccf3f..6ca25e8 100644
 +                                bool legacy)
 +{
 +   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
-+   struct darwin_submit_resource *objects = (struct darwin_submit_resource *)
-+      util_dynarray_grow(&submit->resources, struct darwin_submit_resource, DARWIN_NATIVE_BO_LIMIT);
-+   if (!objects)
-+      return VK_ERROR_OUT_OF_HOST_MEMORY;
-+
-+   uint32_t count = 0;
-+   pthread_mutex_lock(&retire->lock);
-+   for (uint32_t id = 1; id <= DARWIN_NATIVE_BO_LIMIT; id++) {
-+      if (retire->nodes[id].state != DARWIN_BO_ACTIVE)
-+         continue;
-+
-+      struct tu_bo *bo = tu_device_lookup_bo(dev, id);
-+      objects[count++] = {tu_bo_get_ref(bo), 0};
-+   }
-+   pthread_mutex_unlock(&retire->lock);
-+   submit->resources.size = count * sizeof(*objects);
-+   qsort(objects, count, sizeof(*objects), darwin_resource_compare);
++   uint16_t object_indices[DARWIN_NATIVE_BO_LIMIT + 1] = {};
 +
 +   util_dynarray_foreach (&submit->commands, NativeAdrenoAbiSubmitBuffer, ib) {
 +      struct tu_resource_range *range = (struct tu_resource_range *)
@@ -2384,58 +3071,53 @@ index a5ccf3f..6ca25e8 100644
 +      *range = {ib->iova, ib->bytes, TU_RESOURCE_READ};
 +   }
 +
++   VkResult result = VK_SUCCESS;
++   pthread_mutex_lock(&retire->lock);
 +   util_dynarray_foreach (&submit->ranges, struct tu_resource_range, range) {
 +      if (!range->iova || !range->size)
 +         continue;
 +
-+      uint32_t lo = 0, hi = count;
-+      while (lo < hi) {
-+         const uint32_t mid = lo + (hi - lo) / 2;
-+         if (objects[mid].bo->iova <= range->iova)
-+            lo = mid + 1;
-+         else
-+            hi = mid;
-+      }
-+      if (!lo || range->iova - objects[lo - 1].bo->iova >= objects[lo - 1].bo->size ||
-+          range->size > objects[lo - 1].bo->size - (range->iova - objects[lo - 1].bo->iova)) {
++      struct tu_bo *bo = darwin_lookup_bo_locked(retire, range->iova, range->size);
++      if (!bo) {
 +         submit->fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
 +         continue;
 +      }
-+      objects[lo - 1].access |= range->access;
-+      VkResult result = darwin_add_native_range(submit, objects[lo - 1].bo,
-+         range->iova - objects[lo - 1].bo->iova, range->size, range->access);
-+      if (result != VK_SUCCESS)
-+         return result;
-+   }
-+
-+   for (uint32_t i = 0; i < count; i++) {
-+      struct tu_bo *bo = objects[i].bo;
-+      if (!(bo->darwin_alloc_flags & TU_BO_ALLOC_INTERNAL_RESOURCE))
-+         continue;
-+
-+      VkResult result = darwin_add_native_range(submit, bo, 0, bo->size,
-+                                                TU_RESOURCE_READ | TU_RESOURCE_WRITE);
-+      if (result != VK_SUCCESS)
-+         return result;
-+   }
-+
-+   uint32_t kept = 0;
-+   for (uint32_t i = 0; i < count; i++) {
-+      struct darwin_submit_resource resource = objects[i];
-+      if (legacy || submit->fallback_reasons ||
-+          (resource.bo->darwin_alloc_flags & TU_BO_ALLOC_INTERNAL_RESOURCE)) {
-+         resource.access |= TU_RESOURCE_READ | TU_RESOURCE_WRITE;
++      if (!object_indices[bo->gem_handle]) {
++         struct darwin_submit_resource *object = (struct darwin_submit_resource *)
++            util_dynarray_grow(&submit->resources, struct darwin_submit_resource, 1);
++         if (!object) {
++            result = VK_ERROR_OUT_OF_HOST_MEMORY;
++            break;
++         }
++         *object = {tu_bo_get_ref(bo), range->access};
++         object_indices[bo->gem_handle] =
++            util_dynarray_num_elements(&submit->resources, struct darwin_submit_resource);
 +      }
-+      if (resource.bo->darwin_alloc_flags & TU_BO_ALLOC_GPU_READ_ONLY)
-+         resource.access &= ~TU_RESOURCE_WRITE;
 +
-+      if (resource.access) {
-+         objects[kept++] = resource;
-+      } else {
-+         tu_bo_finish(dev, resource.bo);
++      result = darwin_add_native_range(submit, bo, range->iova - bo->iova,
++                                       range->size, range->access);
++      if (result != VK_SUCCESS)
++         break;
++   }
++
++   if (result == VK_SUCCESS && (legacy || submit->fallback_reasons)) {
++      for (uint32_t id = 1; id <= DARWIN_NATIVE_BO_LIMIT; id++) {
++         if (retire->nodes[id].state != DARWIN_BO_ACTIVE || object_indices[id])
++            continue;
++
++         struct tu_bo *bo = tu_device_lookup_bo(dev, id);
++         struct darwin_submit_resource *object = (struct darwin_submit_resource *)
++            util_dynarray_grow(&submit->resources, struct darwin_submit_resource, 1);
++         if (!object) {
++            result = VK_ERROR_OUT_OF_HOST_MEMORY;
++            break;
++         }
++         *object = {tu_bo_get_ref(bo), TU_RESOURCE_READ | TU_RESOURCE_WRITE};
 +      }
 +   }
-+   submit->resources.size = kept * sizeof(*objects);
++   pthread_mutex_unlock(&retire->lock);
++   if (result != VK_SUCCESS)
++      return result;
 +
 +   NativeAdrenoAbiSubmitResourceV2 *ranges =
 +      (NativeAdrenoAbiSubmitResourceV2 *)submit->native_ranges.data;
@@ -2461,7 +3143,7 @@ index a5ccf3f..6ca25e8 100644
  static void
  darwin_submit_add_bind(struct tu_device *device, void *_submit,
                         struct tu_sparse_vma *vma, uint64_t vma_offset,
-@@ -1816,6 +2273,132 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+@@ -1816,6 +2421,132 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
     return vk_device_set_lost(&dev->vk, "submit: no free job slot");
  }
  
@@ -2594,7 +3276,7 @@ index a5ccf3f..6ca25e8 100644
  static VkResult
  darwin_queue_submit(struct tu_queue *queue, void *_submit,
                      struct vk_sync_wait *waits, uint32_t wait_count,
-@@ -1826,6 +2409,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1826,6 +2557,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     struct tu_device *dev = queue->device;
     struct darwin_connection &dw = *darwin_connection_for(dev);
  
@@ -2604,7 +3286,7 @@ index a5ccf3f..6ca25e8 100644
     /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
     for (uint32_t i = 0; i < wait_count; i++) {
        struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
-@@ -1837,14 +2423,23 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1837,14 +2571,23 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
     uint32_t fence = 0;
     const unsigned total = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
     if (total) {
@@ -2630,7 +3312,7 @@ index a5ccf3f..6ca25e8 100644
           pthread_mutex_lock(&dw.lock);
           darwin_note_fence(&dw, chunk_fence);
           pthread_mutex_unlock(&dw.lock);
-@@ -1869,6 +2464,20 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+@@ -1869,6 +2612,20 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
  
  /* ---- device ---- */
  
@@ -2651,7 +3333,17 @@ index a5ccf3f..6ca25e8 100644
  static VkResult
  darwin_device_init(struct tu_device *dev)
  {
-@@ -2090,6 +2699,7 @@ static const struct tu_knl darwin_knl_funcs = {
+@@ -1895,6 +2652,9 @@ darwin_device_init(struct tu_device *dev)
+    util_idalloc_reserve(&retire->ids, 0);
+    list_inithead(&retire->pending);
+    list_inithead(&retire->cache);
++   list_inithead(&retire->cache_general);
++   list_inithead(&retire->cache_commands);
++   rb_tree_init(&retire->active_bos);
+    list_inithead(&retire->reclaim);
+    list_inithead(&retire->retry);
+    list_inithead(&retire->released);
+@@ -2090,6 +2850,7 @@ static const struct tu_knl darwin_knl_funcs = {
     .queue_wait_fence = darwin_queue_wait_fence,
     .sparse_vma_init = darwin_sparse_vma_init,
     .sparse_vma_finish = darwin_sparse_vma_finish,
@@ -2716,7 +3408,7 @@ index 8b010ed..05de9b1 100644
  
     pipeline->instrlen = v->instrlen;
 diff --git a/src/freedreno/vulkan/tu_query_pool.cc b/src/freedreno/vulkan/tu_query_pool.cc
-index 7c30e65..52c2468 100644
+index 7c30e65..cf6ffb0 100644
 --- a/src/freedreno/vulkan/tu_query_pool.cc
 +++ b/src/freedreno/vulkan/tu_query_pool.cc
 @@ -410,7 +410,7 @@ tu_CreateQueryPool(VkDevice _device,
@@ -2728,17 +3420,76 @@ index 7c30e65..52c2468 100644
     if (result != VK_SUCCESS) {
        tu_query_pool_destroy(device, pool, pAllocator);
        return result;
-@@ -901,6 +901,8 @@ tu_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
+@@ -901,6 +901,10 @@ tu_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
     VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
     struct tu_cs *cs = &cmdbuf->cs;
 +
 +   tu_cmd_use_buffer(cmdbuf, buffer, TU_RESOURCE_WRITE);
++   tu_cmd_use_range(cmdbuf, {pool->bo->iova + pool->query_stride * firstQuery,
++                             uint64_t(pool->query_stride) * queryCount, TU_RESOURCE_READ});
     assert(firstQuery + queryCount <= pool->size);
  
     switch (pool->vk.query_type) {
+@@ -989,6 +993,9 @@ tu_CmdResetQueryPool(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+ 
++   tu_cmd_use_range(cmdbuf, {pool->bo->iova + pool->query_stride * firstQuery,
++                             uint64_t(pool->query_stride) * queryCount, TU_RESOURCE_WRITE});
++
+    switch (pool->vk.query_type) {
+    case VK_QUERY_TYPE_TIMESTAMP:
+    case VK_QUERY_TYPE_OCCLUSION:
+@@ -1427,6 +1434,8 @@ tu_CmdBeginQueryIndexedEXT(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
++   tu_cmd_use_range(cmdbuf, {pool->bo->iova + pool->query_stride * query,
++                             pool->query_stride, TU_RESOURCE_READ | TU_RESOURCE_WRITE});
+    assert(query < pool->size);
+ 
+    switch (pool->vk.query_type) {
+@@ -2040,6 +2049,8 @@ tu_CmdEndQueryIndexedEXT(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmdbuf, commandBuffer);
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
++   tu_cmd_use_range(cmdbuf, {pool->bo->iova + pool->query_stride * query,
++                             pool->query_stride, TU_RESOURCE_READ | TU_RESOURCE_WRITE});
+    assert(query < pool->size);
+ 
+    switch (pool->vk.query_type) {
+@@ -2083,6 +2094,9 @@ tu_CmdWriteTimestamp2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+ 
++   tu_cmd_use_range(cmd, {pool->bo->iova + pool->query_stride * query,
++                          pool->query_stride, TU_RESOURCE_WRITE});
++
+    /* Inside a render pass, just write the timestamp multiple times so that
+     * the user gets the last one if we use GMEM. There isn't really much
+     * better we can do, and this seems to be what the blob does too.
+@@ -2164,6 +2178,10 @@ tu_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+ 
++   tu_cmd_use_range(cmd, {pool->bo->iova + pool->query_stride * firstQuery,
++                          uint64_t(pool->query_stride) * accelerationStructureCount,
++                          TU_RESOURCE_WRITE});
++
+    struct tu_cs *cs = &cmd->cs;
+ 
+    /* Flush any AS builds */
+@@ -2193,6 +2211,7 @@ tu_CmdWriteAccelerationStructuresPropertiesKHR(VkCommandBuffer commandBuffer,
+       }
+ 
+       tu_cs_emit_pkt7(cs, CP_MEM_TO_MEM, 5);
++      tu_cs_use_range(cs, va, sizeof(uint64_t), TU_RESOURCE_READ);
+       tu_cs_emit(cs, CP_MEM_TO_MEM_0_DOUBLE);
+       tu_cs_emit_qw(cs, query_result_iova(pool, query, uint64_t, 0));
+       tu_cs_emit_qw(cs, va);
 diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
-index da6c2f3..de49069 100644
+index da6c2f3..5909e78 100644
 --- a/src/freedreno/vulkan/tu_queue.cc
 +++ b/src/freedreno/vulkan/tu_queue.cc
 @@ -115,7 +115,7 @@ get_vis_stream_patchpoint_cs(struct tu_cmd_buffer *cmd,
@@ -2759,18 +3510,57 @@ index da6c2f3..de49069 100644
  }
  
  static VkResult
-@@ -285,6 +285,10 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+@@ -213,6 +213,7 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+     * submit.
+     */
+    for (unsigned i = 0; i < cmdbuf_count; i++) {
++      tu_cmd_use_bo(cmd_buffers[i], bo, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
+       bool has_bo = false;
+       util_dynarray_foreach (&cmd_buffers[i]->vis_stream_bos,
+                              struct tu_bo *, cmd_bo) {
+@@ -252,6 +253,7 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+ 
+          if (cmd_buffers[i]->usage_flags &
+              VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) {
++            tu_cs_use_range(&sub_cs, patchpoint->iova, 2 * sizeof(uint32_t), TU_RESOURCE_WRITE);
+             tu_cs_emit_pkt7(&sub_cs, CP_MEM_WRITE, 4);
+             tu_cs_emit_qw(&sub_cs, patchpoint->iova);
+             tu_cs_emit_qw(&sub_cs, final_iova);
+@@ -266,6 +268,7 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+       if (count_patchpoint->data) {
+          if (cmd_buffers[i]->usage_flags &
+              VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT) {
++            tu_cs_use_range(&sub_cs, count_patchpoint->iova, sizeof(uint32_t), TU_RESOURCE_WRITE);
+             tu_cs_emit_pkt7(&sub_cs, CP_MEM_WRITE, 3);
+             tu_cs_emit_qw(&sub_cs, count_patchpoint->iova);
+             tu_cs_emit(&sub_cs, vis_stream_count);
+@@ -280,11 +283,25 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+          tu_cs_emit_pkt7(&sub_cs, CP_WAIT_FOR_ME, 0);
+ 
+          /* Signal that this CS is done and can be reused. */
++         tu_cs_use_range(&sub_cs, fence_iova, sizeof(uint32_t), TU_RESOURCE_WRITE);
+          tu_cs_emit_pkt7(&sub_cs, CP_MEM_WRITE, 3);
+          tu_cs_emit_qw(&sub_cs, fence_iova);
           tu_cs_emit(&sub_cs, 1);
  
           struct tu_cs_entry entry = tu_cs_end_sub_stream(&cs, &sub_cs);
 +         result = tu_cs_get_record_result(&cs);
++         if (result != VK_SUCCESS) {
++            tu_cs_finish(&cs);
++            return result;
++         }
++
++#ifdef TU_HAS_DARWIN
++         result = tu_darwin_submit_add_cs_resources(queue->device, submit, &cs);
++#endif
++         tu_cs_finish(&cs);
 +         if (result != VK_SUCCESS)
 +            return result;
 +
           submit_add_entries(queue->device, submit, dump_cmds, &entry, 1);
        }
  
-@@ -427,7 +431,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -427,7 +444,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
  
     for (unsigned i = 0; i < vk_submit->command_buffer_count; i++) {
        VkResult result =
@@ -2779,7 +3569,7 @@ index da6c2f3..de49069 100644
        if (result != VK_SUCCESS) {
           return result;
        }
-@@ -459,7 +463,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -459,7 +476,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
      * Their recording errors must reach the caller before any kernel submit.
      */
     for (unsigned i = 0; i < cmdbuf_count; i++) {
@@ -2788,7 +3578,7 @@ index da6c2f3..de49069 100644
        if (result != VK_SUCCESS) {
           if (cmd_buffers !=
               (struct tu_cmd_buffer **) vk_submit->command_buffers) {
-@@ -483,19 +487,33 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -483,19 +500,33 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
     struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
  
     void *submit = tu_submit_create(device);
@@ -2825,7 +3615,7 @@ index da6c2f3..de49069 100644
  
     if (has_trace_points) {
        tu_u_trace_submission_data_create(
-@@ -506,6 +524,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -506,6 +537,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
        struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
        struct tu_cs *cs = &cmd_buffer->cs;
  
@@ -2842,7 +3632,7 @@ index da6c2f3..de49069 100644
        if (perf_pass_index != ~0) {
           struct tu_cs_entry *perf_cs_entry =
              &cmd_buffer->device->perfcntrs_pass_cs_entries[perf_pass_index];
-@@ -519,6 +547,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -519,6 +560,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
        if (u_trace_submission_data &&
            u_trace_submission_data->timestamp_copy_data) {
           struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
@@ -2850,10 +3640,16 @@ index da6c2f3..de49069 100644
 +         if (result != VK_SUCCESS)
 +            goto out_locked;
 +
++#ifdef TU_HAS_DARWIN
++         result = tu_darwin_submit_add_cs_resources(device, submit, cs);
++         if (result != VK_SUCCESS)
++            goto out_locked;
++#endif
++
           submit_add_entries(device, submit, &dump_cmds, cs->entries,
                              cs->entry_count);
        }
-@@ -526,6 +558,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -526,6 +577,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
  
     autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
     if (autotune_cs) {
@@ -2861,10 +3657,16 @@ index da6c2f3..de49069 100644
 +      if (result != VK_SUCCESS)
 +         goto out_locked;
 +
++#ifdef TU_HAS_DARWIN
++      result = tu_darwin_submit_add_cs_resources(device, submit, autotune_cs);
++      if (result != VK_SUCCESS)
++         goto out_locked;
++#endif
++
        submit_add_entries(device, submit, &dump_cmds, autotune_cs->entries,
                           autotune_cs->entry_count);
     }
-@@ -571,8 +607,6 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -571,8 +632,6 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
        fd_rd_output_end(rd_output);
     }
  
@@ -2873,7 +3675,7 @@ index da6c2f3..de49069 100644
  #ifdef HAVE_PERFETTO
     if (u_trace_should_process(&device->trace_context)) {
        for (int i = 0; i < vk_submit->command_buffer_count; i++)
-@@ -620,8 +654,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+@@ -620,8 +679,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
     pthread_cond_broadcast(&queue->device->timeline_cond);
  
     u_trace_context_process(&device->trace_context, false);
