@@ -34,6 +34,15 @@ record for version 1, or 128 in a 3104-byte record for version 2. The diagnostic
 mailbox retains the 16-buffer record. Host-import pages remain retained until the
 kernel acknowledges removal of their GPU mapping.
 
+On a Darwin device advertising cached coherent memory, Turnip exposes that memory
+as the default type for resources, heaps and internal command storage. CPU maps
+use write-back caching, and the kernel selects GPU mapping attributes from the
+allocation or imported pages. Metal Shared storage, WriteCombined hints, Private
+resources and eagerly allocated Memoryless attachments prefer cached coherent
+memory on unified-memory GPUs. The frontend's device query recognizes hardware
+coherence and kernel-managed visibility; either removes IOSurface flush-range
+collection and userspace cache operations from submission and completion.
+
 Device answers are cached by selector and argument. The frontend disables no-copy
 rebind replay logs. A padded render target aliases its buffer only when the height
 is divisible by four, its width rounded to 16 texels fits each row pitch, and the

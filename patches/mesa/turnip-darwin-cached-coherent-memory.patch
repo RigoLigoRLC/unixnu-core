@@ -1,0 +1,129 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -1674,6 +1674,8 @@
+                         struct tu_instance *instance)
+ {
+    VkResult result = VK_SUCCESS;
++   const bool darwin_cached_coherent =
++      strcmp(instance->knl->name, "darwin") == 0 && device->has_cached_coherent_memory;
+ 
+    const char *fd_name = fd_dev_name(&device->dev_id);
+    if (!fd_name) {
+@@ -1757,7 +1759,7 @@
+ 
+    device->level1_dcache_size = util_cache_granularity();
+    device->has_cached_non_coherent_memory =
+-      device->level1_dcache_size > 0 && !DETECT_ARCH_ARM;
++      device->level1_dcache_size > 0 && !DETECT_ARCH_ARM && !darwin_cached_coherent;
+    device->preferred_uncached_as_cached_index = -1;
+ 
+    device->memory.type_count = 1;
+@@ -1766,7 +1768,9 @@
+       VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+       VK_MEMORY_PROPERTY_HOST_COHERENT_BIT;
+ 
+-   if (device->has_cached_coherent_memory) {
++   if (darwin_cached_coherent) {
++      device->memory.types[0] |= VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++   } else if (device->has_cached_coherent_memory) {
+       device->memory.types[device->memory.type_count] =
+          VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+          VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
+@@ -3874,8 +3878,9 @@
+    if (handleType != VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT ||
+        !device->physical_device->has_host_import || ((uintptr_t) pHostPointer & 4095))
+       return vk_error(device, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+-   /* Imported pages keep the owner's CPU mapping; they are offered as the plain (host-coherent) type. On Darwin the importer cleans
+-    * and invalidates its own CPU caches around GPU use (NativeAdrenoAbiBoImport), as an IOSurface's owner does. */
++   /* Imported pages keep the owner's CPU mapping. The kernel derives GPU mapping
++    * attributes from those pages and completes CPU/GPU visibility before signaling
++    * the submission fence. The default coherent memory type accepts these imports. */
+    pMemoryHostPointerProperties->memoryTypeBits = 1u;
+    return VK_SUCCESS;
+ }
+diff --git a/src/freedreno/vulkan/tu_knl.cc b/src/freedreno/vulkan/tu_knl.cc
+--- a/src/freedreno/vulkan/tu_knl.cc
++++ b/src/freedreno/vulkan/tu_knl.cc
+@@ -42,6 +42,16 @@
+    struct tu_instance *instance = dev->physical_device->instance;
+ 
+    size = align64(size, os_page_size);
++
++   /* Darwin command, shader and descriptor BOs use the same cached coherent
++    * pages as application resources. The KMD and cache bookkeeping receive
++    * these properties before the allocation enters a reuse pool. */
++   if (strcmp(instance->knl->name, "darwin") == 0 &&
++       dev->physical_device->has_cached_coherent_memory) {
++      mem_property |= VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT |
++                      VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
++                      VK_MEMORY_PROPERTY_HOST_CACHED_BIT;
++   }
+ 
+    const VkMemoryPropertyFlags replace_flags_mask =
+       VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT |
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -1520,7 +1520,11 @@
+          return result;
+       }
+ 
+-      NativeAdrenoAbiBoAlloc alloc = {.bytes = size, .align_log2 = 12, .contiguous = 0};
++      NativeAdrenoAbiBoAlloc alloc = {
++         .bytes = size,
++         .align_log2 = 12,
++         .allocation_flags = 0,
++      };
+       NativeAdrenoAbiBoAllocReply reply = {};
+       kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+       if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
+@@ -1797,10 +1801,12 @@
+ 
+    mach_vm_address_t address = (mach_vm_address_t)(uintptr_t)placed_addr;
+    mach_vm_size_t length = 0;
+-   /* IOUserClient::mapClientMemory64 takes the cache mode from THESE flags, not from the descriptor the driver returns, so a plain
+-    * kIOMapAnywhere would give a cached mapping of memory the GPU reads non-cacheable. Write combine is Normal non-cacheable: the
+-    * GPU sees CPU writes after a barrier, and memcpy/unaligned stores stay legal (device-memory mappings fault on those). */
+-   uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | kIOMapWriteCombineCache;
++   /* The userspace mapping must have the same CPU cache mode as the allocation
++    * retained by the kernel and any mapping retained for BO reuse. */
++   const uint32_t cache_mode =
++      (bo->darwin_mem_property & VK_MEMORY_PROPERTY_HOST_CACHED_BIT) ?
++      kIOMapCopybackCache : kIOMapWriteCombineCache;
++   uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | cache_mode;
+    kr = IOConnectMapMemory64(dw.conn, reply.token, mach_task_self(), &address, &length, options);
+    if (kr != KERN_SUCCESS || !address || length < bo->size) {
+       bo->map = kr == KERN_SUCCESS ? (void *)(uintptr_t)address : NULL;
+@@ -1970,7 +1976,7 @@
+ }
+ 
+ VKAPI_ATTR VkBool32 VKAPI_CALL
+-tu_NativeAdrenoDeviceCacheMaintenance(VkDevice _device)
++tu_NativeAdrenoDeviceHostCoherent(VkDevice _device)
+ {
+    VK_FROM_HANDLE(tu_device, device, _device);
+    if (!device->darwin_retire)
+@@ -1978,7 +1984,8 @@
+ 
+    const NativeAdrenoAbiSubmitCaps caps = darwin_submit_caps(device);
+    return caps.version == NativeAdrenoSubmitVersion &&
+-          (caps.flags & NativeAdrenoSubmitKernelCacheMaintenance) != 0;
++          (caps.flags & (NativeAdrenoSubmitHardwareCoherent |
++                         NativeAdrenoSubmitKernelCacheMaintenance)) != 0;
+ }
+ 
+ VkResult
+@@ -2616,8 +2623,10 @@
+ darwin_GetDeviceProcAddr(VkDevice _device, const char *name)
+ {
+    VK_FROM_HANDLE(tu_device, device, _device);
+-   if (!strcmp(name, "vkNativeAdrenoDeviceCacheMaintenance"))
+-      return (PFN_vkVoidFunction)tu_NativeAdrenoDeviceCacheMaintenance;
++   if (!strcmp(name, "vkNativeAdrenoDeviceHostCoherent") ||
++       !strcmp(name, "vkNativeAdrenoDeviceCacheMaintenance")) {
++      return (PFN_vkVoidFunction)tu_NativeAdrenoDeviceHostCoherent;
++   }
+ 
+    return vk_device_get_proc_addr(&device->vk, name);
+ }
