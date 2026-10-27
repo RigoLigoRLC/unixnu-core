@@ -1,0 +1,2943 @@
+diff --git a/src/freedreno/vulkan/tu_autotune.cc b/src/freedreno/vulkan/tu_autotune.cc
+index d748039..2f2293e 100644
+--- a/src/freedreno/vulkan/tu_autotune.cc
++++ b/src/freedreno/vulkan/tu_autotune.cc
+@@ -394,6 +394,10 @@ tu_autotune::submission_entry::try_get_cs(uint32_t new_fence)
+    tu_cs_begin(&fence_cs);
+    TU_CALLX(device, write_fence_cs)(device, &fence_cs, new_fence);
+    tu_cs_end(&fence_cs);
++   if (tu_cs_get_record_result(&fence_cs) != VK_SUCCESS) {
++      return &fence_cs;
++   }
++
+    assert(fence_cs.entry_count == 1); /* We expect the initial allocation to be large enough. */
+    fence = new_fence;
+ 
+@@ -1606,6 +1610,10 @@ tu_autotune::on_submit(struct tu_cmd_buffer **cmd_buffers, uint32_t cmd_buffer_c
+    /* Generate a new fence and the CS for it. */
+    const uint32_t new_fence = next_fence++;
+    auto fence_cs = get_cs_for_fence(new_fence);
++   if (tu_cs_get_record_result(fence_cs) != VK_SUCCESS) {
++      return fence_cs;
++   }
++
+    for (uint32_t i = 0; i < cmd_buffer_count; i++) {
+       /* Transfer the entries from the command buffers to the active queue. */
+       struct tu_cmd_buffer *cmdbuf = cmd_buffers[i];
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 1d33085..75e6c5d 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -2734,6 +2734,9 @@ tu_CmdBlitImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, src_image, pBlitImageInfo->srcImage);
+    VK_FROM_HANDLE(tu_image, dst_image, pBlitImageInfo->dstImage);
+ 
++   tu_cmd_use_image(cmd, src_image, TU_RESOURCE_READ);
++   tu_cmd_use_image(cmd, dst_image, TU_RESOURCE_WRITE);
++
+    for (uint32_t i = 0; i < pBlitImageInfo->regionCount; ++i) {
+       /* can't blit both depth and stencil at once with D32_S8
+        * TODO: more advanced 3D blit path to support it instead?
+@@ -2906,6 +2909,9 @@ tu_CmdCopyBufferToImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, dst_image, pCopyBufferToImageInfo->dstImage);
+    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferToImageInfo->srcBuffer);
+ 
++   tu_cmd_use_buffer(cmd, src_buffer, TU_RESOURCE_READ);
++   tu_cmd_use_image(cmd, dst_image, TU_RESOURCE_WRITE);
++
+    trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format);
+ 
+    for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
+@@ -3113,6 +3119,9 @@ tu_CmdCopyImageToBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, src_image, pCopyImageToBufferInfo->srcImage);
+    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyImageToBufferInfo->dstBuffer);
+ 
++   tu_cmd_use_image(cmd, src_image, TU_RESOURCE_READ);
++   tu_cmd_use_buffer(cmd, dst_buffer, TU_RESOURCE_WRITE);
++
+    trace_start_copy_image_to_buffer(&cmd->trace, &cmd->cs, cmd, src_image->vk.format);
+ 
+    bool unaligned_store = false;
+@@ -3476,6 +3485,9 @@ tu_CmdCopyImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_image, src_image, pCopyImageInfo->srcImage);
+    VK_FROM_HANDLE(tu_image, dst_image, pCopyImageInfo->dstImage);
+ 
++   tu_cmd_use_image(cmd, src_image, TU_RESOURCE_READ);
++   tu_cmd_use_image(cmd, dst_image, TU_RESOURCE_WRITE);
++
+    trace_start_copy_image(&cmd->trace, &cmd->cs, cmd, src_image->vk.format,
+                           dst_image->vk.format);
+ 
+@@ -3749,6 +3761,9 @@ tu_CmdCopyBuffer2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, src_buffer, pCopyBufferInfo->srcBuffer);
+    VK_FROM_HANDLE(tu_buffer, dst_buffer, pCopyBufferInfo->dstBuffer);
+ 
++   tu_cmd_use_buffer(cmd, src_buffer, TU_RESOURCE_READ);
++   tu_cmd_use_buffer(cmd, dst_buffer, TU_RESOURCE_WRITE);
++
+    trace_start_copy_buffer(&cmd->trace, &cmd->cs, cmd);
+ 
+    /* Choose the largest common block size for all copy regions
+@@ -3799,6 +3814,8 @@ tu_CmdUpdateBuffer(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+ 
++   tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_WRITE);
++
+    struct tu_cs_memory tmp;
+    VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dataSize, 64), 64 / 4, &tmp);
+    if (result != VK_SUCCESS) {
+@@ -3894,6 +3911,8 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+ 
++   tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_WRITE);
++
+    fillSize = vk_buffer_range(&buffer->vk, dstOffset, fillSize);
+ 
+    VkDeviceAddress dst_va = vk_buffer_address(&buffer->vk, dstOffset);
+@@ -3910,6 +3929,9 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_image, src_image, pResolveImageInfo->srcImage);
+    VK_FROM_HANDLE(tu_image, dst_image, pResolveImageInfo->dstImage);
++
++   tu_cmd_use_image(cmd, src_image, TU_RESOURCE_READ);
++   tu_cmd_use_image(cmd, dst_image, TU_RESOURCE_WRITE);
+    const struct blit_ops *ops = &r2d_ops<CHIP>;
+    struct tu_cs *cs = &cmd->cs;
+ 
+@@ -4306,6 +4328,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_image, image, image_h);
+ 
++   tu_cmd_use_image(cmd, image, TU_RESOURCE_WRITE);
++
+    trace_start_clear_color_image(&cmd->trace, &cmd->cs, cmd, image->vk.format);
+ 
+    bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
+@@ -4348,6 +4372,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_image, image, image_h);
+ 
++   tu_cmd_use_image(cmd, image, TU_RESOURCE_WRITE);
++
+    trace_start_clear_depth_stencil_image(&cmd->trace, &cmd->cs, cmd,
+                                          image->vk.format);
+ 
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index bcb7724..54e8554 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -33,6 +33,99 @@ enum tu_cmd_buffer_status {
+    TU_CMD_BUFFER_STATUS_ACTIVE = 1,
+ };
+ 
++void
++tu_cmd_use_range(struct tu_cmd_buffer *cmd, struct tu_resource_range range)
++{
++#ifdef TU_HAS_DARWIN
++   if (!range.iova || !range.size)
++      return;
++
++   struct tu_resource_range *record = (struct tu_resource_range *)
++      util_dynarray_grow(&cmd->resource_ranges, struct tu_resource_range, 1);
++   if (!record) {
++      vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++      return;
++   }
++
++   *record = range;
++#endif
++}
++
++void
++tu_cmd_use_buffer(struct tu_cmd_buffer *cmd, const struct tu_buffer *buffer,
++                  uint32_t access)
++{
++   if (!buffer)
++      return;
++
++   if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT) {
++      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_SPARSE;
++      return;
++   }
++
++   tu_cmd_use_range(cmd, {buffer->vk.device_address, buffer->vk.size, access});
++}
++
++void
++tu_cmd_use_image(struct tu_cmd_buffer *cmd, const struct tu_image *image,
++                 uint32_t access)
++{
++   if (!image)
++      return;
++
++   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
++      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_SPARSE;
++      return;
++   }
++
++   tu_cmd_use_range(cmd, {image->iova, image->total_size, access});
++}
++
++VkResult
++tu_cmd_record_result(struct tu_cmd_buffer *cmd)
++{
++   struct tu_cs *streams[] = {
++      &cmd->cs, &cmd->draw_cs, &cmd->tile_store_cs,
++      &cmd->draw_epilogue_cs, &cmd->sub_cs,
++      &cmd->pre_chain.draw_cs, &cmd->pre_chain.draw_epilogue_cs,
++   };
++   for (struct tu_cs *cs : streams) {
++      VkResult result = tu_cs_get_record_result(cs);
++      if (result != VK_SUCCESS)
++         vk_command_buffer_set_error(&cmd->vk, result);
++   }
++
++   return vk_command_buffer_get_record_result(&cmd->vk);
++}
++
++static void
++tu_cmd_use_descriptor_set(struct tu_cmd_buffer *cmd, struct tu_descriptor_set *set)
++{
++#ifdef TU_HAS_DARWIN
++   tu_cmd_use_range(cmd, {set->va, set->size, TU_RESOURCE_READ});
++   if (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR) {
++      for (uint32_t i = 0; i < set->resource_count; i++) {
++         tu_cmd_use_range(cmd, set->resources[i]);
++      }
++      if (set->resource_addresses_unknown) {
++         cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
++      }
++   } else {
++      struct tu_descriptor_set **record = (struct tu_descriptor_set **)
++         util_dynarray_grow(&cmd->resource_descriptor_sets, struct tu_descriptor_set *, 1);
++      if (!record) {
++         vk_command_buffer_set_error(&cmd->vk, VK_ERROR_OUT_OF_HOST_MEMORY);
++         return;
++      }
++
++      *record = set;
++   }
++
++   if (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT)
++      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND;
++#endif
++}
++
+ static struct tu_bo *
+ tu_cmd_buffer_setup_status_tracking(struct tu_device *device)
+ {
+@@ -267,6 +360,11 @@ static void
+ tu_emit_vis_stream_patchpoint(struct tu_cmd_buffer *cmd, struct tu_cs *cs,
+                               uint32_t offset)
+ {
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++      return;
++   }
++
+    struct tu_vis_stream_patchpoint patchpoint = {
+       .render_pass_idx = cmd->state.tile_render_pass_count,
+       .data = cs->cur,
+@@ -457,6 +555,11 @@ tu7_set_thread_br_patchpoint(struct tu_cmd_buffer *cmd,
+ {
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+ 
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++      return;
++   }
++
+    if (!force_disable_cb) {
+       struct tu_cb_control_point info = {
+          .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
+@@ -478,6 +581,11 @@ tu7_set_thread_both_patchpoint(struct tu_cmd_buffer *cmd,
+ {
+    tu_cs_emit_pkt7(cs, CP_THREAD_CONTROL, 1);
+ 
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++      return;
++   }
++
+    struct tu_cb_control_point info = {
+       .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
+       .patchpoint = cs->cur,
+@@ -555,6 +663,11 @@ tu_emit_cache_flush(struct tu_cmd_buffer *cmd_buffer)
+ 
+       tu_cs_patchable_end(cs, false, &cb_state);
+ 
++      if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd_buffer->vk, tu_cs_get_record_result(cs));
++         return;
++      }
++
+       tu_add_cb_barrier_info(cmd_buffer);
+ 
+       struct tu_cb_control_point cb_patch = {
+@@ -2504,6 +2617,11 @@ tu_init_hw(struct tu_cmd_buffer *cmd, struct tu_cs *cs)
+       tu_cs_emit_pkt7(cs, CP_BV_BR_COUNT_OPS, 2);
+       tu_cs_emit(cs, CP_BV_BR_COUNT_OPS_0_OP(PIPE_SET_BR_OFFSET));
+ 
++      if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++         return;
++      }
++
+       struct tu_vis_stream_patchpoint *patchpoint =
+          &cmd->vis_stream_count_patchpoint;
+       patchpoint->data = cs->cur;
+@@ -3236,6 +3354,11 @@ tu7_emit_concurrent_binning_sysmem(struct tu_cmd_buffer *cmd,
+    }
+    tu_cs_patchable_end(cs, true, &no_cb_state);
+ 
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++      vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++      return;
++   }
++
+    struct tu_cb_control_point enable_cb_patch = {
+       .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
+       .patchpoint = cb_state.nop_header,
+@@ -4177,6 +4300,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+    struct tu_cmd_buffer *cmd_buffer =
+       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+ 
++   util_dynarray_fini(&cmd_buffer->resource_ranges);
++   util_dynarray_fini(&cmd_buffer->resource_descriptor_sets);
++
+    tu_cs_finish(&cmd_buffer->cs);
+    tu_cs_finish(&cmd_buffer->draw_cs);
+    tu_cs_finish(&cmd_buffer->tile_store_cs);
+@@ -4203,6 +4329,8 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
+                                         &cmd_buffer->descriptors[i].push_set.layout->vk);
+       vk_free(&cmd_buffer->device->vk.alloc,
+               cmd_buffer->descriptors[i].push_set.mapped_ptr);
++      vk_free(&cmd_buffer->device->vk.alloc,
++              cmd_buffer->descriptors[i].push_set.resources);
+    }
+ 
+    util_dynarray_foreach (&cmd_buffer->msrtss_color_temporaries,
+@@ -4253,6 +4381,10 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+    struct tu_cmd_buffer *cmd_buffer =
+       container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
+ 
++   util_dynarray_clear(&cmd_buffer->resource_ranges);
++   util_dynarray_clear(&cmd_buffer->resource_descriptor_sets);
++   cmd_buffer->resource_fallback_reasons = 0;
++
+    VkResult status_check_result = VK_SUCCESS;
+    if (TU_DEBUG_START(CHECK_CMD_BUFFER_STATUS))
+       status_check_result = tu_cmd_buffer_status_check_idle(cmd_buffer);
+@@ -4281,6 +4413,7 @@ tu_reset_cmd_buffer(struct vk_command_buffer *vk_cmd_buffer,
+                                         &cmd_buffer->descriptors[i].push_set.layout->vk);
+       }
+       vk_free(&cmd_buffer->device->vk.alloc, cmd_buffer->descriptors[i].push_set.mapped_ptr);
++      vk_free(&cmd_buffer->device->vk.alloc, cmd_buffer->descriptors[i].push_set.resources);
+       memset(&cmd_buffer->descriptors[i].push_set, 0, sizeof(cmd_buffer->descriptors[i].push_set));
+       cmd_buffer->descriptors[i].push_set.base.type = VK_OBJECT_TYPE_DESCRIPTOR_SET;
+       cmd_buffer->descriptors[i].max_sets_bound = 0;
+@@ -4576,6 +4709,7 @@ tu_CmdBindVertexBuffers2(VkCommandBuffer commandBuffer,
+          cmd->state.vb[firstBinding + i].size = 0;
+       } else {
+          struct tu_buffer *buf = tu_buffer_from_handle(pBuffers[i]);
++         tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
+          cmd->state.vb[firstBinding + i].base = vk_buffer_address(&buf->vk, pOffsets[i]);
+          cmd->state.vb[firstBinding + i].size =
+             vk_buffer_range(&buf->vk, pOffsets[i], pSizes ? pSizes[i] : VK_WHOLE_SIZE);
+@@ -4602,6 +4736,8 @@ tu_CmdBindIndexBuffer2KHR(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_buffer, buf, buffer);
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++
+    size = buf ? vk_buffer_range(&buf->vk, offset, size) : 0;
+ 
+    uint32_t index_size, index_shift;
+@@ -4770,6 +4906,8 @@ tu_bind_descriptor_sets(struct tu_cmd_buffer *cmd,
+       if (!set)
+          continue;
+ 
++      tu_cmd_use_descriptor_set(cmd, set);
++
+       if (set->layout->has_inline_uniforms)
+          cmd->state.dirty |= TU_CMD_DIRTY_SHADER_CONSTS;
+ 
+@@ -4913,6 +5051,8 @@ tu_CmdBindDescriptorBuffersEXT(
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+ 
++   cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DESCRIPTOR_BUFFER;
++
+    for (unsigned i = 0; i < bufferCount; i++)
+       cmd->state.descriptor_buffer_iova[i] = pBindingInfos[i].address;
+ }
+@@ -5027,6 +5167,19 @@ tu_push_descriptor_set_update_layout(struct tu_device *device,
+    vk_descriptor_set_layout_ref(&layout->vk);
+    set->layout = layout;
+ 
++   if (set->resource_count < layout->resource_count) {
++      void *resources = vk_realloc(&device->vk.alloc, set->resources,
++                                    layout->resource_count * sizeof(*set->resources),
++                                    8, VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!resources)
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++      set->resources = (struct tu_resource_range *)resources;
++      set->resource_count = layout->resource_count;
++   }
++   memset(set->resources, 0, set->resource_count * sizeof(*set->resources));
++   set->resource_addresses_unknown = false;
++
+    if (set->host_size < layout->size) {
+       void *new_buf =
+          vk_realloc(&device->vk.alloc, set->mapped_ptr, layout->size, 8,
+@@ -5170,6 +5323,7 @@ tu_CmdBindTransformFeedbackBuffersEXT(VkCommandBuffer commandBuffer,
+ 
+    for (uint32_t i = 0; i < bindingCount; i++) {
+       VK_FROM_HANDLE(tu_buffer, buf, pBuffers[i]);
++      tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_WRITE);
+       uint64_t iova = vk_buffer_address(&buf->vk, pOffsets[i]);
+       uint32_t size = vk_buffer_range(&buf->vk, pOffsets[i],
+                                       pSizes ? pSizes[i] : VK_WHOLE_SIZE);
+@@ -5220,6 +5374,8 @@ tu_CmdBeginTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+ 
+       VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
+ 
++      tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++
+       tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
+       tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(VPC_SO_BUFFER_OFFSET(CHIP, idx).reg) |
+                      CP_MEM_TO_REG_0_UNK31 |
+@@ -5273,6 +5429,8 @@ tu_CmdEndTransformFeedbackEXT(VkCommandBuffer commandBuffer,
+ 
+       VK_FROM_HANDLE(tu_buffer, buf, pCounterBuffers[i]);
+ 
++      tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_WRITE);
++
+       /* VPC_SO_FLUSH_BASE has dwords counter, but counter should be in bytes */
+       tu_cs_emit_pkt7(cs, CP_MEM_TO_REG, 3);
+       tu_cs_emit(cs, CP_MEM_TO_REG_0_REG(tu_scratch_reg<CHIP>(0).reg) |
+@@ -5328,7 +5486,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd_buffer, commandBuffer);
+ 
+-   if (vk_command_buffer_has_error(&cmd_buffer->vk)) {
++   if (tu_cmd_record_result(cmd_buffer) != VK_SUCCESS) {
+       return vk_command_buffer_end(&cmd_buffer->vk);
+    }
+ 
+@@ -5378,6 +5536,7 @@ tu_EndCommandBuffer(VkCommandBuffer commandBuffer)
+    tu_cs_end(&cmd_buffer->draw_cs);
+    tu_cs_end(&cmd_buffer->draw_epilogue_cs);
+ 
++   tu_cmd_record_result(cmd_buffer);
+    return vk_command_buffer_end(&cmd_buffer->vk);
+ }
+ TU_GENX(tu_EndCommandBuffer);
+@@ -6322,6 +6481,19 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+    for (uint32_t i = 0; i < commandBufferCount; i++) {
+       VK_FROM_HANDLE(tu_cmd_buffer, secondary, pCmdBuffers[i]);
+ 
++      result = tu_cmd_record_result(secondary);
++      if (result != VK_SUCCESS) {
++         vk_command_buffer_set_error(&cmd->vk, result);
++         return;
++      }
++      util_dynarray_foreach (&secondary->resource_ranges, struct tu_resource_range, range) {
++         tu_cmd_use_range(cmd, *range);
++      }
++      util_dynarray_foreach (&secondary->resource_descriptor_sets, struct tu_descriptor_set *, set) {
++         tu_cmd_use_descriptor_set(cmd, *set);
++      }
++      cmd->resource_fallback_reasons |= secondary->resource_fallback_reasons;
++
+       if (secondary->usage_flags &
+           VK_COMMAND_BUFFER_USAGE_RENDER_PASS_CONTINUE_BIT) {
+          assert(tu_cs_is_empty(&secondary->cs));
+@@ -6389,6 +6561,10 @@ tu_CmdExecuteCommands(VkCommandBuffer commandBuffer,
+                tu_cs_reserve_space(cs, 5);
+                tu_cs_emit_pkt7(cs, CP_MEM_WRITE, 4);
+                tu_cs_emit_qw(cs, patchpoint.iova);
++               if (tu_cs_get_record_result(cs) != VK_SUCCESS) {
++                  vk_command_buffer_set_error(&cmd->vk, tu_cs_get_record_result(cs));
++                  return;
++               }
+                patchpoint.iova = tu_cs_get_cur_iova(cs);
+                patchpoint.data = cs->cur;
+                tu_cs_emit_qw(cs, 0);
+@@ -7024,6 +7200,13 @@ tu_CmdBeginRenderPass2(VkCommandBuffer commandBuffer,
+ 
+    tu_choose_gmem_layout(cmd);
+ 
++   for (uint32_t i = 0; i < pass->attachment_count; i++) {
++      const struct tu_image_view *view = cmd->state.attachments[i];
++      if (view) {
++         tu_cmd_use_image(cmd, view->image, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++      }
++   }
++
+    /* Note: because this is external, any flushes will happen before draw_cs
+     * gets called. However deferred flushes could have to happen later as part
+     * of the subpass.
+@@ -7185,6 +7368,13 @@ tu_CmdBeginRendering(VkCommandBuffer commandBuffer,
+       return;
+    }
+ 
++   for (uint32_t i = 0; i < cmd->dynamic_pass.attachment_count; i++) {
++      const struct tu_image_view *view = cmd->state.attachments[i];
++      if (view) {
++         tu_cmd_use_image(cmd, view->image, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++      }
++   }
++
+    tu_choose_gmem_layout(cmd);
+ 
+    cmd->state.renderpass_cache.pending_flush_bits =
+@@ -8337,6 +8527,13 @@ tu6_draw_common(struct tu_cmd_buffer *cmd,
+                 /* note: draw_count is 0 for indirect */
+                 uint32_t draw_count)
+ {
++   for (unsigned stage = MESA_SHADER_VERTEX; stage <= MESA_SHADER_FRAGMENT; stage++) {
++      const struct tu_shader *shader = cmd->state.shaders[stage];
++      if (shader && shader->uses_buffer_device_address) {
++         cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
++      }
++   }
++
+    const struct tu_program_state *program = &cmd->state.program;
+    struct tu_render_pass_state *rp = &cmd->state.rp;
+ 
+@@ -8971,6 +9168,8 @@ tu_CmdDrawIndirect(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, buf, _buffer);
+    struct tu_cs *cs = &cmd->draw_cs;
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++
+    tu6_emit_empty_vs_params<CHIP>(cmd);
+ 
+    if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
+@@ -9002,6 +9201,8 @@ tu_CmdDrawIndexedIndirect(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, buf, _buffer);
+    struct tu_cs *cs = &cmd->draw_cs;
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++
+    tu6_emit_empty_vs_params<CHIP>(cmd);
+ 
+    if (cmd->device->physical_device->info->props.indirect_draw_wfm_quirk)
+@@ -9038,6 +9239,9 @@ tu_CmdDrawIndirectCount(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
+    struct tu_cs *cs = &cmd->draw_cs;
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++   tu_cmd_use_buffer(cmd, count_buf, TU_RESOURCE_READ);
++
+    tu6_emit_empty_vs_params<CHIP>(cmd);
+ 
+    /* It turns out that the firmware we have for a650 only partially fixed the
+@@ -9077,6 +9281,9 @@ tu_CmdDrawIndexedIndirectCount(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, count_buf, countBuffer);
+    struct tu_cs *cs = &cmd->draw_cs;
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++   tu_cmd_use_buffer(cmd, count_buf, TU_RESOURCE_READ);
++
+    tu6_emit_empty_vs_params<CHIP>(cmd);
+ 
+    draw_wfm(cmd);
+@@ -9112,6 +9319,8 @@ tu_CmdDrawIndirectByteCountEXT(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, buf, _counterBuffer);
+    struct tu_cs *cs = &cmd->draw_cs;
+ 
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
++
+    /* All known firmware versions do not wait for WFI's with CP_DRAW_AUTO.
+     * Plus, for the common case where the counter buffer is written by
+     * vkCmdEndTransformFeedback, we need to wait for the CP_WAIT_MEM_WRITES to
+@@ -9382,6 +9591,10 @@ tu_dispatch(struct tu_cmd_buffer *cmd,
+    struct tu_cs *cs = &cmd->cs;
+    struct tu_shader *shader = cmd->state.shaders[MESA_SHADER_COMPUTE];
+ 
++   if (shader->uses_buffer_device_address) {
++      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
++   }
++
+    bool emit_instrlen_workaround =
+       shader->variant->instrlen >
+       cmd->device->physical_device->info->props.instr_cache_size;
+@@ -9693,6 +9906,8 @@ tu_CmdDispatchIndirect(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_buffer, buffer, _buffer);
+    struct tu_dispatch_info info = {};
+ 
++   tu_cmd_use_buffer(cmd_buffer, buffer, TU_RESOURCE_READ);
++
+    info.indirect = vk_buffer_address(&buffer->vk, offset);
+ 
+    tu_dispatch<CHIP>(cmd_buffer, &info);
+@@ -9723,6 +9938,8 @@ tu_dispatch_unaligned_indirect(VkCommandBuffer commandBuffer,
+    info.unaligned = true;
+    info.indirect = size_addr;
+ 
++   tu_cmd_use_range(cmd_buffer, {size_addr, 3 * sizeof(uint32_t), TU_RESOURCE_READ});
++
+    TU_CALLX(cmd_buffer->device, tu_dispatch)(cmd_buffer, &info);
+ }
+ 
+@@ -9896,6 +10113,7 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+          const VkBufferMemoryBarrier2 *barrier =
+             &dep_info->pBufferMemoryBarriers[i];
+          VK_FROM_HANDLE(tu_buffer, buffer, barrier->buffer);
++         tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
+          bool sparse_aliasing =
+             buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
+          VkPipelineStageFlags2 sanitized_src_stage =
+@@ -9926,6 +10144,8 @@ tu_barrier(struct tu_cmd_buffer *cmd,
+             &dep_info->pImageMemoryBarriers[i];
+          VK_FROM_HANDLE(tu_image, image, barrier->image);
+ 
++         tu_cmd_use_image(cmd, image, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++
+          VkImageLayout old_layout = barrier->oldLayout;
+ 
+          bool sparse_aliasing =
+@@ -10113,6 +10333,7 @@ tu_CmdBeginConditionalRenderingEXT(VkCommandBuffer commandBuffer,
+       tu_emit_cache_flush<CHIP>(cmd);
+ 
+    VK_FROM_HANDLE(tu_buffer, buf, pConditionalRenderingBegin->buffer);
++   tu_cmd_use_buffer(cmd, buf, TU_RESOURCE_READ);
+    uint64_t iova = vk_buffer_address(&buf->vk, pConditionalRenderingBegin->offset);
+ 
+    /* qcom doesn't support 32-bit reference values, only 64-bit, but Vulkan
+@@ -10219,6 +10440,8 @@ tu_CmdWriteBufferMarker2AMD(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+ 
++   tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_WRITE);
++
+    uint64_t va = vk_buffer_address(&buffer->vk, dstOffset);
+ 
+    struct tu_cs *cs = cmd->state.pass ? &cmd->draw_cs : &cmd->cs;
+@@ -10295,6 +10518,8 @@ tu_write_buffer_cp(VkCommandBuffer commandBuffer,
+ {
+    VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
+ 
++   tu_cmd_use_range(cmd, {addr, size, TU_RESOURCE_WRITE});
++
+    TU_CALLX(cmd->device, tu_emit_cache_flush)(cmd);
+ 
+    struct tu_cs *cs = &cmd->cs;
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+index 17bebeb..55f0594 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -661,6 +661,10 @@ struct tu_cmd_buffer
+ 
+    struct tu_device *device;
+ 
++   struct util_dynarray resource_ranges;
++   struct util_dynarray resource_descriptor_sets;
++   uint32_t resource_fallback_reasons;
++
+    struct u_trace_iterator trace_renderpass_start;
+    struct u_trace trace, rp_trace;
+ 
+@@ -756,6 +760,20 @@ VK_DEFINE_HANDLE_CASTS(tu_cmd_buffer, vk.base, VkCommandBuffer,
+ 
+ extern const struct vk_command_buffer_ops tu_cmd_buffer_ops;
+ 
++enum tu_resource_fallback {
++   TU_RESOURCE_FALLBACK_DEVICE_ADDRESS = 1,
++   TU_RESOURCE_FALLBACK_DESCRIPTOR_BUFFER = 2,
++   TU_RESOURCE_FALLBACK_SPARSE = 4,
++   TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND = 8,
++};
++
++void tu_cmd_use_range(struct tu_cmd_buffer *cmd, struct tu_resource_range range);
++void tu_cmd_use_buffer(struct tu_cmd_buffer *cmd, const struct tu_buffer *buffer,
++                       uint32_t access);
++void tu_cmd_use_image(struct tu_cmd_buffer *cmd, const struct tu_image *image,
++                      uint32_t access);
++VkResult tu_cmd_record_result(struct tu_cmd_buffer *cmd);
++
+ static inline uint32_t
+ tu_attachment_gmem_offset(struct tu_cmd_buffer *cmd,
+                           const struct tu_render_pass_attachment *att,
+diff --git a/src/freedreno/vulkan/tu_cs.cc b/src/freedreno/vulkan/tu_cs.cc
+index 47e1939..65fa5b1 100644
+--- a/src/freedreno/vulkan/tu_cs.cc
++++ b/src/freedreno/vulkan/tu_cs.cc
+@@ -128,6 +128,10 @@ tu_cs_get_offset(const struct tu_cs *cs)
+ uint64_t
+ tu_cs_get_cur_iova(const struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return 0;
++   }
++
+    if (cs->mode == TU_CS_MODE_EXTERNAL)
+       return cs->external_iova + ((char *) cs->cur - (char *) cs->start);
+    return tu_cs_current_bo(cs)->iova + ((char *) cs->cur - (char *) tu_cs_current_bo(cs)->map);
+@@ -155,8 +159,9 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+       uint32_t new_capacity = MAX2(4, 2 * bos->bo_capacity);
+       struct tu_bo **new_bos = (struct tu_bo **)
+          realloc(bos->bos, new_capacity * sizeof(struct tu_bo *));
+-      if (!new_bos)
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      if (!new_bos) {
++         return tu_cs_set_error(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
+ 
+       bos->bo_capacity = new_capacity;
+       bos->bos = new_bos;
+@@ -168,16 +173,17 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+       tu_bo_init_new(cs->device, NULL, &new_bo, size * sizeof(uint32_t),
+                      (enum tu_bo_alloc_flags)(COND(!cs->writeable,
+                                                    TU_BO_ALLOC_GPU_READ_ONLY) |
+-                                              TU_BO_ALLOC_ALLOW_DUMP),
++                                              TU_BO_ALLOC_ALLOW_DUMP |
++                                              TU_BO_ALLOC_INTERNAL_RESOURCE),
+                      cs->name);
+    if (result != VK_SUCCESS) {
+-      return result;
++      return tu_cs_set_error(cs, result);
+    }
+ 
+    result = tu_bo_map(cs->device, new_bo, NULL);
+    if (result != VK_SUCCESS) {
+       tu_bo_finish(cs->device, new_bo);
+-      return result;
++      return tu_cs_set_error(cs, result);
+    }
+ 
+    TU_RMV(cmd_buffer_bo_create, cs->device, new_bo);
+@@ -196,6 +202,10 @@ tu_cs_add_bo(struct tu_cs *cs, uint32_t size)
+ static VkResult
+ tu_cs_reserve_entry(struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return cs->record_result;
++   }
++
+    /* entries are only for TU_CS_MODE_GROW */
+    assert(cs->mode == TU_CS_MODE_GROW);
+ 
+@@ -204,8 +214,9 @@ tu_cs_reserve_entry(struct tu_cs *cs)
+       uint32_t new_capacity = MAX2(4, cs->entry_capacity * 2);
+       struct tu_cs_entry *new_entries = (struct tu_cs_entry *)
+          realloc(cs->entries, new_capacity * sizeof(struct tu_cs_entry));
+-      if (!new_entries)
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      if (!new_entries) {
++         return tu_cs_set_error(cs, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
+ 
+       cs->entry_capacity = new_capacity;
+       cs->entries = new_entries;
+@@ -222,6 +233,13 @@ tu_cs_reserve_entry(struct tu_cs *cs)
+ static void
+ tu_cs_add_entry(struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++   if (tu_cs_reserve_entry(cs) != VK_SUCCESS) {
++      return;
++   }
++
+    /* entries are only for TU_CS_MODE_GROW */
+    assert(cs->mode == TU_CS_MODE_GROW);
+ 
+@@ -251,6 +269,10 @@ tu_cs_add_entry(struct tu_cs *cs)
+ VkResult
+ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
+ {
++   if (tu_cs_set_error(cs, target->record_result) != VK_SUCCESS) {
++      return cs->record_result;
++   }
++
+    VkResult result;
+ 
+    assert(cs->mode == TU_CS_MODE_GROW);
+@@ -276,6 +298,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target)
+ void
+ tu_cs_begin(struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(cs->mode != TU_CS_MODE_SUB_STREAM);
+    assert(tu_cs_is_empty(cs));
+ }
+@@ -287,6 +313,10 @@ tu_cs_begin(struct tu_cs *cs)
+ void
+ tu_cs_end(struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(cs->mode != TU_CS_MODE_SUB_STREAM);
+ 
+    if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+@@ -296,12 +326,20 @@ tu_cs_end(struct tu_cs *cs)
+ void
+ tu_cs_set_writeable(struct tu_cs *cs, bool writeable)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(cs->mode == TU_CS_MODE_GROW || cs->mode == TU_CS_MODE_SUB_STREAM);
+ 
+    if (cs->writeable != writeable) {
+       assert(!cs->cond_stack_depth);
+       if (cs->mode == TU_CS_MODE_GROW && !tu_cs_is_empty(cs))
+          tu_cs_add_entry(cs);
++      if (cs->record_result != VK_SUCCESS) {
++         return;
++      }
++
+       struct tu_bo_array *old_bos = cs->writeable ? &cs->read_write : &cs->read_only;
+       struct tu_bo_array *new_bos = writeable ? &cs->read_write : &cs->read_only;
+ 
+@@ -331,6 +369,13 @@ VkResult
+ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+                                uint32_t size, struct tu_cs *sub_cs)
+ {
++   tu_cs_init_external(sub_cs, cs->device, nullptr, nullptr, 0, cs->writeable);
++   sub_cs->parent = cs;
++   if (cs->record_result != VK_SUCCESS || !size || count > UINT32_MAX / size) {
++      return tu_cs_set_error(sub_cs, cs->record_result != VK_SUCCESS ?
++         cs->record_result : VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size);
+ 
+@@ -341,21 +386,27 @@ tu_cs_begin_sub_stream_aligned(struct tu_cs *cs, uint32_t count,
+        */
+       result = tu_cs_reserve_space(cs, count * size);
+    } else {
+-      result = tu_cs_reserve_space(cs, count * size + (size - tu_cs_get_offset(cs)) % size);
+-      cs->start += (size - tu_cs_get_offset(cs)) % size;
++      const uint32_t padding = (size - tu_cs_get_offset(cs)) % size;
++      if (padding > UINT32_MAX - count * size) {
++         return tu_cs_set_error(sub_cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      }
++      result = tu_cs_reserve_space(cs, count * size + padding);
++      if (result == VK_SUCCESS) {
++         cs->start += (size - tu_cs_get_offset(cs)) % size;
++      }
++   }
++   if (result != VK_SUCCESS) {
++      return tu_cs_set_error(sub_cs, result);
+    }
+-   if (result != VK_SUCCESS)
+-      return result;
+ 
+    cs->cur = cs->start;
+ 
+    tu_cs_init_external(sub_cs, cs->device, cs->cur, cs->reserved_end,
+                        tu_cs_get_cur_iova(cs), cs->writeable);
++   sub_cs->parent = cs;
+    tu_cs_begin(sub_cs);
+    result = tu_cs_reserve_space(sub_cs, count * size);
+-   assert(result == VK_SUCCESS);
+-
+-   return VK_SUCCESS;
++   return tu_cs_set_error(sub_cs, result);
+ }
+ 
+ /**
+@@ -369,6 +420,14 @@ tu_cs_alloc(struct tu_cs *cs,
+             uint32_t size,
+             struct tu_cs_memory *memory)
+ {
++   *memory = {};
++   if (cs->record_result != VK_SUCCESS) {
++      return cs->record_result;
++   }
++   if (!size || count > (UINT32_MAX - (size - 1)) / size) {
++      return tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(size && size <= 1024);
+ 
+@@ -385,8 +444,9 @@ tu_cs_alloc(struct tu_cs *cs,
+    /* TODO: smarter way to deal with alignment? */
+ 
+    VkResult result = tu_cs_reserve_space(cs, count * size + (size-1));
+-   if (result != VK_SUCCESS)
+-      return result;
++   if (result != VK_SUCCESS) {
++      return tu_cs_set_error(cs, result);
++   }
+ 
+    struct tu_bo *bo = tu_cs_current_bo(cs);
+    size_t offset = align(tu_cs_get_offset(cs), size);
+@@ -410,6 +470,10 @@ tu_cs_alloc(struct tu_cs *cs,
+ struct tu_cs_entry
+ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
++   if (tu_cs_set_error(cs, sub_cs->record_result) != VK_SUCCESS) {
++      return {};
++   }
++
+    assert(cs->mode == TU_CS_MODE_SUB_STREAM);
+    assert(sub_cs->start == cs->cur && sub_cs->end == cs->reserved_end);
+    tu_cs_sanity_check(sub_cs);
+@@ -436,10 +500,13 @@ tu_cs_end_sub_stream(struct tu_cs *cs, struct tu_cs *sub_cs)
+ VkResult
+ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return cs->record_result;
++   }
++
+    if (tu_cs_get_space(cs) < reserved_size) {
+-      if (cs->mode == TU_CS_MODE_EXTERNAL) {
+-         UNREACHABLE("cannot grow external buffer");
+-         return VK_ERROR_OUT_OF_HOST_MEMORY;
++      if (cs->mode == TU_CS_MODE_EXTERNAL || cs->refcount_bo) {
++         return tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+       }
+ 
+       /* add an entry for the exiting command packets */
+@@ -448,6 +515,9 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+          assert(cs->mode != TU_CS_MODE_SUB_STREAM);
+ 
+          tu_cs_add_entry(cs);
++         if (cs->record_result != VK_SUCCESS) {
++            return cs->record_result;
++         }
+       }
+ 
+       for (uint32_t i = 0; i < cs->cond_stack_depth; i++) {
+@@ -455,14 +525,18 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+          *cs->cond_dwords[i] = cs->cur - cs->cond_dwords[i] - 1;
+ 
+          /* space for CP_COND_REG_EXEC in next bo */
++         if (reserved_size > UINT32_MAX - 3) {
++            return tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         }
+          reserved_size += 3;
+       }
+ 
+       /* switch to a new BO */
+       uint32_t new_size = MAX2(cs->next_bo_size, reserved_size);
+       VkResult result = tu_cs_add_bo(cs, new_size);
+-      if (result != VK_SUCCESS)
+-         return result;
++      if (result != VK_SUCCESS) {
++         return tu_cs_set_error(cs, result);
++      }
+ 
+       if (cs->cond_stack_depth) {
+          cs->reserved_end = cs->cur + reserved_size;
+@@ -503,6 +577,10 @@ tu_cs_reserve_space(struct tu_cs *cs, uint32_t reserved_size)
+ void
+ tu_cs_reset(struct tu_cs *cs)
+ {
++   cs->record_result = VK_SUCCESS;
++   cs->cond_stack_depth = 0;
++   cs->pkt = nullptr;
++
+    if (cs->mode == TU_CS_MODE_EXTERNAL) {
+       assert(!cs->read_only.bo_count && !cs->read_write.bo_count &&
+              !cs->refcount_bo && !cs->entry_count);
+@@ -520,7 +598,7 @@ tu_cs_reset(struct tu_cs *cs)
+       tu_bo_finish(cs->device, cs->read_write.bos[i]);
+    }
+ 
+-   assert(!cs->writeable);
++   cs->writeable = false;
+ 
+    if (cs->read_only.bo_count) {
+       cs->read_only.bos[0] = cs->read_only.bos[cs->read_only.bo_count - 1];
+@@ -545,8 +623,16 @@ tu_cs_emit_data_nop(struct tu_cs *cs,
+                     uint32_t size,
+                     uint32_t align_dwords)
+ {
++   if (!align_dwords || size > UINT32_MAX - (align_dwords - 1)) {
++      tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return 0;
++   }
++
+    uint32_t total_size = size + (align_dwords - 1);
+    tu_cs_emit_pkt7(cs, CP_NOP, total_size);
++   if (cs->record_result != VK_SUCCESS) {
++      return 0;
++   }
+ 
+    uint64_t iova = tu_cs_get_cur_iova(cs);
+    uint64_t iova_aligned = align64(iova, align_dwords * sizeof(uint32_t));
+diff --git a/src/freedreno/vulkan/tu_cs.h b/src/freedreno/vulkan/tu_cs.h
+index 6a66de1..6dce578 100644
+--- a/src/freedreno/vulkan/tu_cs.h
++++ b/src/freedreno/vulkan/tu_cs.h
+@@ -92,6 +92,8 @@ struct tu_cs
+    const char *name;
+ 
+    struct tu_device *device;
++   VkResult record_result;
++   struct tu_cs *parent;
+    enum tu_cs_mode mode;
+    bool writeable;
+    uint32_t next_bo_size;
+@@ -120,6 +122,25 @@ struct tu_cs
+    tu_crb crb(uint32_t nregs);
+ };
+ 
++static inline VkResult
++tu_cs_get_record_result(const struct tu_cs *cs)
++{
++   return cs->record_result;
++}
++
++static inline VkResult
++tu_cs_set_error(struct tu_cs *cs, VkResult result)
++{
++   if (cs->record_result == VK_SUCCESS && result != VK_SUCCESS) {
++      cs->record_result = result;
++      if (cs->parent) {
++         tu_cs_set_error(cs->parent, result);
++      }
++   }
++
++   return cs->record_result;
++}
++
+ void
+ tu_breadcrumbs_init(struct tu_device *device);
+ 
+@@ -177,6 +198,10 @@ static inline struct tu_draw_state
+ tu_cs_end_draw_state(struct tu_cs *cs, struct tu_cs *sub_cs)
+ {
+    struct tu_cs_entry entry = tu_cs_end_sub_stream(cs, sub_cs);
++   if (cs->record_result != VK_SUCCESS) {
++      return {};
++   }
++
+    return (struct tu_draw_state) {
+       .iova = entry.bo->iova + entry.offset,
+       .size = entry.size / sizeof(uint32_t),
+@@ -195,10 +220,17 @@ tu_cs_draw_state(struct tu_cs *sub_cs, struct tu_cs *cs, uint32_t size)
+ {
+    struct tu_cs_memory memory;
+ 
+-   /* TODO: clean this up */
+-   tu_cs_alloc(sub_cs, size, 1, &memory);
++   VkResult result = tu_cs_alloc(sub_cs, size, 1, &memory);
++   if (result != VK_SUCCESS) {
++      tu_cs_init_external(cs, sub_cs->device, nullptr, nullptr, 0, sub_cs->writeable);
++      cs->parent = sub_cs;
++      tu_cs_set_error(cs, result);
++      return {};
++   }
++
+    tu_cs_init_external(cs, sub_cs->device, memory.map, memory.map + size,
+                        memory.iova, memory.writeable);
++   cs->parent = sub_cs;
+    tu_cs_begin(cs);
+    tu_cs_reserve_space(cs, size);
+ 
+@@ -222,6 +254,10 @@ tu_cs_add_entries(struct tu_cs *cs, struct tu_cs *target);
+ static inline uint32_t
+ tu_cs_get_size(const struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS || !cs->start) {
++      return 0;
++   }
++
+    return cs->cur - cs->start;
+ }
+ 
+@@ -263,6 +299,10 @@ tu_cs_get_call_size(const struct tu_cs *cs)
+ static inline void
+ tu_cs_sanity_check(const struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(cs->start <= cs->cur);
+    assert(cs->cur <= cs->reserved_end);
+    assert(cs->reserved_end <= cs->end);
+@@ -277,6 +317,14 @@ tu_cs_emit_sync_breadcrumb(struct tu_cs *cs, uint8_t opcode, uint16_t cnt);
+ static inline void
+ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++   if (!cs->cur || cs->cur >= cs->reserved_end) {
++      tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
++
+    assert(cs->cur < cs->reserved_end);
+    *cs->cur = value;
+    ++cs->cur;
+@@ -294,6 +342,15 @@ tu_cs_emit(struct tu_cs *cs, uint32_t value)
+ static inline void
+ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ {
++   if (cs->record_result != VK_SUCCESS || !length) {
++      return;
++   }
++   if (!cs->cur || cs->cur > cs->reserved_end ||
++       length > (size_t) (cs->reserved_end - cs->cur)) {
++      tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
++
+    assert(cs->cur + length <= cs->reserved_end);
+    memcpy(cs->cur, values, sizeof(uint32_t) * length);
+    cs->cur += length;
+@@ -305,27 +362,38 @@ tu_cs_emit_array(struct tu_cs *cs, const uint32_t *values, uint32_t length)
+ static inline uint32_t
+ tu_cs_get_space(const struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS || !cs->cur || cs->cur > cs->end) {
++      return 0;
++   }
++
+    return cs->end - cs->cur;
+ }
+ 
+-static inline void
++static inline bool
+ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return false;
++   }
++
+    if (cs->mode != TU_CS_MODE_GROW) {
++      if (tu_cs_get_space(cs) < reserved_size) {
++         tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++         return false;
++      }
++
+       assert(tu_cs_get_space(cs) >= reserved_size);
+       assert(cs->reserved_end == cs->end);
+-      return;
++      return true;
+    }
+ 
+    if (tu_cs_get_space(cs) >= reserved_size &&
+        cs->entry_count < cs->entry_capacity) {
+       cs->reserved_end = cs->cur + reserved_size;
+-      return;
++      return true;
+    }
+ 
+-   ASSERTED VkResult result = tu_cs_reserve_space(cs, reserved_size);
+-   /* TODO: set this error in tu_cs and use it */
+-   assert(result == VK_SUCCESS);
++   return tu_cs_set_error(cs, tu_cs_reserve_space(cs, reserved_size)) == VK_SUCCESS;
+ }
+ 
+ /**
+@@ -334,6 +402,10 @@ tu_cs_reserve(struct tu_cs *cs, uint32_t reserved_size)
+ static inline void
+ tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(!cs->pkt); /* No mixing with the packet builders.*/
+    tu_cs_reserve(cs, cnt + 1);
+    tu_cs_emit(cs, pm4_pkt4_hdr(regindx, cnt));
+@@ -345,6 +417,10 @@ tu_cs_emit_pkt4(struct tu_cs *cs, uint16_t regindx, uint16_t cnt)
+ static inline void
+ tu_cs_emit_pkt7(struct tu_cs *cs, uint8_t opcode, uint16_t cnt)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(!cs->pkt); /* No mixing with the packet builders.*/
+ #if TU_BREADCRUMBS_ENABLED
+    tu_cs_emit_sync_breadcrumb(cs, opcode, cnt + 1);
+@@ -380,6 +456,16 @@ tu_cs_emit_write_reg(struct tu_cs *cs, uint16_t reg, uint32_t value)
+ static inline void
+ tu_cs_emit_ib(struct tu_cs *cs, const struct tu_cs_entry *entry)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++   if (!entry->bo || !entry->size || entry->offset > entry->bo->size ||
++       entry->size > entry->bo->size - entry->offset ||
++       ((entry->offset | entry->size) & (sizeof(uint32_t) - 1))) {
++      tu_cs_set_error(cs, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      return;
++   }
++
+    assert(entry->bo);
+    assert(entry->size && entry->offset + entry->size <= entry->bo->size);
+    assert(entry->size % sizeof(uint32_t) == 0);
+@@ -408,6 +494,10 @@ tu_cs_emit_state_ib(struct tu_cs *cs, struct tu_draw_state state)
+ static inline void
+ tu_cs_emit_call(struct tu_cs *cs, const struct tu_cs *target)
+ {
++   if (tu_cs_set_error(cs, target->record_result) != VK_SUCCESS) {
++      return;
++   }
++
+    assert(target->mode == TU_CS_MODE_GROW);
+    for (uint32_t i = 0; i < target->entry_count; i++)
+       tu_cs_emit_ib(cs, target->entries + i);
+@@ -465,7 +555,10 @@ struct tu_cs_patchable_state {
+ static struct tu_cs_patchable_state
+ tu_cs_patchable_start(struct tu_cs *cs, uint32_t reserved_size)
+ {
+-   tu_cs_reserve(cs, reserved_size);
++   if (!tu_cs_reserve(cs, reserved_size)) {
++      return {};
++   }
++
+    uint32_t *nop_header = cs->cur;
+    tu_cs_emit_pkt7(cs, CP_NOP, 0);
+    return (struct tu_cs_patchable_state) {
+@@ -482,6 +575,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
+                     bool enabled_by_default,
+                     struct tu_cs_patchable_state *state)
+ {
++   if (cs->record_result != VK_SUCCESS || !state->nop_header) {
++      return;
++   }
++
+    assert(cs->end == state->_end);
+    state->dwords = cs->cur - state->nop_header - 1;
+    state->disable_patch = pm4_pkt7_hdr(CP_NOP, state->dwords);
+@@ -495,6 +592,10 @@ tu_cs_patchable_end(struct tu_cs *cs,
+ static inline void
+ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+ {
++   if (!tu_cs_reserve(cs, 3)) {
++      return;
++   }
++
+    assert(cs->cond_stack_depth < TU_COND_EXEC_STACK_SIZE);
+ 
+    ASSERTED enum compare_mode mode =
+@@ -520,6 +621,10 @@ tu_cond_exec_start(struct tu_cs *cs, uint32_t cond_flags)
+ static inline void
+ tu_cond_exec_end(struct tu_cs *cs)
+ {
++   if (cs->record_result != VK_SUCCESS) {
++      return;
++   }
++
+    assert(cs->cond_stack_depth > 0);
+    cs->cond_stack_depth--;
+ 
+@@ -649,6 +754,9 @@ struct tu_reg_value {
+    STATIC_ASSERT(ARRAY_SIZE(regs) <= 16);               \
+                                                         \
+    tu_cs_emit_pkt4((cs), regs[0].reg, count);             \
++   if (tu_cs_get_record_result(cs) != VK_SUCCESS) {       \
++      break;                                             \
++   }                                                     \
+    uint32_t *p = (cs)->cur;                               \
+    __ONE_REG( 0, regs);                                 \
+    __ONE_REG( 1, regs);                                 \
+@@ -677,7 +785,11 @@ struct tu_pkt {
+    tu_pkt(tu_cs *cs, enum adreno_pm4_type3_packets pkt, unsigned ndwords)
+        : cs(cs), pkt(pkt)
+    {
+-      tu_cs_reserve(cs, ndwords + 1);
++      if (!tu_cs_reserve(cs, ndwords + 1)) {
++         this->cs = nullptr;
++         return;
++      }
++
+       start = cs->cur;
+       cs->cur++; /* Leave a slot for the packet header when we're done. */
+       assert(!cs->pkt);
+@@ -702,12 +814,16 @@ struct tu_pkt {
+ 
+    void append(uint32_t value)
+    {
+-      tu_cs_emit(cs, value);
++      if (cs) {
++         tu_cs_emit(cs, value);
++      }
+    }
+ 
+    void append(const uint32_t *dwords, uint32_t sizedwords)
+    {
+-      tu_cs_emit_array(cs, dwords, sizedwords);
++      if (cs) {
++         tu_cs_emit_array(cs, dwords, sizedwords);
++      }
+    }
+ 
+  public:
+@@ -722,6 +838,12 @@ struct tu_pkt {
+          return;
+       }
+ 
++      if (cs->record_result != VK_SUCCESS) {
++         cs->pkt = nullptr;
++         cs = nullptr;
++         return;
++      }
++
+       assert(start);
+       assert(cs->pkt == this);
+ 
+diff --git a/src/freedreno/vulkan/tu_descriptor_set.cc b/src/freedreno/vulkan/tu_descriptor_set.cc
+index 2ff6826..6b03fe0 100644
+--- a/src/freedreno/vulkan/tu_descriptor_set.cc
++++ b/src/freedreno/vulkan/tu_descriptor_set.cc
+@@ -193,6 +193,8 @@ tu_CreateDescriptorSetLayout(
+       set_layout->binding[b].array_size =
+          binding->descriptorType == VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK ?
+          1 : binding->descriptorCount;
++      set_layout->binding[b].resource_offset = set_layout->resource_count;
++      set_layout->resource_count += set_layout->binding[b].array_size;
+       set_layout->binding[b].offset = set_layout->size;
+       set_layout->binding[b].dynamic_offset_offset = dynamic_offset_size;
+       set_layout->binding[b].shader_stages = binding->stageFlags;
+@@ -694,6 +696,24 @@ tu_descriptor_set_create(struct tu_device *device,
+       }
+    }
+ 
++   set->resource_count = layout->resource_count;
++   if (set->resource_count) {
++      set->resources = (struct tu_resource_range *)
++         vk_zalloc(&device->vk.alloc,
++                   set->resource_count * sizeof(*set->resources), 8,
++                   VK_SYSTEM_ALLOCATION_SCOPE_OBJECT);
++      if (!set->resources) {
++         if (!pool->host_memory_base) {
++            if (set->size) {
++               util_vma_heap_free(&pool->bo_heap,
++                                 set->offset + TU_POOL_HEAP_OFFSET, set->size);
++            }
++            vk_object_free(&device->vk, NULL, set);
++         }
++         return vk_error(device, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++   }
++
+    vk_descriptor_set_layout_ref(&layout->vk);
+    list_addtail(&set->pool_link, &pool->desc_sets);
+    pool->entry_count++;
+@@ -716,6 +736,7 @@ tu_descriptor_set_destroy(struct tu_device *device,
+    }
+ 
+    pool->entry_count--;
++   vk_free(&device->vk.alloc, set->resources);
+    vk_object_free(&device->vk, NULL, set);
+ }
+ 
+@@ -810,7 +831,9 @@ tu_CreateDescriptorPool(VkDevice _device,
+    if (bo_size) {
+       if (!(pCreateInfo->flags & VK_DESCRIPTOR_POOL_CREATE_HOST_ONLY_BIT_EXT)) {
+          ret = tu_bo_init_new(device, &pool->base, &pool->bo, bo_size,
+-                              TU_BO_ALLOC_ALLOW_DUMP, "descriptor pool");
++                              (enum tu_bo_alloc_flags)(TU_BO_ALLOC_ALLOW_DUMP |
++                                                       TU_BO_ALLOC_INTERNAL_RESOURCE),
++                              "descriptor pool");
+          if (ret)
+             goto fail_alloc;
+ 
+@@ -853,6 +876,8 @@ tu_destroy_descriptor_pool_entries(struct tu_device *device,
+       vk_descriptor_set_layout_unref(&device->vk, &set->layout->vk);
+       if (!pool->host_memory_base)
+          tu_descriptor_set_destroy(device, pool, set);
++      else
++         vk_free(&device->vk.alloc, set->resources);
+    }
+ 
+    list_inithead(&pool->desc_sets);
+@@ -971,6 +996,8 @@ tu_FreeDescriptorSets(VkDevice _device,
+ 
+       if (set && !pool->host_memory_base)
+          tu_descriptor_set_destroy(device, pool, set);
++      else if (set)
++         vk_free(&device->vk.alloc, set->resources);
+    }
+    return VK_SUCCESS;
+ }
+@@ -1347,6 +1374,78 @@ tu_GetDescriptorEXT(
+ }
+ TU_GENX(tu_GetDescriptorEXT);
+ 
++static struct tu_resource_range
++descriptor_resource(VkDescriptorType type, const void *data, bool *unknown)
++{
++   const struct tu_buffer *buffer = NULL;
++   const struct tu_image *image = NULL;
++   uint32_t access = TU_RESOURCE_READ;
++
++   switch (type) {
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++   case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
++      access |= TU_RESOURCE_WRITE;
++      FALLTHROUGH;
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++   case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++      buffer = tu_buffer_from_handle(((const VkDescriptorBufferInfo *)data)->buffer);
++      break;
++   case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++      access |= TU_RESOURCE_WRITE;
++      FALLTHROUGH;
++   case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER: {
++      const struct tu_buffer_view *view =
++         tu_buffer_view_from_handle(*(const VkBufferView *)data);
++      buffer = view ? view->buffer : NULL;
++      break;
++   }
++   case VK_DESCRIPTOR_TYPE_STORAGE_IMAGE:
++      access |= TU_RESOURCE_WRITE;
++      FALLTHROUGH;
++   case VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE:
++   case VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER:
++   case VK_DESCRIPTOR_TYPE_INPUT_ATTACHMENT:
++   case VK_DESCRIPTOR_TYPE_SAMPLE_WEIGHT_IMAGE_QCOM:
++   case VK_DESCRIPTOR_TYPE_BLOCK_MATCH_IMAGE_QCOM: {
++      const struct tu_image_view *view =
++         tu_image_view_from_handle(((const VkDescriptorImageInfo *)data)->imageView);
++      image = view ? view->image : NULL;
++      break;
++   }
++   case VK_DESCRIPTOR_TYPE_SAMPLER:
++   case VK_DESCRIPTOR_TYPE_INLINE_UNIFORM_BLOCK:
++      break;
++   default:
++      *unknown = true;
++      break;
++   }
++
++   if (buffer) {
++      if (buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_BINDING_BIT)
++         *unknown = true;
++      return {buffer->vk.device_address, buffer->vk.size, access};
++   }
++   if (image) {
++      if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
++         *unknown = true;
++      return {image->iova, image->total_size, access};
++   }
++   return {};
++}
++
++static void
++set_descriptor_resource(struct tu_descriptor_set *set, uint32_t index,
++                        VkDescriptorType type, const void *data)
++{
++   if (!set->resources || index >= set->resource_count) {
++      set->resource_addresses_unknown = true;
++      return;
++   }
++
++   set->resources[index] = descriptor_resource(type, data,
++                                              &set->resource_addresses_unknown);
++}
++
+ template <chip CHIP>
+ void
+ tu_update_descriptor_sets(const struct tu_device *device,
+@@ -1424,6 +1523,26 @@ tu_update_descriptor_sets(const struct tu_device *device,
+ 
+       ptr += binding_layout->size / 4 * writeset->dstArrayElement;
+       for (j = 0; j < writeset->descriptorCount; ++j) {
++         const void *resource_data = NULL;
++         switch (writeset->descriptorType) {
++         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
++         case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
++         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER_DYNAMIC:
++         case VK_DESCRIPTOR_TYPE_STORAGE_BUFFER:
++            resource_data = writeset->pBufferInfo + j;
++            break;
++         case VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER:
++         case VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER:
++            resource_data = writeset->pTexelBufferView + j;
++            break;
++         default:
++            resource_data = writeset->pImageInfo ? writeset->pImageInfo + j : NULL;
++            break;
++         }
++         set_descriptor_resource(set,
++                                 binding_layout->resource_offset + writeset->dstArrayElement + j,
++                                 writeset->descriptorType, resource_data);
++
+          switch(writeset->descriptorType) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC:
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER:
+@@ -1560,6 +1679,16 @@ tu_update_descriptor_sets(const struct tu_device *device,
+       for (j = 0; j < copyset->descriptorCount; ++j) {
+          memcpy(dst_ptr, src_ptr, copy_size);
+ 
++         const uint32_t source = src_binding_layout->resource_offset + copyset->srcArrayElement + j;
++         const uint32_t target = dst_binding_layout->resource_offset + copyset->dstArrayElement + j;
++         if (source < src_set->resource_count && target < dst_set->resource_count &&
++             src_set->resources && dst_set->resources) {
++            dst_set->resources[target] = src_set->resources[source];
++         } else {
++            dst_set->resource_addresses_unknown = true;
++         }
++         dst_set->resource_addresses_unknown |= src_set->resource_addresses_unknown;
++
+          src_ptr += src_binding_layout->size / 4;
+          dst_ptr += dst_binding_layout->size / 4;
+       }
+@@ -1708,6 +1837,7 @@ tu_CreateDescriptorUpdateTemplate(
+       templ->entry[j++] = (struct tu_descriptor_update_template_entry) {
+          .descriptor_type = entry->descriptorType,
+          .descriptor_count = entry->descriptorCount,
++         .resource_offset = binding_layout->resource_offset + entry->dstArrayElement,
+          .dst_offset = dst_offset,
+          .dst_stride = dst_stride,
+          .immutable_samplers = immutable_samplers,
+@@ -1769,6 +1899,8 @@ tu_update_descriptor_set_with_template(
+       ptr += templ->entry[i].dst_offset;
+       unsigned dst_offset = templ->entry[i].dst_offset;
+       for (unsigned j = 0; j < templ->entry[i].descriptor_count; ++j) {
++         set_descriptor_resource(set, templ->entry[i].resource_offset + j,
++                                 templ->entry[i].descriptor_type, src);
+          switch(templ->entry[i].descriptor_type) {
+          case VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER_DYNAMIC: {
+             assert(!(set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR));
+diff --git a/src/freedreno/vulkan/tu_descriptor_set.h b/src/freedreno/vulkan/tu_descriptor_set.h
+index 6a6a1ff..630fac8 100644
+--- a/src/freedreno/vulkan/tu_descriptor_set.h
++++ b/src/freedreno/vulkan/tu_descriptor_set.h
+@@ -7,6 +7,7 @@
+ #define TU_DESCRIPTOR_SET_H
+ 
+ #include "tu_common.h"
++#include "tu_knl.h"
+ 
+ #include "util/vma.h"
+ #include "vk_descriptor_set_layout.h"
+@@ -40,6 +41,7 @@ struct tu_descriptor_set_binding_layout
+ 
+    /* Number of array elements in this binding */
+    uint32_t array_size;
++   uint32_t resource_offset;
+ 
+    /* The size in bytes of each Vulkan descriptor. */
+    uint32_t size;
+@@ -72,6 +74,7 @@ struct tu_descriptor_set_layout
+ 
+    /* Number of bindings in this descriptor set */
+    uint32_t binding_count;
++   uint32_t resource_count;
+ 
+    /* Total size of the descriptor set with room for all array entries */
+    uint32_t size;
+@@ -137,6 +140,9 @@ struct tu_descriptor_set
+    uint32_t host_size;
+ 
+    uint32_t *dynamic_descriptors;
++   struct tu_resource_range *resources;
++   uint32_t resource_count;
++   bool resource_addresses_unknown;
+ };
+ VK_DEFINE_NONDISP_HANDLE_CASTS(tu_descriptor_set, base, VkDescriptorSet,
+                                VK_OBJECT_TYPE_DESCRIPTOR_SET)
+@@ -170,6 +176,7 @@ struct tu_descriptor_update_template_entry
+ 
+    /* The number of descriptors to update */
+    uint32_t descriptor_count;
++   uint32_t resource_offset;
+ 
+    /* Into mapped_ptr or dynamic_descriptors, in units of the respective array
+     */
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 88f7287..dc491ae 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2666,7 +2666,10 @@ static VkResult
+ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+ {
+    struct tu_cs shader_cs;
+-   tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
++   VkResult result = tu_cs_begin_sub_stream(&device->sub_cs, 10, &shader_cs);
++   if (result != VK_SUCCESS) {
++      return result;
++   }
+ 
+    uint32_t raw_shader[] = {
+       0x00040000, 0x40600000, // mul.f hr0.x, hr0.x, hr1.x
+@@ -2678,10 +2681,17 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+ 
+    tu_cs_emit_array(&shader_cs, raw_shader, ARRAY_SIZE(raw_shader));
+    struct tu_cs_entry shader_entry = tu_cs_end_sub_stream(&device->sub_cs, &shader_cs);
++   if (tu_cs_get_record_result(&device->sub_cs) != VK_SUCCESS) {
++      return tu_cs_get_record_result(&device->sub_cs);
++   }
++
+    uint64_t shader_iova = shader_entry.bo->iova + shader_entry.offset;
+ 
+    struct tu_cs sub_cs;
+-   tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
++   result = tu_cs_begin_sub_stream(&device->sub_cs, 47, &sub_cs);
++   if (result != VK_SUCCESS) {
++      return result;
++   }
+ 
+    tu_cs_emit_regs(&sub_cs, SP_UPDATE_CNTL(A7XX,
+             .vs_state = true, .hs_state = true, .ds_state = true,
+@@ -2747,7 +2757,7 @@ tu_init_cmdbuf_start_a725_quirk(struct tu_device *device)
+    device->cmdbuf_start_a725_quirk_entry =
+       tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
+ 
+-   return VK_SUCCESS;
++   return tu_cs_get_record_result(&device->sub_cs);
+ }
+ 
+ static VkResult
+@@ -3138,6 +3148,10 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+          device->perfcntrs_pass_cs_entries[i] =
+             tu_cs_end_sub_stream(&device->sub_cs, &sub_cs);
++         result = tu_cs_get_record_result(&device->sub_cs);
++         if (result != VK_SUCCESS) {
++            goto fail_prepare_perfcntrs_pass_cs;
++         }
+       }
+    }
+ 
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 392f2a7..f902017 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -20,6 +20,20 @@ struct tu_u_trace_syncobj;
+ struct tu_queue;
+ struct vdrm_bo;
+ 
++enum tu_resource_access {
++   TU_RESOURCE_READ = 1,
++   TU_RESOURCE_WRITE = 2,
++};
++
++/* A recorded resource range names GPU virtual bytes. The Darwin submitter
++ * resolves these bytes against live BOs and holds the BOs until the kernel
++ * has accepted its own references. */
++struct tu_resource_range {
++   uint64_t iova;
++   uint64_t size;
++   uint32_t access;
++};
++
+ enum tu_bo_alloc_flags {
+    TU_BO_ALLOC_NO_FLAGS = 0,
+    TU_BO_ALLOC_ALLOW_DUMP = 1 << 0,
+@@ -61,6 +75,7 @@ struct tu_bo {
+ #ifdef TU_HAS_DARWIN
+    /* The kernel handle is opaque. gem_handle indexes this device's BO array. */
+    uint64_t darwin_handle;
++   uint32_t darwin_last_fence;
+    /* The token selects this BO's IOConnectMapMemory64 descriptor. */
+    uint32_t darwin_token;
+    /* A V2 map ID owns the kernel's completed CPU mapping and its BO lease. */
+@@ -262,6 +277,14 @@ tu_bo_sync_cache(struct tu_device *dev,
+ 
+ void tu_bo_allow_dump(struct tu_device *dev, struct tu_bo *bo);
+ 
++#ifdef TU_HAS_DARWIN
++struct tu_cmd_buffer;
++VkResult tu_darwin_submit_add_resources(struct tu_device *dev, void *submit,
++                                        struct tu_cmd_buffer *cmd);
++VKAPI_ATTR VkBool32 VKAPI_CALL
++tu_NativeAdrenoDeviceCacheMaintenance(VkDevice device);
++#endif
++
+ void tu_bo_set_metadata(struct tu_device *dev, struct tu_bo *bo,
+                         void *metadata, uint32_t metadata_size);
+ int tu_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo,
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index a5ccf3f..d957141 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -7,6 +7,7 @@
+ #include <errno.h>
+ #include <pthread.h>
+ #include <sched.h>
++#include <stdlib.h>
+ #include <string.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -54,6 +55,8 @@ struct darwin_connection {
+    uint32_t last_fence;
+    NativeAdrenoAbiDeviceInfo info;
+    NativeAdrenoAbiParams params;
++   NativeAdrenoAbiSubmitCaps submit_caps;
++   bool submit_caps_checked;
+ };
+ 
+ static pthread_mutex_t profile_device_lock = PTHREAD_MUTEX_INITIALIZER;
+@@ -87,6 +90,7 @@ struct darwin_retired_bo {
+ };
+ 
+ enum darwin_bo_state {
++   DARWIN_BO_RESERVED,
+    DARWIN_BO_ACTIVE,
+    DARWIN_BO_PENDING,
+    DARWIN_BO_CACHED,
+@@ -104,7 +108,7 @@ struct darwin_bo_node {
+    struct list_head link;
+    struct list_head bucket_link;
+    enum darwin_bo_state state;
+-   uint64_t retry_generation;
++   uint64_t retry_after_ns;
+ };
+ 
+ /* darwin_retire_state owns one node per native handle, including active BOs.
+@@ -120,6 +124,9 @@ struct darwin_retire_state {
+    struct list_head buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
+    struct list_head pending_buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
+    unsigned count, node_count;
++   unsigned reclaim_count, released_count;
++   unsigned budget_calls;
++   NativeAdrenoAbiResourceBudget mapping_budget;
+    unsigned trim_waiters;
+    unsigned cache_count;
+    VkResult failure;
+@@ -178,6 +185,8 @@ dw_call(struct tu_device *dev, uint32_t method, const void *in, size_t in_size,
+    return dw_call(darwin_connection_for(dev), method, in, in_size, out, out_size);
+ }
+ 
++static void darwin_refresh_mapping_budget(struct tu_device *dev, bool force);
++
+ static VkResult
+ darwin_unmap_cpu_storage(struct tu_device *dev, uint64_t handle, void **mapping,
+                          uint32_t *token, uint64_t *map_id)
+@@ -323,6 +332,8 @@ darwin_profile_reporter(void *argument)
+    uint64_t sequence = 0;
+    uint64_t sent_slow = 0;
+    for (;;) {
++      darwin_refresh_mapping_budget(retire->device, true);
++
+       NativeAdrenoAbiBoCacheCounters counters;
+       NativeAdrenoAbiBoCacheBudget budget = {};
+       NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
+@@ -681,6 +692,7 @@ darwin_evict_oldest_locked(struct darwin_retire_state *retire,
+    ++retire->count;
+    retire->pending_bytes += node->bo.size;
+    retire->reclaim_bytes += node->bo.size;
++   ++retire->reclaim_count;
+    ++retire->cache_evictions;
+    switch (reason) {
+    case DARWIN_EVICT_OBJECTS:
+@@ -702,6 +714,55 @@ darwin_evict_oldest_locked(struct darwin_retire_state *retire,
+ 
+ }
+ 
++/* The completed cache releases enough mappings to fit this connection's
++ * share after already queued destruction has finished. Active and pending
++ * BOs keep their storage until their owners and GPU jobs release it. */
++static void
++darwin_enforce_mapping_budget_locked(struct darwin_retire_state *retire)
++{
++   const unsigned target = retire->mapping_budget.version ?
++      MIN2(retire->mapping_budget.connection_target, (uint32_t) DARWIN_NATIVE_BO_LIMIT) :
++      DARWIN_NATIVE_BO_LIMIT / 2;
++   unsigned retained = retire->node_count - retire->reclaim_count - retire->released_count;
++   while (retire->cache_count && retained > target) {
++      darwin_evict_oldest_locked(retire, DARWIN_EVICT_OBJECTS);
++      --retained;
++   }
++}
++
++static void
++darwin_refresh_mapping_budget(struct tu_device *dev, bool force)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   if (!retire || !(retire->connection.params.flags & NativeAdrenoParamsResourceBudget)) {
++      return;
++   }
++
++   pthread_mutex_lock(&retire->lock);
++   const bool query = force || !(retire->budget_calls++ % 32);
++   pthread_mutex_unlock(&retire->lock);
++   if (!query) {
++      return;
++   }
++
++   NativeAdrenoAbiResourceBudget budget = {};
++   kern_return_t kr = dw_call(dev, NativeAdrenoMethodGetResourceBudget, NULL, 0,
++                              &budget, sizeof(budget));
++   if (kr != KERN_SUCCESS || budget.version != NativeAdrenoResourceBudgetVersion ||
++       !budget.capacity || budget.connection_target > budget.capacity) {
++      return;
++   }
++
++   pthread_mutex_lock(&retire->lock);
++   if (!retire->mapping_budget.version || budget.generation >= retire->mapping_budget.generation) {
++      retire->mapping_budget = budget;
++      darwin_enforce_mapping_budget_locked(retire);
++      ++retire->work_generation;
++      pthread_cond_signal(&retire->work_wake);
++   }
++   pthread_mutex_unlock(&retire->lock);
++}
++
+ static void
+ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_bo_node *node)
+ {
+@@ -710,6 +771,7 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
+       node->state = DARWIN_BO_RECLAIM;
+       list_addtail(&node->link, &retire->reclaim);
+       retire->reclaim_bytes += bo->size;
++      ++retire->reclaim_count;
+       return;
+    }
+ 
+@@ -730,6 +792,7 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
+    ++retire->profile.puts;
+    --retire->count;
+    retire->pending_bytes -= bo->size;
++   darwin_enforce_mapping_budget_locked(retire);
+ }
+ 
+ static void
+@@ -758,7 +821,7 @@ darwin_retire_worker(void *argument)
+       }
+ 
+       list_for_each_entry_safe(struct darwin_bo_node, node, &retire->retry, link) {
+-         if (node->retry_generation != retire->work_generation) {
++         if (os_time_get_nano() >= node->retry_after_ns) {
+             list_del(&node->link);
+             node->state = DARWIN_BO_RECLAIM;
+             list_addtail(&node->link, &retire->reclaim);
+@@ -766,7 +829,22 @@ darwin_retire_worker(void *argument)
+       }
+       if (retire->failure != VK_SUCCESS ||
+           (list_is_empty(&retire->pending) && list_is_empty(&retire->reclaim))) {
+-         pthread_cond_wait(&retire->work_wake, &retire->lock);
++         if (retire->failure != VK_SUCCESS) {
++            pthread_cond_wait(&retire->work_wake, &retire->lock);
++         } else {
++            const bool waiting_for_release = !list_is_empty(&retire->retry);
++            struct timespec deadline;
++            clock_gettime(CLOCK_REALTIME, &deadline);
++            deadline.tv_nsec += waiting_for_release ? 1000000 : 100000000;
++            if (deadline.tv_nsec >= 1000000000) {
++               ++deadline.tv_sec;
++               deadline.tv_nsec -= 1000000000;
++            }
++            pthread_cond_timedwait(&retire->work_wake, &retire->lock, &deadline);
++            pthread_mutex_unlock(&retire->lock);
++            darwin_refresh_mapping_budget(dev, !waiting_for_release);
++            pthread_mutex_lock(&retire->lock);
++         }
+          processed = 0;
+          turn_bytes = 0;
+          observed_fence = 0;
+@@ -799,6 +877,8 @@ darwin_retire_worker(void *argument)
+             --retire->count;
+             retire->pending_bytes -= node->bo.size;
+             retire->reclaim_bytes -= node->bo.size;
++            --retire->reclaim_count;
++            ++retire->released_count;
+          } else {
+             observed_fence = node->bo.fence;
+             if (node->bo.cacheable) {
+@@ -814,7 +894,7 @@ darwin_retire_worker(void *argument)
+          list_add(&node->link, &retire->pending);
+       } else if (result == VK_NOT_READY && destroy) {
+          node->state = DARWIN_BO_RECLAIM;
+-         node->retry_generation = retire->work_generation;
++         node->retry_after_ns = os_time_get_nano() + 1000000;
+          list_addtail(&node->link, &retire->retry);
+       } else {
+          if (!destroy && node->bo.cacheable) {
+@@ -863,6 +943,7 @@ darwin_recycle_released_locked(struct tu_device *dev, struct darwin_retire_state
+       darwin_free_iova(dev, node->bo.iova, node->bo.size);
+       util_idalloc_free(&retire->ids, node->bo.gem_handle);
+       --retire->node_count;
++      --retire->released_count;
+       *node = {};
+    }
+ }
+@@ -885,7 +966,7 @@ darwin_allocate_bo_id(struct tu_device *dev)
+    if (retire->failure == VK_SUCCESS && retire->node_count < DARWIN_NATIVE_BO_LIMIT) {
+       id = util_idalloc_alloc(&retire->ids);
+       retire->nodes[id].bo.gem_handle = id;
+-      retire->nodes[id].state = DARWIN_BO_ACTIVE;
++      retire->nodes[id].state = DARWIN_BO_RESERVED;
+       ++retire->node_count;
+    }
+    pthread_mutex_unlock(&retire->lock);
+@@ -917,6 +998,8 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+                     bool eligible, const char *name, uint32_t *reason,
+                     struct darwin_retired_bo *out)
+ {
++   darwin_refresh_mapping_budget(dev, false);
++
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+    NativeAdrenoAbiBoCacheCounters *profile = &retire->profile;
+@@ -956,7 +1039,7 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+ 
+          *out = node->bo;
+          darwin_remove_cached_locked(retire, node);
+-         node->state = DARWIN_BO_ACTIVE;
++         node->state = DARWIN_BO_RESERVED;
+          ++retire->cache_hits;
+          ++profile->hits;
+          ++size_bin->hits;
+@@ -1079,12 +1162,15 @@ static VkResult
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+                    uint64_t size, uint32_t gem_handle, kern_return_t map_error)
+ {
++   const VkResult map_result = map_error == kIOReturnBusy ? VK_ERROR_UNKNOWN :
++      map_error == kIOReturnNotResponding ? VK_ERROR_DEVICE_LOST :
++      VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+    kern_return_t cleanup = dw_call(dev, NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
+       darwin_cancel_bo_id(dev, gem_handle);
+-      return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoMap failed: 0x%x", map_error);
++      return vk_errorf(dev, map_result, "BoMap failed: 0x%x", map_error);
+    }
+    /* A failed map may have modified tables. Unknown cleanup never authorizes
+     * reusing its IOVA, even though no tu_bo could be published to the caller. */
+@@ -1093,6 +1179,20 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+    retire->nodes[gem_handle].bo = {
+       .handle = handle, .iova = iova, .size = size, .gem_handle = gem_handle,
+    };
++   if (cleanup == kIOReturnBusy) {
++      struct darwin_bo_node *node = &retire->nodes[gem_handle];
++      node->state = DARWIN_BO_RECLAIM;
++      node->retry_after_ns = os_time_get_nano() + 1000000;
++      list_addtail(&node->link, &retire->retry);
++      ++retire->count;
++      ++retire->reclaim_count;
++      retire->pending_bytes += size;
++      retire->reclaim_bytes += size;
++      darwin_wake_worker_locked(retire);
++      pthread_mutex_unlock(&retire->lock);
++      return vk_errorf(dev, map_result, "BoMap failed: 0x%x; storage release pending", map_error);
++   }
++
+    retire->nodes[gem_handle].state = DARWIN_BO_QUARANTINED;
+    retire->failure = vk_device_set_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
+    VkResult result = retire->failure;
+@@ -1100,8 +1200,126 @@ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+    return result;
+ }
+ 
++static kern_return_t
++darwin_map_with_alias_wait(struct tu_device *dev, const NativeAdrenoAbiBoMap *map,
++                           NativeAdrenoAbiBoMapReply *mapped, uint64_t deadline_ns)
++{
++   struct darwin_connection &dw = *darwin_connection_for(dev);
++   for (;;) {
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoMap, map, sizeof(*map),
++                                 mapped, sizeof(*mapped));
++      if (kr != kIOReturnBusy || os_time_get_nano() >= deadline_ns ||
++          !(dw.params.flags & NativeAdrenoParamsResourceBudget)) {
++         return kr;
++      }
++
++      NativeAdrenoAbiResourceBudget budget = {};
++      kern_return_t queried = dw_call(dev, NativeAdrenoMethodGetResourceBudget,
++                                      NULL, 0, &budget, sizeof(budget));
++      if (queried != KERN_SUCCESS || budget.version != NativeAdrenoResourceBudgetVersion ||
++          budget.last_failure_reason != NativeAdrenoMapFailureActiveAlias ||
++          budget.last_failure_handle != map->handle || budget.last_failure_iova != map->iova) {
++         return kr;
++      }
++
++      pthread_mutex_lock(&dw.lock);
++      const uint32_t fence = dw.last_fence;
++      pthread_mutex_unlock(&dw.lock);
++      if (fence) {
++         VkResult waited = dw_wait_fence_raw(dev, fence,
++            MIN2(deadline_ns, (uint64_t)os_time_get_nano() + 1000000));
++         if (waited != VK_SUCCESS && waited != VK_TIMEOUT) {
++            return kIOReturnNotResponding;
++         }
++         if (waited == VK_TIMEOUT) {
++            continue;
++         }
++      }
++
++      const uint64_t now = os_time_get_nano();
++      if (now < deadline_ns) {
++         usleep((useconds_t) MIN2(1000ull, (deadline_ns - now + 999) / 1000));
++      }
++   }
++}
++
++/* A new BO keeps its handle, IOVA and metadata ID across bounded retries.
++ * Only the retirement worker destroys completed cached mappings. A failed
++ * retry returns all three reservations through darwin_map_failure. */
++static VkResult
++darwin_map_storage(struct tu_device *dev, uint64_t handle, uint64_t iova,
++                   uint64_t size, uint32_t gem_handle, uint32_t permissions)
++{
++   struct darwin_connection &dw = *darwin_connection_for(dev);
++   NativeAdrenoAbiBoMap map = {
++      .handle = handle,
++      .iova = iova,
++      .permissions = permissions,
++      .writeback = 0,
++      .shareability = 2,
++   };
++   NativeAdrenoAbiBoMapReply mapped = {};
++   const uint64_t deadline_ns = os_time_get_nano() + 5000000000ull;
++   kern_return_t kr = darwin_map_with_alias_wait(dev, &map, &mapped, deadline_ns);
++   const bool mapping_pressure = kr == kIOReturnNoSpace &&
++      (dw.params.flags & NativeAdrenoParamsResourceBudget);
++   if (mapping_pressure || kr == kIOReturnNoResources) {
++      darwin_refresh_mapping_budget(dev, true);
++      VkResult reclaimed = darwin_trim_cache(dev, DARWIN_EVICT_OBJECTS);
++      if (reclaimed != VK_SUCCESS) {
++         VkResult cleanup = darwin_map_failure(dev, handle, iova, size, gem_handle, kr);
++         return cleanup == VK_ERROR_DEVICE_LOST ? cleanup : reclaimed;
++      }
++      const unsigned attempts = mapping_pressure ? 3 : 1;
++      for (unsigned attempt = 0; attempt < attempts; ++attempt) {
++         kr = darwin_map_with_alias_wait(dev, &map, &mapped, deadline_ns);
++         if (kr != kIOReturnNoSpace || attempt + 1 == attempts) {
++            break;
++         }
++
++         struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++         struct timespec deadline;
++         clock_gettime(CLOCK_REALTIME, &deadline);
++         deadline.tv_nsec += 100000000;
++         if (deadline.tv_nsec >= 1000000000) {
++            ++deadline.tv_sec;
++            deadline.tv_nsec -= 1000000000;
++         }
++         pthread_mutex_lock(&retire->lock);
++         if (!retire->worker_stop && retire->failure == VK_SUCCESS) {
++            pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline);
++         }
++         pthread_mutex_unlock(&retire->lock);
++         darwin_refresh_mapping_budget(dev, true);
++      }
++   }
++
++   if (kr != KERN_SUCCESS) {
++      return darwin_map_failure(dev, handle, iova, size, gem_handle, kr);
++   }
++
++   return VK_SUCCESS;
++}
++
+ /* ---- buffer objects ---- */
+ 
++/* The BO becomes visible to submission only after its native allocation,
++ * mapping and tu_bo fields are complete. Last-reference removal uses this
++ * same lock before changing the node back to reserved ownership. */
++static void
++darwin_publish_bo(struct tu_device *dev, struct tu_bo *bo)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&retire->lock);
++   struct darwin_bo_node *node = &retire->nodes[bo->gem_handle];
++   node->bo.handle = bo->darwin_handle;
++   node->bo.iova = bo->iova;
++   node->bo.size = bo->size;
++   node->bo.alloc_flags = bo->darwin_alloc_flags;
++   node->state = DARWIN_BO_ACTIVE;
++   pthread_mutex_unlock(&retire->lock);
++}
++
+ static VkResult
+ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+                struct tu_bo **out_bo, uint64_t size, uint64_t client_iova,
+@@ -1175,17 +1393,10 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+ 
+-      NativeAdrenoAbiBoMap map = {
+-         .handle = reply.handle,
+-         .iova = iova,
+-         .permissions = (flags & TU_BO_ALLOC_GPU_READ_ONLY) ? 1u : 3u,
+-         .writeback = 0,
+-         .shareability = 2,
+-      };
+-      NativeAdrenoAbiBoMapReply mapped = {};
+-      kr = dw_call(dev, NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+-      if (kr != KERN_SUCCESS) {
+-         return darwin_map_failure(dev, reply.handle, iova, size, storage.gem_handle, kr);
++      result = darwin_map_storage(dev, reply.handle, iova, size, storage.gem_handle,
++                                  (flags & TU_BO_ALLOC_GPU_READ_ONLY) ? 1u : 3u);
++      if (result != VK_SUCCESS) {
++         return result;
+       }
+ 
+       storage.handle = reply.handle;
+@@ -1213,6 +1424,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       .unique_id = storage.handle,
+    };
+    bo->darwin_handle = storage.handle;
++   bo->darwin_last_fence = 0;
+    bo->darwin_token = storage.token;
+    bo->darwin_map_id = storage.map_id;
+    bo->darwin_alloc_flags = flags;
+@@ -1228,6 +1440,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       TU_RMV(bo_map, dev, bo);
+    }
+ 
++   darwin_publish_bo(dev, bo);
+    *out_bo = bo;
+    if (flags & TU_BO_ALLOC_INTERNAL_RESOURCE) {
+       TU_RMV(internal_resource_create, dev, bo);
+@@ -1271,6 +1484,8 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+ static VkResult
+ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
+ {
++   darwin_refresh_mapping_budget(dev, false);
++
+    struct darwin_connection &dw = *darwin_connection_for(dev);
+    if (!(dw.params.flags & NativeAdrenoParamsHostImport))
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+@@ -1317,11 +1532,9 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+       darwin_cancel_bo_id(dev, gem_handle);
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+    }
+-   NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+-   NativeAdrenoAbiBoMapReply mapped = {};
+-   kr = dw_call(dev, NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+-   if (kr != KERN_SUCCESS) {
+-      return darwin_map_failure(dev, reply.handle, iova, size, gem_handle, kr);
++   result = darwin_map_storage(dev, reply.handle, iova, size, gem_handle, 3u);
++   if (result != VK_SUCCESS) {
++      return result;
+    }
+ 
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+@@ -1335,11 +1548,14 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+       .unique_id = reply.handle,
+    };
+    bo->darwin_handle = reply.handle;
++   bo->darwin_last_fence = 0;
+    bo->darwin_token = 0;
+    bo->darwin_map_id = 0;
+    bo->map = pointer;
+    bo->never_unmap = true;
+    darwin_profile_name(bo->darwin_profile_name, sizeof(bo->darwin_profile_name), "host import");
++
++   darwin_publish_bo(dev, bo);
+    tu_dump_bo_init(dev, bo);
+    TU_RMV(bo_allocate, dev, bo);
+    *out_bo = bo;
+@@ -1492,16 +1708,21 @@ darwin_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo, void *metadata,
+ static void
+ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ {
+-   struct darwin_connection &dw = *darwin_connection_for(dev);
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    const uint64_t began = os_time_get_nano() / 1000;
+    assert(bo->gem_handle);
+ 
+    u_rwlock_rdlock(&dev->dma_bo_lock);
+ 
++   pthread_mutex_lock(&retire->lock);
+    if (!p_atomic_dec_zero(&bo->refcnt)) {
++      pthread_mutex_unlock(&retire->lock);
+       u_rwlock_rdunlock(&dev->dma_bo_lock);
+       return;
+    }
++   retire->nodes[bo->gem_handle].state = DARWIN_BO_RESERVED;
++   const uint32_t fence = p_atomic_read(&bo->darwin_last_fence);
++   pthread_mutex_unlock(&retire->lock);
+ 
+    NativeAdrenoAbiBoSlowEvent event = {};
+    event.operation = NativeAdrenoBoSlowRetire;
+@@ -1520,10 +1741,6 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+       TU_RMV(bo_unmap, dev, bo);
+    TU_RMV(bo_destroy, dev, bo);
+ 
+-   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+-   pthread_mutex_lock(&dw.lock);
+-   uint32_t fence = dw.last_fence;
+-   pthread_mutex_unlock(&dw.lock);
+    event.connection_fence = fence;
+    pthread_mutex_lock(&retire->lock);
+    struct darwin_bo_node *node = &retire->nodes[bo->gem_handle];
+@@ -1569,8 +1786,89 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ 
+ struct tu_darwin_queue_submit {
+    struct util_dynarray commands; /* NativeAdrenoAbiSubmitBuffer */
++   struct util_dynarray ranges; /* tu_resource_range */
++   struct util_dynarray resources; /* darwin_submit_resource */
++   VkResult result;
++   uint32_t fallback_reasons;
++};
++
++struct darwin_submit_resource {
++   struct tu_bo *bo;
++   uint32_t access;
+ };
+ 
++static NativeAdrenoAbiSubmitCaps
++darwin_submit_caps(struct tu_device *dev)
++{
++   struct darwin_connection *connection = darwin_connection_for(dev);
++   pthread_mutex_lock(&connection->lock);
++   const bool checked = connection->submit_caps_checked;
++   NativeAdrenoAbiSubmitCaps caps = connection->submit_caps;
++   pthread_mutex_unlock(&connection->lock);
++   if (checked)
++      return caps;
++
++   caps = {};
++   if (dw_call(dev, NativeAdrenoMethodQuerySubmitV2, NULL, 0, &caps, sizeof(caps)) != KERN_SUCCESS ||
++       caps.version != NativeAdrenoSubmitVersion) {
++      caps = {};
++   }
++
++   pthread_mutex_lock(&connection->lock);
++   connection->submit_caps = caps;
++   connection->submit_caps_checked = true;
++   pthread_mutex_unlock(&connection->lock);
++   return caps;
++}
++
++VKAPI_ATTR VkBool32 VKAPI_CALL
++tu_NativeAdrenoDeviceCacheMaintenance(VkDevice _device)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   if (!device->darwin_retire)
++      return VK_FALSE;
++
++   const NativeAdrenoAbiSubmitCaps caps = darwin_submit_caps(device);
++   return caps.version == NativeAdrenoSubmitVersion &&
++          (caps.flags & NativeAdrenoSubmitKernelCacheMaintenance) != 0;
++}
++
++VkResult
++tu_darwin_submit_add_resources(struct tu_device *dev, void *_submit,
++                               struct tu_cmd_buffer *cmd)
++{
++   struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   submit->fallback_reasons |= cmd->resource_fallback_reasons;
++
++   const size_t count = util_dynarray_num_elements(&cmd->resource_ranges, struct tu_resource_range);
++   if (count) {
++      void *target = util_dynarray_grow_bytes(&submit->ranges, count, sizeof(struct tu_resource_range));
++      if (!target)
++         return submit->result = VK_ERROR_OUT_OF_HOST_MEMORY;
++
++      memcpy(target, cmd->resource_ranges.data, count * sizeof(struct tu_resource_range));
++   }
++
++   util_dynarray_foreach (&cmd->resource_descriptor_sets, struct tu_descriptor_set *, set_ptr) {
++      const struct tu_descriptor_set *set = *set_ptr;
++      if (set->layout->flags & VK_DESCRIPTOR_SET_LAYOUT_CREATE_UPDATE_AFTER_BIND_POOL_BIT) {
++         submit->fallback_reasons |= TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND;
++         continue;
++      }
++      if (set->resource_addresses_unknown)
++         submit->fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
++      if (!set->resource_count)
++         continue;
++
++      void *target = util_dynarray_grow_bytes(&submit->ranges, set->resource_count, sizeof(*set->resources));
++      if (!target)
++         return submit->result = VK_ERROR_OUT_OF_HOST_MEMORY;
++
++      memcpy(target, set->resources, set->resource_count * sizeof(*set->resources));
++   }
++   return submit->result;
++}
++
+ static void *
+ darwin_submit_create(struct tu_device *device)
+ {
+@@ -1582,7 +1880,12 @@ static void
+ darwin_submit_finish(struct tu_device *device, void *_submit)
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   util_dynarray_foreach (&submit->resources, struct darwin_submit_resource, resource) {
++      tu_bo_finish(device, resource->bo);
++   }
+    util_dynarray_fini(&submit->commands);
++   util_dynarray_fini(&submit->ranges);
++   util_dynarray_fini(&submit->resources);
+    vk_free(&device->vk.alloc, submit);
+ }
+ 
+@@ -1591,8 +1894,15 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+                           struct tu_cs_entry *entries, unsigned num_entries)
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
++   if (submit->result != VK_SUCCESS || !num_entries)
++      return;
++
+    NativeAdrenoAbiSubmitBuffer *cmds = (NativeAdrenoAbiSubmitBuffer *)
+       util_dynarray_grow(&submit->commands, NativeAdrenoAbiSubmitBuffer, num_entries);
++   if (!cmds) {
++      submit->result = VK_ERROR_OUT_OF_HOST_MEMORY;
++      return;
++   }
+    for (unsigned i = 0; i < num_entries; i++) {
+       cmds[i] = (NativeAdrenoAbiSubmitBuffer) {
+          .handle = entries[i].bo->darwin_handle,
+@@ -1602,6 +1912,86 @@ darwin_submit_add_entries(struct tu_device *device, void *_submit,
+    }
+ }
+ 
++static int
++darwin_resource_compare(const void *left, const void *right)
++{
++   const struct darwin_submit_resource *a = (const struct darwin_submit_resource *)left;
++   const struct darwin_submit_resource *b = (const struct darwin_submit_resource *)right;
++   return a->bo->iova < b->bo->iova ? -1 : a->bo->iova > b->bo->iova;
++}
++
++static VkResult
++darwin_collect_submit_resources(struct tu_device *dev, struct tu_darwin_queue_submit *submit,
++                                bool legacy)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   struct darwin_submit_resource *objects = (struct darwin_submit_resource *)
++      util_dynarray_grow(&submit->resources, struct darwin_submit_resource, DARWIN_NATIVE_BO_LIMIT);
++   if (!objects)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   uint32_t count = 0;
++   pthread_mutex_lock(&retire->lock);
++   for (uint32_t id = 1; id <= DARWIN_NATIVE_BO_LIMIT; id++) {
++      if (retire->nodes[id].state != DARWIN_BO_ACTIVE)
++         continue;
++
++      struct tu_bo *bo = tu_device_lookup_bo(dev, id);
++      objects[count++] = {tu_bo_get_ref(bo), 0};
++   }
++   pthread_mutex_unlock(&retire->lock);
++   submit->resources.size = count * sizeof(*objects);
++   qsort(objects, count, sizeof(*objects), darwin_resource_compare);
++
++   util_dynarray_foreach (&submit->commands, NativeAdrenoAbiSubmitBuffer, ib) {
++      struct tu_resource_range *range = (struct tu_resource_range *)
++         util_dynarray_grow(&submit->ranges, struct tu_resource_range, 1);
++      if (!range)
++         return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++      *range = {ib->iova, ib->bytes, TU_RESOURCE_READ};
++   }
++
++   util_dynarray_foreach (&submit->ranges, struct tu_resource_range, range) {
++      if (!range->iova || !range->size)
++         continue;
++
++      uint32_t lo = 0, hi = count;
++      while (lo < hi) {
++         const uint32_t mid = lo + (hi - lo) / 2;
++         if (objects[mid].bo->iova <= range->iova)
++            lo = mid + 1;
++         else
++            hi = mid;
++      }
++      if (!lo || range->iova - objects[lo - 1].bo->iova >= objects[lo - 1].bo->size ||
++          range->size > objects[lo - 1].bo->size - (range->iova - objects[lo - 1].bo->iova)) {
++         submit->fallback_reasons |= TU_RESOURCE_FALLBACK_DEVICE_ADDRESS;
++         continue;
++      }
++      objects[lo - 1].access |= range->access;
++   }
++
++   uint32_t kept = 0;
++   for (uint32_t i = 0; i < count; i++) {
++      struct darwin_submit_resource resource = objects[i];
++      if (legacy || submit->fallback_reasons ||
++          (resource.bo->darwin_alloc_flags & TU_BO_ALLOC_INTERNAL_RESOURCE)) {
++         resource.access |= TU_RESOURCE_READ | TU_RESOURCE_WRITE;
++      }
++      if (resource.bo->darwin_alloc_flags & TU_BO_ALLOC_GPU_READ_ONLY)
++         resource.access &= ~TU_RESOURCE_WRITE;
++
++      if (resource.access) {
++         objects[kept++] = resource;
++      } else {
++         tu_bo_finish(dev, resource.bo);
++      }
++   }
++   submit->resources.size = kept * sizeof(*objects);
++   return VK_SUCCESS;
++}
++
+ static void
+ darwin_submit_add_bind(struct tu_device *device, void *_submit,
+                        struct tu_sparse_vma *vma, uint64_t vma_offset,
+@@ -1816,6 +2206,115 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+    return vk_device_set_lost(&dev->vk, "submit: no free job slot");
+ }
+ 
++static VkResult
++darwin_submit_v2(struct tu_queue *queue, struct tu_darwin_queue_submit *submit,
++                  const NativeAdrenoAbiSubmitCaps &caps, uint32_t *fence)
++{
++   struct tu_device *dev = queue->device;
++   struct darwin_connection &dw = *darwin_connection_for(dev);
++   const uint32_t ib_count = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
++   const uint32_t resource_count = util_dynarray_num_elements(&submit->resources, struct darwin_submit_resource);
++   const size_t bytes = sizeof(NativeAdrenoAbiSubmitV2) +
++      ib_count * sizeof(NativeAdrenoAbiSubmitIbV2) +
++      resource_count * sizeof(NativeAdrenoAbiSubmitResourceV2);
++   if (ib_count > caps.max_ibs || resource_count > caps.max_resources || bytes > caps.max_packet_bytes) {
++      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY, "native submit exceeds advertised resource or IB limit");
++   }
++
++   uint8_t *packet = (uint8_t *)vk_zalloc(&dev->vk.alloc, bytes + 8, 8,
++                                         VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
++   if (!packet)
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++
++   ((uint32_t *)packet)[0] = DW_TUNNEL_MAGIC;
++   ((uint32_t *)packet)[1] = NativeAdrenoMethodSubmitV2;
++   NativeAdrenoAbiSubmitV2 *header = (NativeAdrenoAbiSubmitV2 *)(packet + 8);
++   header->version = NativeAdrenoSubmitVersion;
++   header->header_bytes = sizeof(*header);
++   header->total_bytes = bytes;
++   header->ib_count = ib_count;
++   header->resource_count = resource_count;
++   header->ib_offset = sizeof(*header);
++   header->resource_offset = header->ib_offset + ib_count * sizeof(NativeAdrenoAbiSubmitIbV2);
++   header->epoch = caps.epoch;
++   if (submit->fallback_reasons) {
++      header->flags = NativeAdrenoSubmitAllMapped;
++      if (submit->fallback_reasons & TU_RESOURCE_FALLBACK_DEVICE_ADDRESS)
++         header->fallback_reason |= NativeAdrenoFallbackDeviceAddress;
++      if (submit->fallback_reasons & TU_RESOURCE_FALLBACK_DESCRIPTOR_BUFFER)
++         header->fallback_reason |= NativeAdrenoFallbackDescriptorBuffer;
++      if (submit->fallback_reasons & (TU_RESOURCE_FALLBACK_SPARSE | TU_RESOURCE_FALLBACK_UPDATE_AFTER_BIND))
++         header->fallback_reason |= NativeAdrenoFallbackIncompleteTracking;
++   }
++
++   NativeAdrenoAbiSubmitIbV2 *ibs = (NativeAdrenoAbiSubmitIbV2 *)((uint8_t *)header + header->ib_offset);
++   NativeAdrenoAbiSubmitResourceV2 *resources =
++      (NativeAdrenoAbiSubmitResourceV2 *)((uint8_t *)header + header->resource_offset);
++   const struct darwin_submit_resource *objects = (const struct darwin_submit_resource *)submit->resources.data;
++   const NativeAdrenoAbiSubmitBuffer *commands = (const NativeAdrenoAbiSubmitBuffer *)submit->commands.data;
++   for (uint32_t i = 0; i < resource_count; i++) {
++      resources[i] = {objects[i].bo->darwin_handle, 0, objects[i].bo->size, objects[i].access, 0};
++   }
++   for (uint32_t i = 0; i < ib_count; i++) {
++      uint32_t resource = 0;
++      while (resource < resource_count && objects[resource].bo->darwin_handle != commands[i].handle)
++         resource++;
++      if (resource == resource_count) {
++         vk_free(&dev->vk.alloc, packet);
++         return vk_device_set_lost(&dev->vk, "native IB has no live retained BO");
++      }
++      ibs[i] = {resource, 0, commands[i].iova - objects[resource].bo->iova, commands[i].bytes};
++   }
++
++   VkResult result = VK_SUCCESS;
++   const uint64_t deadline = os_time_get_nano() + 5000000000ull;
++   for (;;) {
++      NativeAdrenoAbiSubmitV2Reply reply = {};
++      size_t output_size = sizeof(reply);
++      const kern_return_t status = IOConnectCallStructMethod(dw.conn,
++         dw.tunnel ? dw.selector : NativeAdrenoMethodSubmitV2,
++         dw.tunnel ? (void *)packet : (void *)header, bytes + (dw.tunnel ? 8 : 0),
++         &reply, &output_size);
++      if (status == KERN_SUCCESS) {
++         if (reply.epoch != caps.epoch || !reply.fence || reply.fence > UINT32_MAX) {
++            result = vk_device_set_lost(&dev->vk, "native submit returned an invalid completion identity");
++         } else {
++            *fence = reply.fence;
++         }
++         break;
++      }
++      if (status != kIOReturnBusy) {
++         result = vk_device_set_lost(&dev->vk, "native submit V2 failed: 0x%x", status);
++         break;
++      }
++      if (os_time_get_nano() >= deadline) {
++         result = vk_device_set_lost(&dev->vk, "native submit waited five seconds for resource retirement");
++         break;
++      }
++
++      pthread_mutex_lock(&dw.lock);
++      const uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
++      pthread_mutex_unlock(&dw.lock);
++      if (oldest) {
++         result = dw_wait_fence_locked_free(dev, oldest, deadline);
++         if (result != VK_SUCCESS)
++            break;
++      }
++      usleep(100);
++   }
++
++   vk_free(&dev->vk.alloc, packet);
++   return result;
++}
++
++static void
++darwin_publish_resource_fence(struct tu_darwin_queue_submit *submit, uint32_t fence)
++{
++   util_dynarray_foreach (&submit->resources, struct darwin_submit_resource, resource) {
++      p_atomic_set(&resource->bo->darwin_last_fence, fence);
++   }
++}
++
+ static VkResult
+ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+                     struct vk_sync_wait *waits, uint32_t wait_count,
+@@ -1826,6 +2325,9 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    struct tu_device *dev = queue->device;
+    struct darwin_connection &dw = *darwin_connection_for(dev);
+ 
++   if (submit->result != VK_SUCCESS)
++      return submit->result;
++
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+@@ -1837,14 +2339,23 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    uint32_t fence = 0;
+    const unsigned total = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
+    if (total) {
++      const NativeAdrenoAbiSubmitCaps caps = darwin_submit_caps(dev);
++      VkResult collected = darwin_collect_submit_resources(dev, submit, caps.version == 0);
++      if (collected != VK_SUCCESS)
++         return collected;
++
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
+-      for (unsigned at = 0; at < total; at += NativeAdrenoAbiMaxBuffers) {
++      const unsigned increment = caps.version ? total : (unsigned)NativeAdrenoAbiMaxBuffers;
++      for (unsigned at = 0; at < total; at += increment) {
+          unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
+          uint32_t chunk_fence = 0;
+-         VkResult result = darwin_submit_chunk(queue, all + at, count, &chunk_fence);
++         VkResult result = caps.version ?
++            darwin_submit_v2(queue, submit, caps, &chunk_fence) :
++            darwin_submit_chunk(queue, all + at, count, &chunk_fence);
+          if (result != VK_SUCCESS)
+             return result;
++         darwin_publish_resource_fence(submit, chunk_fence);
+          pthread_mutex_lock(&dw.lock);
+          darwin_note_fence(&dw, chunk_fence);
+          pthread_mutex_unlock(&dw.lock);
+@@ -1869,6 +2380,20 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+ 
+ /* ---- device ---- */
+ 
++static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
++darwin_GetDeviceProcAddr(VkDevice _device, const char *name)
++{
++   VK_FROM_HANDLE(tu_device, device, _device);
++   if (!strcmp(name, "vkNativeAdrenoDeviceCacheMaintenance"))
++      return (PFN_vkVoidFunction)tu_NativeAdrenoDeviceCacheMaintenance;
++
++   return vk_device_get_proc_addr(&device->vk, name);
++}
++
++static const struct vk_device_entrypoint_table darwin_device_entrypoints = {
++   .GetDeviceProcAddr = darwin_GetDeviceProcAddr,
++};
++
+ static VkResult
+ darwin_device_init(struct tu_device *dev)
+ {
+@@ -2090,6 +2615,7 @@ static const struct tu_knl darwin_knl_funcs = {
+    .queue_wait_fence = darwin_queue_wait_fence,
+    .sparse_vma_init = darwin_sparse_vma_init,
+    .sparse_vma_finish = darwin_sparse_vma_finish,
++   .device_entrypoints = &darwin_device_entrypoints,
+ };
+ 
+ VkResult
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+index 8b010ed..05de9b1 100644
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -4552,16 +4552,15 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+ 
+    result = tu_pipeline_allocate_cs(builder->device, *pipeline,
+                                     &builder->layout, builder, NULL);
+-
++   if (result != VK_SUCCESS) {
++      tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++      vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
++      return result;
++   }
+ 
+    if (set_combined_state(builder, *pipeline,
+                           VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT |
+                           VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT)) {
+-      if (result != VK_SUCCESS) {
+-         vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
+-         return result;
+-      }
+-
+       tu_emit_program_state<CHIP>(&(*pipeline)->cs, &(*pipeline)->program,
+                                   (*pipeline)->shaders);
+ 
+@@ -4590,6 +4589,13 @@ tu_pipeline_builder_build(struct tu_pipeline_builder *builder,
+ 
+    tu_pipeline_builder_emit_state<CHIP>(builder, *pipeline);
+ 
++   result = tu_cs_get_record_result(&(*pipeline)->cs);
++   if (result != VK_SUCCESS) {
++      tu_pipeline_finish(*pipeline, builder->device, builder->alloc);
++      vk_object_free(&builder->device->vk, builder->alloc, *pipeline);
++      return result;
++   }
++
+    if ((*pipeline)->type == TU_PIPELINE_GRAPHICS_LIB) {
+       struct tu_graphics_lib_pipeline *library =
+          tu_pipeline_to_graphics_lib(*pipeline);
+@@ -5042,6 +5048,15 @@ tu_compute_pipeline_create(VkDevice device,
+       tu6_emit_load_state(dev, &pipeline->base, layout);
+    }
+ 
++   result = tu_cs_get_record_result(&pipeline->base.cs);
++   if (result != VK_SUCCESS) {
++      tu_cs_finish(&pipeline->base.cs);
++      mtx_lock(&dev->pipeline_mutex);
++      tu_suballoc_bo_free(&dev->pipeline_suballoc, &pipeline->base.bo);
++      mtx_unlock(&dev->pipeline_mutex);
++      goto fail;
++   }
++
+    tu_append_executable(&pipeline->base, v, nir_initial_disasm);
+ 
+    pipeline->instrlen = v->instrlen;
+diff --git a/src/freedreno/vulkan/tu_query_pool.cc b/src/freedreno/vulkan/tu_query_pool.cc
+index 7c30e65..52c2468 100644
+--- a/src/freedreno/vulkan/tu_query_pool.cc
++++ b/src/freedreno/vulkan/tu_query_pool.cc
+@@ -410,7 +410,7 @@ tu_CreateQueryPool(VkDevice _device,
+    }
+ 
+    VkResult result = tu_bo_init_new_cached(device, &pool->vk.base, &pool->bo,
+-         pCreateInfo->queryCount * slot_size, TU_BO_ALLOC_NO_FLAGS, "query pool");
++         pCreateInfo->queryCount * slot_size, TU_BO_ALLOC_INTERNAL_RESOURCE, "query pool");
+    if (result != VK_SUCCESS) {
+       tu_query_pool_destroy(device, pool, pAllocator);
+       return result;
+@@ -901,6 +901,8 @@ tu_CmdCopyQueryPoolResults(VkCommandBuffer commandBuffer,
+    VK_FROM_HANDLE(tu_query_pool, pool, queryPool);
+    VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
+    struct tu_cs *cs = &cmdbuf->cs;
++
++   tu_cmd_use_buffer(cmdbuf, buffer, TU_RESOURCE_WRITE);
+    assert(firstQuery + queryCount <= pool->size);
+ 
+    switch (pool->vk.query_type) {
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index da6c2f3..de49069 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -115,7 +115,7 @@ get_vis_stream_patchpoint_cs(struct tu_cmd_buffer *cmd,
+          tu_cs_init_suballoc(cs, cmd->device, &patchpoint_cs->cs_bo);
+          tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
+          *fence_iova = patchpoint_cs->fence_bo.iova;
+-         return VK_SUCCESS;
++         return tu_cs_get_record_result(cs);
+       }
+    }
+ 
+@@ -152,7 +152,7 @@ get_vis_stream_patchpoint_cs(struct tu_cmd_buffer *cmd,
+    tu_cs_begin_sub_stream(cs, cs_size, sub_cs);
+    *fence_iova = patchpoint_cs.fence_bo.iova;
+ 
+-   return VK_SUCCESS;
++   return tu_cs_get_record_result(cs);
+ }
+ 
+ static VkResult
+@@ -285,6 +285,10 @@ resolve_vis_stream_patchpoints(struct tu_queue *queue,
+          tu_cs_emit(&sub_cs, 1);
+ 
+          struct tu_cs_entry entry = tu_cs_end_sub_stream(&cs, &sub_cs);
++         result = tu_cs_get_record_result(&cs);
++         if (result != VK_SUCCESS)
++            return result;
++
+          submit_add_entries(queue->device, submit, dump_cmds, &entry, 1);
+       }
+ 
+@@ -427,7 +431,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+ 
+    for (unsigned i = 0; i < vk_submit->command_buffer_count; i++) {
+       VkResult result =
+-         vk_command_buffer_get_record_result(vk_submit->command_buffers[i]);
++         tu_cmd_record_result((struct tu_cmd_buffer *)vk_submit->command_buffers[i]);
+       if (result != VK_SUCCESS) {
+          return result;
+       }
+@@ -459,7 +463,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+     * Their recording errors must reach the caller before any kernel submit.
+     */
+    for (unsigned i = 0; i < cmdbuf_count; i++) {
+-      result = vk_command_buffer_get_record_result(&cmd_buffers[i]->vk);
++      result = tu_cmd_record_result(cmd_buffers[i]);
+       if (result != VK_SUCCESS) {
+          if (cmd_buffers !=
+              (struct tu_cmd_buffer **) vk_submit->command_buffers) {
+@@ -483,19 +487,33 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    struct tu_u_trace_submission_data *u_trace_submission_data = NULL;
+ 
+    void *submit = tu_submit_create(device);
+-   if (!submit)
++   if (!submit) {
++      pthread_mutex_unlock(&device->submit_mutex);
++      result = VK_ERROR_OUT_OF_HOST_MEMORY;
+       goto fail_create_submit;
++   }
+ 
+    result = resolve_vis_stream_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+    if (result != VK_SUCCESS)
+-      goto out;
++      goto out_locked;
+ 
+    result = resolve_cb_control_patchpoints(queue, submit, &dump_cmds,
+                                            cmd_buffers, cmdbuf_count);
+ 
+    if (result != VK_SUCCESS)
+-      goto out;
++      goto out_locked;
++
++#ifdef TU_HAS_DARWIN
++   if (cmd_buffers != (struct tu_cmd_buffer **) vk_submit->command_buffers) {
++      for (uint32_t i = 0; i < vk_submit->command_buffer_count; i++) {
++         result = tu_darwin_submit_add_resources(device, submit,
++            (struct tu_cmd_buffer *)vk_submit->command_buffers[i]);
++         if (result != VK_SUCCESS)
++            goto out_locked;
++      }
++   }
++#endif
+ 
+    if (has_trace_points) {
+       tu_u_trace_submission_data_create(
+@@ -506,6 +524,16 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+       struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
+       struct tu_cs *cs = &cmd_buffer->cs;
+ 
++      result = tu_cmd_record_result(cmd_buffer);
++      if (result != VK_SUCCESS)
++         goto out_locked;
++
++#ifdef TU_HAS_DARWIN
++      result = tu_darwin_submit_add_resources(device, submit, cmd_buffer);
++      if (result != VK_SUCCESS)
++         goto out_locked;
++#endif
++
+       if (perf_pass_index != ~0) {
+          struct tu_cs_entry *perf_cs_entry =
+             &cmd_buffer->device->perfcntrs_pass_cs_entries[perf_pass_index];
+@@ -519,6 +547,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+       if (u_trace_submission_data &&
+           u_trace_submission_data->timestamp_copy_data) {
+          struct tu_cs *cs = &u_trace_submission_data->timestamp_copy_data->cs;
++         result = tu_cs_get_record_result(cs);
++         if (result != VK_SUCCESS)
++            goto out_locked;
++
+          submit_add_entries(device, submit, &dump_cmds, cs->entries,
+                             cs->entry_count);
+       }
+@@ -526,6 +558,10 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+ 
+    autotune_cs = device->autotune->on_submit(cmd_buffers, cmdbuf_count);
+    if (autotune_cs) {
++      result = tu_cs_get_record_result(autotune_cs);
++      if (result != VK_SUCCESS)
++         goto out_locked;
++
+       submit_add_entries(device, submit, &dump_cmds, autotune_cs->entries,
+                          autotune_cs->entry_count);
+    }
+@@ -571,8 +607,6 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+       fd_rd_output_end(rd_output);
+    }
+ 
+-   util_dynarray_fini(&dump_cmds);
+-
+ #ifdef HAVE_PERFETTO
+    if (u_trace_should_process(&device->trace_context)) {
+       for (int i = 0; i < vk_submit->command_buffer_count; i++)
+@@ -620,8 +654,12 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
+    pthread_cond_broadcast(&queue->device->timeline_cond);
+ 
+    u_trace_context_process(&device->trace_context, false);
++   goto out;
+ 
++out_locked:
++   pthread_mutex_unlock(&device->submit_mutex);
+ out:
++   util_dynarray_fini(&dump_cmds);
+    tu_submit_finish(device, submit);
+ 
+ fail_create_submit:
+diff --git a/src/freedreno/vulkan/tu_shader.cc b/src/freedreno/vulkan/tu_shader.cc
+index d99d55c..2413157 100644
+--- a/src/freedreno/vulkan/tu_shader.cc
++++ b/src/freedreno/vulkan/tu_shader.cc
+@@ -2914,7 +2914,9 @@ tu_upload_variant(struct tu_cs *cs,
+     * and total size is always aligned correctly
+     * note: an assert in tu6_emit_xs_config validates the alignment
+     */
+-   tu_cs_alloc(cs, variant->info.size / 4, 1, &memory);
++   if (tu_cs_alloc(cs, variant->info.size / 4, 1, &memory) != VK_SUCCESS) {
++      return 0;
++   }
+ 
+    memcpy(memory.map, variant->bin, variant->info.size);
+    return memory.iova;
+@@ -3058,7 +3060,19 @@ tu_upload_shader(struct tu_device *dev,
+       }
+    }
+ 
+-   return VK_SUCCESS;
++   result = tu_cs_get_record_result(&shader->cs);
++   if (result != VK_SUCCESS) {
++      tu_cs_finish(&shader->cs);
++      pthread_mutex_lock(&dev->pipeline_mutex);
++      tu_suballoc_bo_free(&dev->pipeline_suballoc, &shader->bo);
++      pthread_mutex_unlock(&dev->pipeline_mutex);
++      if (shader->pvtmem_bo) {
++         tu_bo_finish(dev, shader->pvtmem_bo);
++         shader->pvtmem_bo = nullptr;
++      }
++   }
++
++   return result;
+ }
+ 
+ static bool
+@@ -3121,12 +3135,15 @@ tu_shader_serialize(struct vk_pipeline_cache_object *object,
+    struct tu_shader *shader =
+       container_of(object, struct tu_shader, base);
+ 
++   blob_write_uint32(blob, 0x54555348);
++   blob_write_uint32(blob, 1);
+    blob_write_bytes(blob, &shader->const_state, sizeof(shader->const_state));
+    blob_write_bytes(blob, &shader->dynamic_descriptor_sizes,
+                     sizeof(shader->dynamic_descriptor_sizes));
+    blob_write_uint32(blob, shader->view_mask);
+    blob_write_uint8(blob, shader->active_desc_sets);
+    blob_write_uint8(blob, shader->per_layer_viewport);
++   blob_write_uint8(blob, shader->uses_buffer_device_address);
+ 
+    ir3_store_variant(blob, shader->variant);
+ 
+@@ -3159,6 +3176,12 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
+                       size_t key_size,
+                       struct blob_reader *blob)
+ {
++   const uint32_t magic = blob_read_uint32(blob);
++   const uint32_t version = blob_read_uint32(blob);
++   if (blob->overrun || magic != 0x54555348 || version != 1) {
++      return NULL;
++   }
++
+    struct tu_device *dev =
+       container_of(cache->base.device, struct tu_device, vk);
+    struct tu_shader *shader =
+@@ -3173,6 +3196,7 @@ tu_shader_deserialize(struct vk_pipeline_cache *cache,
+    shader->view_mask = blob_read_uint32(blob);
+    shader->active_desc_sets = blob_read_uint8(blob);
+    shader->per_layer_viewport = blob_read_uint8(blob);
++   shader->uses_buffer_device_address = blob_read_uint8(blob);
+ 
+    shader->variant = ir3_retrieve_variant(blob, dev->compiler, NULL);
+ 
+@@ -3353,6 +3377,51 @@ tu_lower_nir(struct tu_device *dev,
+       lower_alpha_to_coverage(nir);
+ }
+ 
++static bool
++tu_shader_uses_buffer_device_address(nir_shader *nir)
++{
++   nir_foreach_function_impl(impl, nir) {
++      nir_foreach_block(block, impl) {
++         nir_foreach_instr(instr, block) {
++            if (instr->type == nir_instr_type_deref) {
++               if (nir_deref_mode_may_be(nir_instr_as_deref(instr),
++                                         nir_var_mem_global)) {
++                  return true;
++               }
++
++               continue;
++            }
++
++            if (instr->type != nir_instr_type_intrinsic) {
++               continue;
++            }
++
++            switch (nir_instr_as_intrinsic(instr)->intrinsic) {
++            case nir_intrinsic_load_global:
++            case nir_intrinsic_load_global_2x32:
++            case nir_intrinsic_load_global_bounded:
++            case nir_intrinsic_load_global_constant:
++            case nir_intrinsic_load_global_constant_offset:
++            case nir_intrinsic_load_global_constant_bounded:
++            case nir_intrinsic_store_global:
++            case nir_intrinsic_store_global_2x32:
++            case nir_intrinsic_global_atomic:
++            case nir_intrinsic_global_atomic_2x32:
++            case nir_intrinsic_global_atomic_swap:
++            case nir_intrinsic_global_atomic_swap_2x32:
++            case nir_intrinsic_load_global_ir3:
++            case nir_intrinsic_store_global_ir3:
++               return true;
++            default:
++               break;
++            }
++         }
++      }
++   }
++
++   return false;
++}
++
+ VkResult
+ tu_shader_create(struct tu_device *dev,
+                  struct tu_shader **shader_out,
+@@ -3372,6 +3441,9 @@ tu_shader_create(struct tu_device *dev,
+ 
+    shader->per_layer_viewport = info->per_layer_viewport;
+ 
++   /* UBO and SSBO instructions still carry descriptor indices at this point. */
++   shader->uses_buffer_device_address = tu_shader_uses_buffer_device_address(nir);
++
+    if (nir->info.stage == MESA_SHADER_FRAGMENT &&
+        key->fdm_per_layer) {
+       shader->fs.max_fdm_layers = key->max_fdm_layers;
+@@ -3830,6 +3902,12 @@ tu_empty_shader_create(struct tu_device *dev,
+    TU_CALLX(dev, tu6_emit_variant)(&sub_cs, stage, NULL, &pvtmem_config, 0, 0);
+    shader->state = tu_cs_end_draw_state(&shader->cs, &sub_cs);
+ 
++   result = tu_cs_get_record_result(&shader->cs);
++   if (result != VK_SUCCESS) {
++      tu_shader_destroy(dev, shader);
++      return result;
++   }
++
+    *shader_out = shader;
+    return VK_SUCCESS;
+ }
+diff --git a/src/freedreno/vulkan/tu_shader.h b/src/freedreno/vulkan/tu_shader.h
+index 1cd0e89..bc77d17 100644
+--- a/src/freedreno/vulkan/tu_shader.h
++++ b/src/freedreno/vulkan/tu_shader.h
+@@ -91,6 +91,9 @@ struct tu_shader
+     */
+    bool per_layer_viewport;
+ 
++   /* The shader accesses memory through physical GPU addresses. */
++   bool uses_buffer_device_address;
++
+    union {
+       struct {
+          unsigned patch_type;
