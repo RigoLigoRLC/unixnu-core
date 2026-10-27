@@ -25,7 +25,7 @@ index d748039..2f2293e 100644
        /* Transfer the entries from the command buffers to the active queue. */
        struct tu_cmd_buffer *cmdbuf = cmd_buffers[i];
 diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
-index 1d33085..75e6c5d 100644
+index 1d33085..671b659 100644
 --- a/src/freedreno/vulkan/tu_clear_blit.cc
 +++ b/src/freedreno/vulkan/tu_clear_blit.cc
 @@ -2734,6 +2734,9 @@ tu_CmdBlitImage2(VkCommandBuffer commandBuffer,
@@ -87,8 +87,11 @@ index 1d33085..75e6c5d 100644
     struct tu_cs_memory tmp;
     VkResult result = tu_cs_alloc(&cmd->sub_cs, DIV_ROUND_UP(dataSize, 64), 64 / 4, &tmp);
     if (result != VK_SUCCESS) {
-@@ -3894,6 +3911,8 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
+@@ -3892,8 +3909,11 @@ tu_CmdFillBuffer(VkCommandBuffer commandBuffer,
+                  VkDeviceSize fillSize,
+                  uint32_t data)
  {
++   VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_buffer, buffer, dstBuffer);
  
 +   tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_WRITE);
@@ -96,7 +99,7 @@ index 1d33085..75e6c5d 100644
     fillSize = vk_buffer_range(&buffer->vk, dstOffset, fillSize);
  
     VkDeviceAddress dst_va = vk_buffer_address(&buffer->vk, dstOffset);
-@@ -3910,6 +3929,9 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
+@@ -3910,6 +3930,9 @@ tu_CmdResolveImage2(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, src_image, pResolveImageInfo->srcImage);
     VK_FROM_HANDLE(tu_image, dst_image, pResolveImageInfo->dstImage);
@@ -106,7 +109,7 @@ index 1d33085..75e6c5d 100644
     const struct blit_ops *ops = &r2d_ops<CHIP>;
     struct tu_cs *cs = &cmd->cs;
  
-@@ -4306,6 +4328,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
+@@ -4306,6 +4329,8 @@ tu_CmdClearColorImage(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, image, image_h);
  
@@ -115,7 +118,7 @@ index 1d33085..75e6c5d 100644
     trace_start_clear_color_image(&cmd->trace, &cmd->cs, cmd, image->vk.format);
  
     bool use_generic_clear = use_generic_clear_for_image_clear(cmd, image);
-@@ -4348,6 +4372,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
+@@ -4348,6 +4373,8 @@ tu_CmdClearDepthStencilImage(VkCommandBuffer commandBuffer,
     VK_FROM_HANDLE(tu_cmd_buffer, cmd, commandBuffer);
     VK_FROM_HANDLE(tu_image, image, image_h);
  
