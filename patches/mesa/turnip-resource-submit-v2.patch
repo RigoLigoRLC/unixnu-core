@@ -128,7 +128,7 @@ index 1d33085..671b659 100644
                                           image->vk.format);
  
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
-index bcb7724..29e396b 100644
+index bcb7724..540a056 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -33,6 +33,101 @@ enum tu_cmd_buffer_status {
@@ -594,7 +594,7 @@ index bcb7724..29e396b 100644
           const VkBufferMemoryBarrier2 *barrier =
              &dep_info->pBufferMemoryBarriers[i];
           VK_FROM_HANDLE(tu_buffer, buffer, barrier->buffer);
-+         tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++         tu_cmd_use_buffer(cmd, buffer, TU_RESOURCE_READ);
           bool sparse_aliasing =
              buffer->vk.create_flags & VK_BUFFER_CREATE_SPARSE_ALIASED_BIT;
           VkPipelineStageFlags2 sanitized_src_stage =
@@ -602,7 +602,7 @@ index bcb7724..29e396b 100644
              &dep_info->pImageMemoryBarriers[i];
           VK_FROM_HANDLE(tu_image, image, barrier->image);
  
-+         tu_cmd_use_image(cmd, image, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++         tu_cmd_use_image(cmd, image, TU_RESOURCE_READ);
 +
           VkImageLayout old_layout = barrier->oldLayout;
  
