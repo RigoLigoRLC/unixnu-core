@@ -127,3 +127,15 @@ diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl
  
     return vk_device_get_proc_addr(&device->vk, name);
  }
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -286,7 +286,7 @@
+ VkResult tu_darwin_submit_add_cs_resources(struct tu_device *dev, void *submit,
+                                            const struct tu_cs *cs);
+ VKAPI_ATTR VkBool32 VKAPI_CALL
+-tu_NativeAdrenoDeviceCacheMaintenance(VkDevice device);
++tu_NativeAdrenoDeviceHostCoherent(VkDevice device);
+ #endif
+ 
+ void tu_bo_set_metadata(struct tu_device *dev, struct tu_bo *bo,
