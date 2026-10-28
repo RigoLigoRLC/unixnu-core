@@ -43,6 +43,26 @@ memory on unified-memory GPUs. The frontend's device query recognizes hardware
 coherence and kernel-managed visibility; either removes IOSurface flush-range
 collection and userspace cache operations from submission and completion.
 
+The SM7325 adaptation passes resource declarations, render memory barriers and
+fence stages through the frontend into metal2vulkan. Encoding accumulates access
+summaries, and submission exports GPU writes to the CPU only for allocations
+with CPU consumers. Turnip's asynchronous Darwin extension submits timeline
+dependencies and output points to the kernel scheduler; CPU waits sleep on the
+requested point. Display holds a read of the IOSurface backing until DPU has
+switched to its replacement.
+
+Argument encoders, indirect command buffers and tessellation descriptors use
+the runtime's corresponding objects. Default sample-position queries read the
+Vulkan standard-location property and the runtime's supported sample counts.
+On iPadOS 17, Metal IO queues use the inherited system implementation with the
+bridge's blit encoders, shared events and stable resource trace identifiers.
+
+PVRTC sampling uses a GPU-decoded RGBA8 image whose mip levels are refreshed
+after uploads and blits. Depth Min/Max resolve can select samples into an integer
+color attachment and transfer those bits to the destination depth aspect.
+These implementations are part of the SM-T733 source adaptation; its device
+repository records build identities and hardware results.
+
 Device answers are cached by selector and argument. The frontend disables no-copy
 rebind replay logs. A padded render target aliases its buffer only when the height
 is divisible by four, its width rounded to 16 texels fits each row pitch, and the

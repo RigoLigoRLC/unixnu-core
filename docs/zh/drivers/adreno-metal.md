@@ -38,6 +38,22 @@ Private 资源以及实际分配存储的 Memoryless 附件均优先选择缓存
 前端查询识别硬件一致性和内核负责的可见性处理；两者都会移除提交和完成路径
 中的 IOSurface 刷新范围收集及用户态缓存操作。
 
+SM7325 适配将资源声明、render memory barrier 和 fence 的阶段参数传给
+metal2vulkan。编码时累加访问摘要，提交时只为存在 CPU 消费者的分配对象
+导出 GPU 写入。Turnip 的 Darwin 异步扩展把 timeline 依赖和输出时间点交给
+内核调度器，CPU 等待在所需时间点上睡眠。显示驱动持有 IOSurface backing
+的读占用，直到 DPU 切换到下一张表面。
+
+参数编码器、间接命令缓冲区和细分描述符接入 runtime 的对应对象。默认采样
+位置查询读取 Vulkan 的标准位置属性及 runtime 支持的采样数。iPadOS 17 的
+Metal IO 队列沿继承的系统实现运行，使用桥接的 blit encoder、shared event
+和稳定资源追踪标识。
+
+PVRTC 采样使用 GPU 解码的 RGBA8 图像，上传和 blit 后刷新相应 mip 层。
+深度 Min/Max resolve 可以在整数颜色附件中保存所选样本，再将位模式传送到
+目标深度 aspect。这些实现属于 SM-T733 源码适配，构建身份和设备结果由设备
+仓库记录。
+
 设备查询按 selector 和参数缓存，前端关闭 no-copy 重绑所需的编码器回放记录。
 带行间距的 render target 只有在高度是 4 的倍数、宽度向上取整至 16 像素后的
 字节数不超过行距、最后一行不越过分配范围时，才直接别名原缓冲区；其余使用

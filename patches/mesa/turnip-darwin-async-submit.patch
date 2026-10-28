@@ -1,0 +1,601 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -16,6 +16,7 @@
+ #include <mach/mach.h>
+ 
+ #include "NativeAdrenoABI.h"
++#include "tu_darwin_async_abi.h"
+ 
+ #include "util/os_time.h"
+ #include "util/list.h"
+@@ -57,6 +58,7 @@
+    NativeAdrenoAbiDeviceInfo info;
+    NativeAdrenoAbiParams params;
+    NativeAdrenoAbiSubmitCaps submit_caps;
++   NativeAdrenoAbiAsyncCaps async_caps;
+    bool submit_caps_checked;
+ };
+ 
+@@ -501,6 +503,12 @@
+                                "NativeAdreno query failed: 0x%x", kr);
+    }
+    dw.open = true;
++   dw.async_caps = {};
++   if (dw_call(connection, NativeAdrenoMethodQueryAsync, NULL, 0,
++               &dw.async_caps, sizeof(dw.async_caps)) != KERN_SUCCESS ||
++       dw.async_caps.version != NativeAdrenoAsyncVersion) {
++      dw.async_caps = {};
++   }
+    dw.inflight_count = 0;
+    dw.last_fence = 0;
+    return VK_SUCCESS;
+@@ -528,26 +536,31 @@
+    return vk_device_set_lost(&dev->vk, "%s failed: 0x%x", what, kr);
+ }
+ 
+-/* Waits for a fence in short kernel waits so the connection lock is never held for long. */
++static uint64_t
++darwin_relative_timeout(uint64_t absolute)
++{
++   if (absolute == UINT64_MAX) {
++      return UINT64_MAX;
++   }
++   const uint64_t now = os_time_get_nano();
++   return absolute > now ? absolute - now : 0;
++}
++
++/* The kernel sleeps with its submission lock released until the exact
++ * completion predicate changes or the caller's deadline expires. */
+ static VkResult
+ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns)
+ {
+-   for (;;) {
+-      uint64_t now = os_time_get_nano();
+-      uint64_t slice = 1000000; /* 1 ms */
+-      if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
+-         slice = 0;
+-      NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
+-      kern_return_t kr = dw_call(dev, NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
+-      if (kr == KERN_SUCCESS)
+-         return VK_SUCCESS;
+-      if (kr != kIOReturnTimeout)
+-         return dw_status_to_vk(dev, kr, "wait fence");
+-      if (slice == 0)
+-         return VK_TIMEOUT;
+-      if (abs_timeout_ns != UINT64_MAX && os_time_get_nano() >= abs_timeout_ns)
+-         return VK_TIMEOUT;
++   const struct darwin_connection *connection = darwin_connection_for(dev);
++   const uint64_t timeout = darwin_relative_timeout(abs_timeout_ns);
++   if (connection->async_caps.version) {
++      NativeAdrenoAbiCompletionWait request = {fence, timeout, connection->async_caps.epoch};
++      return dw_status_to_vk(dev, dw_call(dev, NativeAdrenoMethodWaitCompletion,
++         &request, sizeof(request), NULL, 0), "wait completion");
+    }
++   NativeAdrenoAbiWaitFence request = {.fence = fence, .timeout_ns = timeout};
++   return dw_status_to_vk(dev, dw_call(dev, NativeAdrenoMethodWaitFence,
++      &request, sizeof(request), NULL, 0), "wait fence");
+ }
+ 
+ static VkResult darwin_collect_retired(struct tu_device *dev);
+@@ -571,7 +584,17 @@
+ static int
+ darwin_submitqueue_new(struct tu_device *dev, struct tu_queue *queue)
+ {
+-   /* The kernel client has queue 0 from open(); every submission rides the one shared ring. */
++   if (darwin_connection_for(dev)->async_caps.version) {
++      NativeAdrenoAbiQueue request = {};
++      NativeAdrenoAbiQueueReply reply = {};
++      const kern_return_t status = dw_call(dev, NativeAdrenoMethodCreateQueue,
++         &request, sizeof(request), &reply, sizeof(reply));
++      if (status != KERN_SUCCESS) {
++         return -1;
++      }
++      queue->msm_queue_id = reply.queue;
++      return 0;
++   }
+    queue->msm_queue_id = 0;
+    return 0;
+ }
+@@ -579,6 +602,10 @@
+ static void
+ darwin_submitqueue_close(struct tu_device *dev, struct tu_queue *queue)
+ {
++   if (darwin_connection_for(dev)->async_caps.version) {
++      const NativeAdrenoAbiQueue request = {queue->msm_queue_id};
++      dw_call(dev, NativeAdrenoMethodCloseQueue, &request, sizeof(request), NULL, 0);
++   }
+ }
+ 
+ /* ---- GPU address space: the client picks addresses out of [va_start, va_start + va_size). ---- */
+@@ -912,6 +939,12 @@
+       VkResult result = destroy ? darwin_release_bo_storage(dev, &node->bo) :
+          node->bo.fence && node->bo.fence != observed_fence ?
+          dw_wait_fence_raw(dev, node->bo.fence, os_time_get_nano() + 1000000) : VK_SUCCESS;
++      if (!destroy && result == VK_SUCCESS && retire->connection.async_caps.version) {
++         const NativeAdrenoAbiBoWait request = {node->bo.handle, 1000000,
++            retire->connection.async_caps.epoch};
++         result = dw_status_to_vk(dev, dw_call(dev, NativeAdrenoMethodWaitBoIdle,
++            &request, sizeof(request), NULL, 0), "wait BO consumers");
++      }
+ 
+       pthread_mutex_lock(&retire->lock);
+       if (destroy) {
+@@ -1950,6 +1983,15 @@
+    struct tu_bo *bo;
+    uint32_t access;
+ };
++
++static int
++darwin_resource_handle_compare(const void *left, const void *right)
++{
++   const darwin_submit_resource *a = (const darwin_submit_resource *)left;
++   const darwin_submit_resource *b = (const darwin_submit_resource *)right;
++   return a->bo->darwin_handle < b->bo->darwin_handle ? -1 :
++      a->bo->darwin_handle > b->bo->darwin_handle;
++}
+ 
+ static NativeAdrenoAbiSubmitCaps
+ darwin_submit_caps(struct tu_device *dev)
+@@ -2211,6 +2253,9 @@
+       }
+    }
+    submit->native_ranges.size = merged * sizeof(*ranges);
++   qsort(submit->resources.data,
++      util_dynarray_num_elements(&submit->resources, struct darwin_submit_resource),
++      sizeof(struct darwin_submit_resource), darwin_resource_handle_compare);
+    return VK_SUCCESS;
+ }
+ 
+@@ -2379,6 +2424,174 @@
+    .move = vk_darwin_sync_move,
+    .wait = vk_darwin_sync_wait,
+    .wait_many = vk_darwin_sync_wait_many,
++};
++
++/* vk_darwin_async_sync owns one kernel timeline or binary payload. Accepted
++ * jobs retain that payload, so reset and move can replace its userspace lease
++ * while earlier queued work still refers to the original object. */
++struct vk_darwin_async_sync {
++   struct vk_sync vk;
++   uint64_t handle;
++};
++
++static VkResult
++darwin_async_create(struct tu_device *device, bool timeline, uint64_t initial,
++                    uint64_t *handle)
++{
++   const NativeAdrenoAbiSyncCreate request = {initial,
++      timeline ? NativeAdrenoAsyncTimeline : 0u, 0};
++   NativeAdrenoAbiSyncHandle reply = {};
++   const kern_return_t status = dw_call(device, NativeAdrenoMethodSyncCreate,
++      &request, sizeof(request), &reply, sizeof(reply));
++   if (status == kIOReturnNoMemory || status == kIOReturnNoResources) {
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   if (status != KERN_SUCCESS) {
++      return dw_status_to_vk(device, status, "create kernel sync");
++   }
++   *handle = reply.handle;
++   return VK_SUCCESS;
++}
++
++static void
++darwin_async_release(struct tu_device *device, uint64_t handle)
++{
++   if (handle) {
++      const NativeAdrenoAbiSyncHandle request = {handle};
++      dw_call(device, NativeAdrenoMethodSyncRelease, &request, sizeof(request), NULL, 0);
++   }
++}
++
++static VkResult
++vk_darwin_async_init(struct vk_device *base, struct vk_sync *sync, uint64_t initial)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *payload = container_of(sync, struct vk_darwin_async_sync, vk);
++   payload->handle = 0;
++   return darwin_async_create(device, sync->flags & VK_SYNC_IS_TIMELINE, initial, &payload->handle);
++}
++
++static void
++vk_darwin_async_finish(struct vk_device *base, struct vk_sync *sync)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *payload = container_of(sync, struct vk_darwin_async_sync, vk);
++   darwin_async_release(device, payload->handle);
++   payload->handle = 0;
++}
++
++static VkResult
++vk_darwin_async_reset(struct vk_device *base, struct vk_sync *sync)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *payload = container_of(sync, struct vk_darwin_async_sync, vk);
++   uint64_t replacement = 0;
++   const VkResult result = darwin_async_create(device, false, 0, &replacement);
++   if (result != VK_SUCCESS) {
++      return result;
++   }
++   darwin_async_release(device, payload->handle);
++   payload->handle = replacement;
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_darwin_async_move(struct vk_device *base, struct vk_sync *dst, struct vk_sync *src)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *target = container_of(dst, struct vk_darwin_async_sync, vk);
++   struct vk_darwin_async_sync *source = container_of(src, struct vk_darwin_async_sync, vk);
++   uint64_t replacement = 0;
++   const VkResult result = darwin_async_create(device, false, 0, &replacement);
++   if (result != VK_SUCCESS) {
++      return result;
++   }
++   darwin_async_release(device, target->handle);
++   target->handle = source->handle;
++   source->handle = replacement;
++   return VK_SUCCESS;
++}
++
++static VkResult
++vk_darwin_async_signal(struct vk_device *base, struct vk_sync *sync, uint64_t value)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *payload = container_of(sync, struct vk_darwin_async_sync, vk);
++   const NativeAdrenoAbiSyncPoint request = {payload->handle,
++      sync->flags & VK_SYNC_IS_TIMELINE ? value : 1};
++   return dw_status_to_vk(device, dw_call(device, NativeAdrenoMethodSyncSignal,
++      &request, sizeof(request), NULL, 0), "signal kernel sync");
++}
++
++static VkResult
++vk_darwin_async_value(struct vk_device *base, struct vk_sync *sync, uint64_t *value)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   struct vk_darwin_async_sync *payload = container_of(sync, struct vk_darwin_async_sync, vk);
++   const NativeAdrenoAbiSyncHandle request = {payload->handle};
++   NativeAdrenoAbiSyncValue reply = {};
++   const VkResult result = dw_status_to_vk(device, dw_call(device, NativeAdrenoMethodSyncQuery,
++      &request, sizeof(request), &reply, sizeof(reply)), "query kernel timeline");
++   if (result == VK_SUCCESS) {
++      *value = reply.value;
++   }
++   return result;
++}
++
++static VkResult
++vk_darwin_async_wait_many(struct vk_device *base, uint32_t count,
++                         const struct vk_sync_wait *waits,
++                         enum vk_sync_wait_flags flags, uint64_t absolute)
++{
++   struct tu_device *device = container_of(base, struct tu_device, vk);
++   if (count > NativeAdrenoAsyncMaxWaits) {
++      return VK_ERROR_OUT_OF_HOST_MEMORY;
++   }
++   NativeAdrenoAbiSyncWait request = {};
++   request.version = NativeAdrenoAsyncVersion;
++   request.count = count;
++   request.epoch = darwin_connection_for(device)->async_caps.epoch;
++   request.timeout_ns = darwin_relative_timeout(absolute);
++   if (flags & VK_SYNC_WAIT_ANY) {
++      request.flags |= NativeAdrenoAsyncWaitAny;
++   }
++   if (flags & VK_SYNC_WAIT_PENDING) {
++      request.flags |= NativeAdrenoAsyncWaitPending;
++   }
++   for (uint32_t at = 0; at < count; ++at) {
++      const struct vk_darwin_async_sync *payload =
++         container_of(waits[at].sync, struct vk_darwin_async_sync, vk);
++      request.points[at] = {payload->handle,
++         waits[at].sync->flags & VK_SYNC_IS_TIMELINE ? waits[at].wait_value : 1};
++   }
++   return dw_status_to_vk(device, dw_call(device, NativeAdrenoMethodSyncWait,
++      &request, sizeof(request), NULL, 0), "wait kernel sync");
++}
++
++static VkResult
++vk_darwin_async_wait(struct vk_device *device, struct vk_sync *sync, uint64_t value,
++                    enum vk_sync_wait_flags flags, uint64_t absolute)
++{
++   const struct vk_sync_wait wait = {.sync = sync, .wait_value = value};
++   return vk_darwin_async_wait_many(device, 1, &wait, flags, absolute);
++}
++
++static const struct vk_sync_type vk_darwin_async_sync_type = {
++   .size = sizeof(struct vk_darwin_async_sync),
++   .features = (enum vk_sync_features)(VK_SYNC_FEATURE_BINARY |
++      VK_SYNC_FEATURE_TIMELINE | VK_SYNC_FEATURE_GPU_WAIT |
++      VK_SYNC_FEATURE_GPU_MULTI_WAIT | VK_SYNC_FEATURE_CPU_WAIT |
++      VK_SYNC_FEATURE_CPU_RESET | VK_SYNC_FEATURE_CPU_SIGNAL |
++      VK_SYNC_FEATURE_WAIT_ANY | VK_SYNC_FEATURE_WAIT_PENDING |
++      VK_SYNC_FEATURE_WAIT_BEFORE_SIGNAL),
++   .init = vk_darwin_async_init,
++   .finish = vk_darwin_async_finish,
++   .signal = vk_darwin_async_signal,
++   .get_value = vk_darwin_async_value,
++   .reset = vk_darwin_async_reset,
++   .move = vk_darwin_async_move,
++   .wait = vk_darwin_async_wait,
++   .wait_many = vk_darwin_async_wait_many,
+ };
+ 
+ static void
+@@ -2430,19 +2643,27 @@
+ 
+ static VkResult
+ darwin_submit_v2(struct tu_queue *queue, struct tu_darwin_queue_submit *submit,
+-                  const NativeAdrenoAbiSubmitCaps &caps, uint32_t *fence)
++                  const NativeAdrenoAbiSubmitCaps &caps, uint32_t *fence,
++                  struct vk_sync_wait *waits = NULL, uint32_t wait_count = 0,
++                  struct vk_sync_signal *signals = NULL, uint32_t signal_count = 0)
+ {
+    struct tu_device *dev = queue->device;
+    struct darwin_connection &dw = *darwin_connection_for(dev);
+    const uint32_t ib_count = util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer);
+    const uint32_t resource_count =
+       util_dynarray_num_elements(&submit->native_ranges, NativeAdrenoAbiSubmitResourceV2);
+-   const size_t bytes = sizeof(NativeAdrenoAbiSubmitV2) +
++   const bool asynchronous = dw.async_caps.version != 0;
++   const size_t submit_bytes = sizeof(NativeAdrenoAbiSubmitV2) +
+       ib_count * sizeof(NativeAdrenoAbiSubmitIbV2) +
+       resource_count * sizeof(NativeAdrenoAbiSubmitResourceV2);
++   const size_t bytes = submit_bytes + (asynchronous ? sizeof(NativeAdrenoAbiSubmitAsync) +
++      (wait_count + signal_count) * sizeof(NativeAdrenoAbiSyncPoint) : 0);
+    if (ib_count > caps.max_ibs || resource_count > caps.max_resources || bytes > caps.max_packet_bytes) {
+       return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY, "native submit exceeds advertised resource or IB limit");
+    }
++   if (wait_count > dw.async_caps.max_waits || signal_count > dw.async_caps.max_signals) {
++      return vk_errorf(dev, VK_ERROR_OUT_OF_HOST_MEMORY, "native submission exceeds dependency capacity");
++   }
+ 
+    uint8_t *packet = (uint8_t *)vk_zalloc(&dev->vk.alloc, bytes + 8, 8,
+                                          VK_SYSTEM_ALLOCATION_SCOPE_COMMAND);
+@@ -2450,16 +2671,45 @@
+       return VK_ERROR_OUT_OF_HOST_MEMORY;
+ 
+    ((uint32_t *)packet)[0] = DW_TUNNEL_MAGIC;
+-   ((uint32_t *)packet)[1] = NativeAdrenoMethodSubmitV2;
+-   NativeAdrenoAbiSubmitV2 *header = (NativeAdrenoAbiSubmitV2 *)(packet + 8);
++   const uint32_t method = asynchronous ? NativeAdrenoMethodSubmitAsync : NativeAdrenoMethodSubmitV2;
++   ((uint32_t *)packet)[1] = method;
++   NativeAdrenoAbiSubmitAsync *async = asynchronous ? (NativeAdrenoAbiSubmitAsync *)(packet + 8) : NULL;
++   NativeAdrenoAbiSubmitV2 *header = (NativeAdrenoAbiSubmitV2 *)(packet + 8 +
++      (asynchronous ? sizeof(*async) : 0));
++   if (asynchronous) {
++      async->version = NativeAdrenoAsyncVersion;
++      async->total_bytes = bytes;
++      async->submit_offset = sizeof(*async);
++      async->submit_bytes = submit_bytes;
++      async->wait_offset = sizeof(*async) + submit_bytes;
++      async->wait_count = wait_count;
++      async->signal_offset = async->wait_offset + wait_count * sizeof(NativeAdrenoAbiSyncPoint);
++      async->signal_count = signal_count;
++      async->epoch = dw.async_caps.epoch;
++      NativeAdrenoAbiSyncPoint *input = (NativeAdrenoAbiSyncPoint *)((uint8_t *)async + async->wait_offset);
++      NativeAdrenoAbiSyncPoint *output = (NativeAdrenoAbiSyncPoint *)((uint8_t *)async + async->signal_offset);
++      for (uint32_t at = 0; at < wait_count; ++at) {
++         const struct vk_darwin_async_sync *payload =
++            container_of(waits[at].sync, struct vk_darwin_async_sync, vk);
++         input[at] = {payload->handle,
++            waits[at].sync->flags & VK_SYNC_IS_TIMELINE ? waits[at].wait_value : 1};
++      }
++      for (uint32_t at = 0; at < signal_count; ++at) {
++         const struct vk_darwin_async_sync *payload =
++            container_of(signals[at].sync, struct vk_darwin_async_sync, vk);
++         output[at] = {payload->handle,
++            signals[at].sync->flags & VK_SYNC_IS_TIMELINE ? signals[at].signal_value : 1};
++      }
++   }
+    header->version = NativeAdrenoSubmitVersion;
+    header->header_bytes = sizeof(*header);
+-   header->total_bytes = bytes;
++   header->total_bytes = submit_bytes;
+    header->ib_count = ib_count;
+    header->resource_count = resource_count;
+    header->ib_offset = sizeof(*header);
+    header->resource_offset = header->ib_offset + ib_count * sizeof(NativeAdrenoAbiSubmitIbV2);
+    header->epoch = caps.epoch;
++   header->queue = queue->msm_queue_id;
+    if (submit->fallback_reasons) {
+       header->flags = NativeAdrenoSubmitAllMapped;
+       if (submit->fallback_reasons & TU_RESOURCE_FALLBACK_DEVICE_ADDRESS)
+@@ -2478,18 +2728,31 @@
+    const NativeAdrenoAbiSubmitBuffer *commands = (const NativeAdrenoAbiSubmitBuffer *)submit->commands.data;
+    memcpy(resources, submit->native_ranges.data, resource_count * sizeof(*resources));
+    for (uint32_t i = 0; i < ib_count; i++) {
+-      uint32_t object = 0;
+-      while (object < object_count && objects[object].bo->darwin_handle != commands[i].handle) {
+-         object++;
++      uint32_t object = 0, object_end = object_count;
++      while (object < object_end) {
++         const uint32_t middle = object + (object_end - object) / 2;
++         if (objects[middle].bo->darwin_handle < commands[i].handle) {
++            object = middle + 1;
++         } else {
++            object_end = middle;
++         }
+       }
+-      if (object == object_count) {
++      if (object == object_count || objects[object].bo->darwin_handle != commands[i].handle) {
+          vk_free(&dev->vk.alloc, packet);
+          return vk_device_set_lost(&dev->vk, "native IB has no live retained BO");
+       }
+ 
+       const uint64_t offset = commands[i].iova - objects[object].bo->iova;
+-      uint32_t resource = 0;
+-      while (resource < resource_count) {
++      uint32_t resource = 0, resource_end = resource_count;
++      while (resource < resource_end) {
++         const uint32_t middle = resource + (resource_end - resource) / 2;
++         if (resources[middle].handle < commands[i].handle) {
++            resource = middle + 1;
++         } else {
++            resource_end = middle;
++         }
++      }
++      while (resource < resource_count && resources[resource].handle == commands[i].handle) {
+          const NativeAdrenoAbiSubmitResourceV2 &range = resources[resource];
+          if (range.handle == commands[i].handle && (range.access & TU_RESOURCE_READ) &&
+              offset >= range.offset && offset - range.offset <= range.bytes &&
+@@ -2498,7 +2761,7 @@
+          }
+          resource++;
+       }
+-      if (resource == resource_count) {
++      if (resource == resource_count || resources[resource].handle != commands[i].handle) {
+          vk_free(&dev->vk.alloc, packet);
+          return vk_device_set_lost(&dev->vk, "native IB has no readable resource range");
+       }
+@@ -2511,11 +2774,12 @@
+       NativeAdrenoAbiSubmitV2Reply reply = {};
+       size_t output_size = sizeof(reply);
+       const kern_return_t status = IOConnectCallStructMethod(dw.conn,
+-         dw.tunnel ? dw.selector : NativeAdrenoMethodSubmitV2,
+-         dw.tunnel ? (void *)packet : (void *)header, bytes + (dw.tunnel ? 8 : 0),
++         dw.tunnel ? dw.selector : method,
++         dw.tunnel ? (void *)packet : (void *)(packet + 8), bytes + (dw.tunnel ? 8 : 0),
+          &reply, &output_size);
+       if (status == KERN_SUCCESS) {
+-         if (reply.epoch != caps.epoch || !reply.fence || reply.fence > UINT32_MAX) {
++         if (reply.epoch != (asynchronous ? dw.async_caps.epoch : caps.epoch) ||
++             !reply.fence || reply.fence > INT32_MAX) {
+             result = vk_device_set_lost(&dev->vk, "native submit returned an invalid completion identity");
+          } else {
+             *fence = reply.fence;
+@@ -2531,6 +2795,16 @@
+          break;
+       }
+ 
++      if (asynchronous) {
++         const NativeAdrenoAbiCapacityWait request = {darwin_relative_timeout(deadline), dw.async_caps.epoch};
++         result = dw_status_to_vk(dev, dw_call(dev, NativeAdrenoMethodWaitCapacity,
++            &request, sizeof(request), NULL, 0), "wait global submission capacity");
++         if (result != VK_SUCCESS) {
++            break;
++         }
++         continue;
++      }
++
+       pthread_mutex_lock(&dw.lock);
+       const uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+       pthread_mutex_unlock(&dw.lock);
+@@ -2567,6 +2841,29 @@
+    if (submit->result != VK_SUCCESS)
+       return submit->result;
+ 
++   if (dw.async_caps.version) {
++      const NativeAdrenoAbiSubmitCaps caps = darwin_submit_caps(dev);
++      VkResult result = darwin_collect_submit_resources(dev, submit, false);
++      if (result != VK_SUCCESS) {
++         return result;
++      }
++      uint32_t completion = 0;
++      result = darwin_submit_v2(queue, submit, caps, &completion,
++         waits, wait_count, signals, signal_count);
++      if (result != VK_SUCCESS) {
++         return result;
++      }
++      darwin_publish_resource_fence(submit, completion);
++      p_atomic_set(&queue->fence, completion);
++      pthread_mutex_lock(&dw.lock);
++      darwin_note_fence(&dw, completion);
++      pthread_mutex_unlock(&dw.lock);
++      if (u_trace_submission_data) {
++         u_trace_submission_data->gpu_ts_offset = 0;
++      }
++      return VK_SUCCESS;
++   }
++
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
+@@ -2922,10 +3219,15 @@
+    device->ubwc_config.macrotile_mode =
+       info->macrotile_mode ? FDL_MACROTILE_8_CHANNEL : FDL_MACROTILE_4_CHANNEL;
+ 
+-   device->timeline_type = vk_sync_timeline_get_type(&vk_darwin_sync_type);
+-   device->sync_types[0] = &vk_darwin_sync_type;
+-   device->sync_types[1] = &device->timeline_type.sync;
+-   device->sync_types[2] = NULL;
++   if (connection.async_caps.version) {
++      device->sync_types[0] = &vk_darwin_async_sync_type;
++      device->sync_types[1] = NULL;
++   } else {
++      device->timeline_type = vk_sync_timeline_get_type(&vk_darwin_sync_type);
++      device->sync_types[0] = &vk_darwin_sync_type;
++      device->sync_types[1] = &device->timeline_type.sync;
++      device->sync_types[2] = NULL;
++   }
+ 
+    device->heap.size = tu_get_system_heap_size(device);
+    device->heap.used = 0u;
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_darwin_async_abi.h
+@@ -0,0 +1,66 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef TU_DARWIN_ASYNC_ABI_H
++#define TU_DARWIN_ASYNC_ABI_H
++
++/* The asynchronous extension is queried separately from ABI v1. These records
++ * allow one userspace build to talk to drivers with either capability set. */
++#ifndef NATIVE_ADRENO_ASYNC_ABI
++enum {
++   NativeAdrenoMethodQueryAsync = 23,
++   NativeAdrenoMethodSyncCreate = 24,
++   NativeAdrenoMethodSyncRelease = 25,
++   NativeAdrenoMethodSyncSignal = 26,
++   NativeAdrenoMethodSyncQuery = 27,
++   NativeAdrenoMethodSyncWait = 28,
++   NativeAdrenoMethodSubmitAsync = 29,
++   NativeAdrenoMethodWaitCompletion = 30,
++   NativeAdrenoMethodWaitCapacity = 31,
++   NativeAdrenoMethodWaitBoIdle = 32,
++   NativeAdrenoAsyncVersion = 1,
++   NativeAdrenoAsyncMaxWaits = 128,
++   NativeAdrenoAsyncMaxSignals = 128,
++   NativeAdrenoAsyncTimeline = 1,
++   NativeAdrenoAsyncWaitAny = 1,
++   NativeAdrenoAsyncWaitPending = 2,
++};
++struct NativeAdrenoAbiAsyncCaps {
++   uint32_t version,max_jobs,max_waits,max_signals;
++   uint64_t epoch;
++};
++struct NativeAdrenoAbiSyncCreate {
++   uint64_t initial_value;
++   uint32_t flags,reserved;
++};
++struct NativeAdrenoAbiSyncHandle {
++   uint64_t handle;
++};
++struct NativeAdrenoAbiSyncPoint {
++   uint64_t handle,value;
++};
++struct NativeAdrenoAbiSyncValue {
++   uint64_t value;
++};
++struct NativeAdrenoAbiSubmitAsync {
++   uint32_t version,total_bytes,submit_offset,submit_bytes;
++   uint32_t wait_offset,wait_count,signal_offset,signal_count;
++   uint64_t epoch;
++};
++struct NativeAdrenoAbiAsyncReply {
++   uint64_t completion,epoch;
++};
++struct NativeAdrenoAbiSyncWait {
++   uint32_t version,count,flags,reserved;
++   uint64_t timeout_ns,epoch;
++   NativeAdrenoAbiSyncPoint points[NativeAdrenoAsyncMaxWaits];
++};
++struct NativeAdrenoAbiCompletionWait {
++   uint64_t completion,timeout_ns,epoch;
++};
++struct NativeAdrenoAbiCapacityWait {
++   uint64_t timeout_ns,epoch;
++};
++struct NativeAdrenoAbiBoWait {
++   uint64_t handle,timeout_ns,epoch;
++};
++#endif
++#endif
