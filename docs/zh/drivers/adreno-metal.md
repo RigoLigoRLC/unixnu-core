@@ -1,7 +1,7 @@
 # AdrenoMetal
 
-SM-T733 的 `unixnu-sm-t733` 主分支保留驱动优化；当前
-`unixnu-sm-t733-apple3` 分支增加 Apple3 前端、格式实现和系统 SDR 策略观测。
+SM-T733 的 `unixnu-sm-t733` 主分支保留驱动优化和系统 BGRA8 sRGB 格式策略；
+当前 `unixnu-sm-t733-apple3` 分支增加 Apple3 前端和格式实现。
 设备分支固定对应的 core、SoC 和 Metal 版本。
 
 先按[适配流程](/zh/porting/gpu)准备板级输入、修改源码、接入构建并逐步验证。

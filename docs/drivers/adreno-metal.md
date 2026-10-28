@@ -6,9 +6,9 @@ AdrenoMetal provides the Metal frontend through metal2vulkan and Turnip. It
 publishes a device through `MTLAddDevice`, translates AIR, and submits work to
 the kernel GPU interface.
 
-The SM-T733 `unixnu-sm-t733` branch contains driver optimizations. This
-`unixnu-sm-t733-apple3` branch adds Apple3 frontend and format implementations
-with the system SDR policy observer. The device branch pins the matching core,
+The SM-T733 `unixnu-sm-t733` branch contains driver optimizations and the system
+BGRA8 sRGB format policy. This `unixnu-sm-t733-apple3` branch adds Apple3
+frontend and format implementations. The device branch pins the matching core,
 SoC and Metal revisions.
 
 | Field | Value |
