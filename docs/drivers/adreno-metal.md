@@ -6,6 +6,11 @@ AdrenoMetal provides the Metal frontend through metal2vulkan and Turnip. It
 publishes a device through `MTLAddDevice`, translates AIR, and submits work to
 the kernel GPU interface.
 
+The SM-T733 `unixnu-sm-t733` branch contains driver optimizations. This
+`unixnu-sm-t733-apple3` branch adds Apple3 frontend and format implementations
+with the system SDR policy observer. The device branch pins the matching core,
+SoC and Metal revisions.
+
 | Field | Value |
 | --- | --- |
 | Repository | [UniXNU/AdrenoMetal](https://github.com/UniXNU/AdrenoMetal) |
@@ -51,11 +56,17 @@ dependencies and output points to the kernel scheduler; CPU waits sleep on the
 requested point. Display holds a read of the IOSurface backing until DPU has
 switched to its replacement.
 
-The `unixnu-sm-t733` branch keeps these submission and synchronization changes
-with the existing Metal feature paths and system surface format policy.
-The `unixnu-sm-t733-apple3` branch adds the Apple3 frontend, compiler and format
-implementations, plus the device's SDR format policy. Each device branch pins
-its corresponding core, SoC and Metal revisions.
+Argument encoders, indirect command buffers and tessellation descriptors use
+the runtime's corresponding objects. Default sample-position queries read the
+Vulkan standard-location property and the runtime's supported sample counts.
+On iPadOS 17, Metal IO queues use the inherited system implementation with the
+bridge's blit encoders, shared events and stable resource trace identifiers.
+
+PVRTC sampling uses a GPU-decoded RGBA8 image whose mip levels are refreshed
+after uploads and blits. Depth Min/Max resolve can select samples into an integer
+color attachment and transfer those bits to the destination depth aspect.
+These implementations are part of the SM-T733 source adaptation; its device
+repository records build identities and hardware results.
 
 Device answers are cached by selector and argument. The frontend disables no-copy
 rebind replay logs. A padded render target aliases its buffer only when the height
