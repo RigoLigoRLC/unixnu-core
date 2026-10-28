@@ -44,10 +44,9 @@ metal2vulkan。编码时累加访问摘要，提交时只为存在 CPU 消费者
 内核调度器，CPU 等待在所需时间点上睡眠。显示驱动持有 IOSurface backing
 的读占用，直到 DPU 切换到下一张表面。
 
-`unixnu-sm-t733` 分支保留上述提交与同步优化，以及既有 Metal 功能路径和
-系统表面格式策略。`unixnu-sm-t733-apple3` 分支增加 Apple3 前端、编译器和
-格式实现，以及设备 SDR 格式策略。设备的两个分支分别固定对应的 core、SoC
-和 Metal 版本。
+`unixnu-sm-t733` 分支保留上述提交与同步优化，以及系统 BGRA8 sRGB 格式
+策略。`unixnu-sm-t733-apple3` 分支增加 Apple3 前端、编译器和格式实现。
+设备的两个分支分别固定对应的 core、SoC 和 Metal 版本。
 
 设备查询按 selector 和参数缓存，前端关闭 no-copy 重绑所需的编码器回放记录。
 带行间距的 render target 只有在高度是 4 的倍数、宽度向上取整至 16 像素后的

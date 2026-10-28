@@ -52,10 +52,9 @@ requested point. Display holds a read of the IOSurface backing until DPU has
 switched to its replacement.
 
 The `unixnu-sm-t733` branch keeps these submission and synchronization changes
-with the existing Metal feature paths and system surface format policy.
-The `unixnu-sm-t733-apple3` branch adds the Apple3 frontend, compiler and format
-implementations, plus the device's SDR format policy. Each device branch pins
-its corresponding core, SoC and Metal revisions.
+with the system BGRA8 sRGB format policy. The `unixnu-sm-t733-apple3` branch adds
+the Apple3 frontend, compiler and format implementations. Each device branch
+pins its corresponding core, SoC and Metal revisions.
 
 Device answers are cached by selector and argument. The frontend disables no-copy
 rebind replay logs. A padded render target aliases its buffer only when the height
