@@ -58,8 +58,7 @@
     "patches/mesa/turnip-darwin-bo-lifetime-v2-map.patch",
     "patches/mesa/turnip-resource-submit-v2.patch",
     "patches/mesa/turnip-darwin-cached-coherent-memory.patch",
-    "patches/mesa/turnip-darwin-async-submit.patch",
-    "patches/mesa/turnip-a6xx-large-texel-buffers.patch"
+    "patches/mesa/turnip-darwin-async-submit.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

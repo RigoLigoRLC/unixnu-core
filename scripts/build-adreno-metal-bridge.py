@@ -29,14 +29,7 @@ PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
     '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
     '0007-accept-two-plane-rgb-surfaces.patch', '0008-alias-padded-rows-of-written-textures.patch',
     '0009-bound-idle-command-pools-on-ios.patch', '0010-coordinate-memory-pool-growth.patch',
-    '0011-preserve-metal-stages-and-host-visibility.patch',
-    '0012-resolve-depth-through-integer-attachments.patch',
-    '0013-extend-xr-sampling-blending-and-resolve.patch',
-    '0014-pvrtc-gpu-decoded-textures.patch',
-    '0015-tessellation-counts-and-icb-continuations.patch',
-    '0016-pass-runtime-sampler-maximum-lod.patch',
-    '0017-argument-sampler-filtering-metadata.patch',
-    '0018-sample-static-textures-with-argument-samplers.patch']]
+    '0011-preserve-metal-stages-and-host-visibility.patch']]
 tree_diff = subprocess.check_output(['git', '-C', str(SOURCE), 'diff', '--no-ext-diff', '--abbrev=7', 'HEAD', '--'], text=True)
 def canonical_diff(diff):
     # Independent patches touch disjoint files; Git orders the combined diff by
@@ -90,10 +83,6 @@ triple = 'aarch64-apple-ios' if args.target == 'ios' else 'aarch64-apple-darwin'
 # finished while this stays the same (PrimeShaders.h).
 runtime_id = hashlib.sha256((PIN + '\n' + canonical_diff(expected)).encode()).hexdigest()[:32]
 env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
-if 'M2V_GLSL_COMPILER' not in env:
-    bundled_glslang = ROOT / '.cache/mesa-tools/bin/glslang'
-    if bundled_glslang.is_file():
-        env['M2V_GLSL_COMPILER'] = str(bundled_glslang)
 target_dir = ROOT / 'build/m2v-target'
 log = out / ('build-%s.log' % args.target)
 with log.open('w') as stream:
