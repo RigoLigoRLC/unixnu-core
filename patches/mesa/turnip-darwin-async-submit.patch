@@ -530,6 +530,8 @@
  
     device->heap.size = tu_get_system_heap_size(device);
     device->heap.used = 0u;
+diff --git a/src/freedreno/vulkan/tu_darwin_async_abi.h b/src/freedreno/vulkan/tu_darwin_async_abi.h
+new file mode 100644
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_darwin_async_abi.h
 @@ -0,0 +1,66 @@
