@@ -205,6 +205,15 @@ index 2413157..e5c7e5b 100644
        nir_def *offset = intr->src[1].ssa;
  
        nir_foreach_use_safe (use, &intr->def) {
+@@ -1703,7 +1766,7 @@ lower_ssbo_address_size(nir_builder *b, nir_intrinsic_instr *intr, void *data)
+ static bool
+ tu_nir_lower_ssbo_address_size(
+-   nir_shader *shader, const struct lower_ssbo_address_size_state *state)
++   nir_shader *shader, const struct descriptor_load_state *state)
+ {
+    return nir_shader_intrinsics_pass(shader, lower_ssbo_address_size,
+                                      nir_metadata_control_flow, (void *) state);
+ }
 @@ -3463,6 +3526,18 @@ tu_shader_create(struct tu_device *dev,
              key->read_only_input_attachments, key->dynamic_renderpass,
              &const_allocs);
