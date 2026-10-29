@@ -56,10 +56,16 @@ with the system BGRA8 sRGB format policy. The `unixnu-sm-t733-apple3` branch add
 the Apple3 frontend, compiler and format implementations. Each device branch
 pins its corresponding core, SoC and Metal revisions.
 
+The SM7325 bridge uses metal2vulkan development commit
+`624bab3918de5b978e1101517abca2b4fa426565` and the ordered patches in
+`AdrenoMetal/bridge/patches/series`. The new runtime's fence stages retain the
+local resource visibility and cached coherent memory policies.
+
 Device answers are cached by selector and argument. The frontend disables no-copy
-rebind replay logs. A padded render target aliases its buffer only when the height
-is divisible by four, its width rounded to 16 texels fits each row pitch, and the
-last rounded row fits the allocation. Other padded targets use a shadow image.
+rebind replay logs. Host-page textures use their imported memory directly when
+the runtime accepts the layout. Turnip uses draw loads and 2D stores for linear
+imported attachments whose dimensions do not fill complete GMEM blocks. Those
+transfers cover the valid texels within the owner's row pitch.
 
 Frame trace and pipeline journal files default off through
 `NATIVE_ADRENO_FRAME_TRACE=0` and `NATIVE_ADRENO_PIPELINE_JOURNAL=0`. Periodic

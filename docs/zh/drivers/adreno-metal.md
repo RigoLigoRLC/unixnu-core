@@ -48,10 +48,15 @@ metal2vulkan。编码时累加访问摘要，提交时只为存在 CPU 消费者
 策略。`unixnu-sm-t733-apple3` 分支增加 Apple3 前端、编译器和格式实现。
 设备的两个分支分别固定对应的 core、SoC 和 Metal 版本。
 
+SM7325 桥接使用 metal2vulkan development 提交
+`624bab3918de5b978e1101517abca2b4fa426565`，补丁顺序由
+`AdrenoMetal/bridge/patches/series` 记录。本机资源可见性和缓存一致性内存
+策略接入新运行时的 fence 阶段模型。
+
 设备查询按 selector 和参数缓存，前端关闭 no-copy 重绑所需的编码器回放记录。
-带行间距的 render target 只有在高度是 4 的倍数、宽度向上取整至 16 像素后的
-字节数不超过行距、最后一行不越过分配范围时，才直接别名原缓冲区；其余使用
-shadow 图像。
+运行时接受纹理布局时，host-page 纹理直接使用导入内存。对于尺寸未填满 GMEM
+块的外部线性附件，Turnip 使用 draw load 和 2D store，传输只覆盖所属行跨度
+内的有效像素。
 
 `NATIVE_ADRENO_FRAME_TRACE=0` 与 `NATIVE_ADRENO_PIPELINE_JOURNAL=0` 默认关闭
 逐命令追踪和管线文件日志，保留周期读取的内存统计。前端错误与 host-import

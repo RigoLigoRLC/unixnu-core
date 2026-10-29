@@ -8,10 +8,11 @@ import argparse
 import hashlib
 import json
 import os
-import re
 from pathlib import Path
 import shutil
 import subprocess
+
+from mesa_patch_identity import validate_recorded_patches
 
 ROOT = Path(__file__).resolve().parents[1]
 PIN = json.loads((ROOT / 'scripts/data/gpu-metal-vulkan-inputs.json').read_text())['translator']['commit']
@@ -23,35 +24,20 @@ parser.add_argument('--manifest-only', action='store_true',
 args = parser.parse_args()
 if subprocess.check_output(['git', '-C', str(SOURCE), 'rev-parse', 'HEAD'], text=True).strip() != PIN:
     raise SystemExit('Translator revision differs from the qualified source pin')
-PATCHES = [ROOT / 'drivers/AdrenoMetal/bridge/patches' / name for name in [
-    '0001-optional-constant-output-members.patch', '0002-resource-wait-storage-dependencies.patch',
-    '0003-cache-device-entry-point-priming.patch', '0004-fold-constant-global-field-loads.patch',
-    '0005-keep-module-decodes-and-profile-fingerprints.patch', '0006-skip-draws-without-a-pipeline.patch',
-    '0007-accept-two-plane-rgb-surfaces.patch', '0008-alias-padded-rows-of-written-textures.patch',
-    '0009-bound-idle-command-pools-on-ios.patch', '0010-coordinate-memory-pool-growth.patch',
-    '0011-preserve-metal-stages-and-host-visibility.patch']]
-tree_diff = subprocess.check_output(['git', '-C', str(SOURCE), 'diff', '--no-ext-diff', '--abbrev=7', 'HEAD', '--'], text=True)
-def canonical_diff(diff):
-    # Independent patches touch disjoint files; Git orders the combined diff by
-    # filename, rather than by the order the patches were applied.
-    blocks = [block for block in re.split(r'(?=^diff --git )', diff, flags=re.M) if block]
-    names = [block.splitlines()[0] for block in blocks]
-    if len(set(names)) != len(names):
-        raise SystemExit('Overlapping recorded patches require an explicit combined-source update')
-    return ''.join(sorted(blocks, key=lambda block: block.splitlines()[0]))
+patch_directory = ROOT / 'drivers/AdrenoMetal/bridge/patches'
+patch_names = [line.split('#', 1)[0].strip()
+               for line in (patch_directory / 'series').read_text().splitlines()]
+PATCHES = [patch_directory / name for name in patch_names if name]
+source_status = subprocess.check_output(
+    ['git', '-C', str(SOURCE), 'status', '--porcelain', '--untracked-files=all'], text=True)
+if not source_status:
+    for patch in PATCHES:
+        subprocess.run(['git', '-C', str(SOURCE), 'apply', str(patch)], check=True)
 
-
-expected = ''
-states = [expected]
-for patch in PATCHES:
-    expected += patch.read_text()
-    states.append(canonical_diff(expected))
-if tree_diff not in states:
-    raise SystemExit('Translator source differs from the pinned revision plus its recorded patches')
-for patch in PATCHES[states.index(tree_diff):]:
-    subprocess.run(['git', '-C', str(SOURCE), 'apply', str(patch)], check=True)
-if subprocess.check_output(['git', '-C', str(SOURCE), 'diff', '--no-ext-diff', '--abbrev=7', 'HEAD', '--'], text=True) != canonical_diff(expected):
-    raise SystemExit('Translator patch result differs from its exact recorded source')
+# Sequential patches may update the same file. Reversing them in a temporary
+# copy must recover the pinned source bytes before the compiler consumes it.
+validate_recorded_patches(ROOT, SOURCE, {'patches': [str(patch) for patch in PATCHES]})
+expected = ''.join(patch.read_text() for patch in PATCHES)
 out = ROOT / 'build/adreno-metal-bridge'
 out.mkdir(parents=True, exist_ok=True)
 llvm_as = next((p for p in ['/opt/homebrew/opt/llvm/bin/llvm-as', shutil.which('llvm-as') or ''] if p and Path(p).exists()), None)
@@ -73,7 +59,8 @@ manifest.write_text('\n'.join([
     # The runtime hashes every shader-cache key and entry; without asm, sha2 0.10 on aarch64 is the portable software rounds, not the
     # ARMv8 SHA-256 instructions every target CPU has (cpufeatures answers sha2 true on Apple platforms).
     'sha2 = { version = "0.10", features = ["asm"] }',
-    '[profile.release]', 'panic = "unwind"', 'debug = 1', '',
+    '[profile.release]', 'panic = "unwind"', 'debug = 1',
+    'lto = "fat"', 'codegen-units = 1', '',
 ]))
 if args.manifest_only:
     print(manifest)
@@ -81,7 +68,7 @@ if args.manifest_only:
 triple = 'aarch64-apple-ios' if args.target == 'ios' else 'aarch64-apple-darwin'
 # The translator source the runtime is built from (its pin and recorded patches), which keys the shader cache: shader priming keeps what it
 # finished while this stays the same (PrimeShaders.h).
-runtime_id = hashlib.sha256((PIN + '\n' + canonical_diff(expected)).encode()).hexdigest()[:32]
+runtime_id = hashlib.sha256((PIN + '\n' + expected).encode()).hexdigest()[:32]
 env = dict(os.environ, NMB_RUNTIME_ID=runtime_id, NMB_FIXTURE_AIR=str(air), NMB_FC_AIR=str(fc_air), IPHONEOS_DEPLOYMENT_TARGET='17.0', MACOSX_DEPLOYMENT_TARGET='14.0')
 target_dir = ROOT / 'build/m2v-target'
 log = out / ('build-%s.log' % args.target)
