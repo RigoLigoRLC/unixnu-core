@@ -1,0 +1,148 @@
+diff --git a/src/freedreno/fdl/fd6_layout.c b/src/freedreno/fdl/fd6_layout.c
+index 67491ab..76a8e0c 100644
+--- a/src/freedreno/fdl/fd6_layout.c
++++ b/src/freedreno/fdl/fd6_layout.c
+@@ -193,7 +193,11 @@ fdl6_layout_image(struct fdl_layout *layout, const struct fd_dev_info *info,
+           * aligned gmem store. turnip can use CP_BLIT to work without this
+           * extra alignment, but gallium driver doesn't implement it yet
+           */
+-         if (layout->cpp > 4)
++         /* An explicit layout uses its owner's row pitch. Turnip loads and
++          * stores imported attachments over their texels when the image
++          * dimensions do not cover complete GMEM blocks.
++          */
++         if (layout->cpp > 4 && !explicit_layout)
+             layout->pitchalign = fdl_cpp_shift(layout) - 2;
+ 
+          /* when possible, use a bit more alignment than necessary
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index d5786bf..09c3db2 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -5636,6 +5636,25 @@ fdm_apply_load_coords(struct tu_cmd_buffer *cmd,
+    r3d_coords_raw(cmd, cs, coords);
+ }
+ 
++/* Imported linear attachments retain the owner's row pitch and allocation
++ * size. A blit event transfers complete GMEM blocks, which can extend beyond
++ * the final texel. These attachments use draw loads and 2D stores instead.
++ */
++bool
++tu_attachment_unpadded(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview)
++{
++   const struct fd_dev_info *info = cmd->device->physical_device->info;
++   const VkExternalMemoryHandleTypeFlags host_types =
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_ALLOCATION_BIT_EXT |
++      VK_EXTERNAL_MEMORY_HANDLE_TYPE_HOST_MAPPED_FOREIGN_MEMORY_BIT_EXT;
++
++   return iview->image->layout[0].tile_mode == TILE6_LINEAR &&
++          (iview->image->vk.tiling == VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT ||
++           (iview->image->vk.external_handle_types & host_types)) &&
++          (iview->view.width % info->gmem_align_w ||
++           iview->view.height % info->gmem_align_h);
++}
++
+ template <chip CHIP>
+ static void
+ load_3d_blit(struct tu_cmd_buffer *cmd,
+@@ -5796,6 +5815,7 @@ tu_load_gmem_attachment(struct tu_cmd_buffer *cmd,
+ 
+    if (TU_DEBUG(3D_LOAD) ||
+        cmd->state.pass->has_fdm ||
++       tu_attachment_unpadded(cmd, iview) ||
+        /* Replicating unresolve seems to not work and the blob never uses it.
+         */
+        (a != gmem_a)) {
+@@ -6019,6 +6039,10 @@ tu_attachment_store_unaligned(struct tu_cmd_buffer *cmd, uint32_t a)
+    if (TU_DEBUG(UNALIGNED_STORE))
+       return true;
+ 
++   if (tu_attachment_unpadded(cmd, iview)) {
++      return true;
++   }
++
+    unsigned render_area_count =
+       cmd->state.per_layer_render_area ? cmd->state.pass->num_views : 1;
+ 
+diff --git a/src/freedreno/vulkan/tu_clear_blit.h b/src/freedreno/vulkan/tu_clear_blit.h
+index 1defb04..62d1e43 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.h
++++ b/src/freedreno/vulkan/tu_clear_blit.h
+@@ -100,6 +100,9 @@ tu_store_gmem_attachment(struct tu_cmd_buffer *cmd,
+ void
+ tu_choose_gmem_layout(struct tu_cmd_buffer *cmd);
+ 
++bool
++tu_attachment_unpadded(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview);
++
+ void
+ tu_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer,
+                         VkDeviceAddress dstAddr,
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 43fb96e..7a12650 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -4222,6 +4222,46 @@ tu_cmd_render_sysmem(struct tu_cmd_buffer *cmd,
+    tu_trace_end_render_pass<CHIP>(cmd, false);
+ }
+ 
++/* The process-wide counters record GMEM passes, autotuned SYSMEM passes and
++ * other SYSMEM passes, each followed by its pixel count in thousands.
++ * Slot 6 counts GMEM passes whose imported attachment needs draw loads or
++ * 2D stores; slot 7 is reserved. The Metal frontend reads them on demand.
++ */
++static uint64_t tu_render_mode_counts[8];
++
++static void
++tu_note_render_mode(struct tu_cmd_buffer *cmd, bool sysmem)
++{
++   const VkExtent2D extent = cmd->state.render_areas[0].extent;
++   const uint64_t kpx = (uint64_t) extent.width * extent.height / 1000;
++   const char *reason = cmd->state.rp.gmem_disable_reason;
++   const unsigned slot =
++      !sysmem ? 0 : reason && !strcmp(reason, "Autotune selected sysmem") ? 2 : 4;
++
++   p_atomic_inc(&tu_render_mode_counts[slot]);
++   p_atomic_add(&tu_render_mode_counts[slot + 1], kpx);
++   if (sysmem) {
++      return;
++   }
++
++   for (unsigned i = 0; i < cmd->state.pass->attachment_count; i++) {
++      const struct tu_image_view *iview = cmd->state.attachments[i];
++      if (iview && tu_attachment_unpadded(cmd, iview)) {
++         p_atomic_inc(&tu_render_mode_counts[6]);
++         break;
++      }
++   }
++}
++
++extern "C" __attribute__((visibility("default"))) void tu_render_mode_stats(uint64_t out[8]);
++extern "C" __attribute__((visibility("default"))) void
++tu_render_mode_stats(uint64_t out[8])
++{
++   for (unsigned i = 0; i < 8; i++) {
++      out[i] = p_atomic_read(&tu_render_mode_counts[i]);
++   }
++}
++
+ template <chip CHIP>
+ void
+ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+@@ -4237,10 +4277,14 @@ tu_cmd_render(struct tu_cmd_buffer *cmd_buffer,
+    tu_autotune::rp_key_opt rp_key = cmd_buffer->device->autotune->emit_preempt_latency_tracking_rp_hash(cmd_buffer);
+ 
+    tu_autotune::rp_ctx_t rp_ctx = NULL;
+-   if (use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key))
++   const bool sysmem = use_sysmem_rendering(cmd_buffer, &rp_ctx, rp_key);
++   tu_note_render_mode(cmd_buffer, sysmem);
++
++   if (sysmem) {
+       tu_cmd_render_sysmem<CHIP>(cmd_buffer, rp_ctx);
+-   else
++   } else {
+       tu_cmd_render_tiles<CHIP>(cmd_buffer, rp_ctx, fdm_offsets);
++   }
+ }
+ 
+ static void tu_reset_render_pass(struct tu_cmd_buffer *cmd_buffer)
