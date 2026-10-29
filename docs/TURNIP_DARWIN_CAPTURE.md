@@ -8,12 +8,14 @@ kernel ABI lacks the trace header keeps the disabled callback implementations.
 
 The transport thread polls capture state every 10 ms and registers one producer
 for each active generation. It sends at most eight 176-byte events per IOKit
-call. GPU and Metal callbacks append to a 2048-event CPU queue. Each device
-accepts at most 8192 GPU trace events per generation and 64 recorded primary
-command buffers awaiting submission. Timestamp allocation uses 64-entry chunks.
-Overflow increments the explicit dropped count. Capture stop closes admission,
-drains submitted u_trace work, sends remaining records, and ends the producer.
-A three-second drain timeout reports an incomplete producer.
+call. Two 2048-event queues reserve separate capacity for completed GPU
+timestamps and CPU/Metal metadata. The transport alternates records from both
+queues and uses the available queue when the other is empty. Only the GPU
+timestamp worker waits for space; metadata callbacks report overflow without
+waiting for transport or issuing IOKit calls. A 16 MiB allocation budget covers
+timestamp storage and CPU trace payloads until their command buffers retire.
+Capture stop closes admission, drains submitted u_trace work, sends both queues,
+and ends the producer after their completion.
 
 The A6xx timestamp command is Mesa's `CP_EVENT_WRITE(RB_DONE_TS)`. Mesa waits for
 the native completion receipt before reading the timestamp BO. The conversion
@@ -28,7 +30,11 @@ WFI before that clone, then emits the clone's WAIT_FOR_ME and CP_MEMCPY. The
 move crosses only the timestamp-copy commands; draw, final store, and the tile
 render-end marker retain their ordering. Outside capture the original command
 sequence remains. The instrumentation event records encoded timestamp,
-CP_MEMCPY, WAIT_FOR_ME, and additional WFI dword counts. These counters describe
+CP_MEMCPY, WAIT_FOR_ME, and additional WFI dword counts. Additional WFI counts
+come from successful trace-clone and timestamp-copy WFI packet emissions and
+belong to the source capture generation. The existing tile-tail wait is excluded.
+Instrumentation event source flags bit 0 (event flags bit 16) marks the WFI value
+as measured; an older unmarked zero is unavailable. These counters describe
 capture commands; they do not measure shader or cache execution time.
 
 Each command-buffer recording receives a process-wide monotonically increasing

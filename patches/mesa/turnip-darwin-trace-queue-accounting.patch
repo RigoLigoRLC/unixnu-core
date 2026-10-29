@@ -1,0 +1,263 @@
+--- a/src/freedreno/vulkan/tu_darwin_trace.cc
++++ b/src/freedreno/vulkan/tu_darwin_trace.cc
+@@ -18,17 +18,27 @@
+ #include "util/u_atomic.h"
+ 
+ enum {
+-   TRACE_LOCAL_EVENTS = 4096,
++   TRACE_QUEUE_EVENTS = 2048,
++   TRACE_GPU_QUEUE = 0,
++   TRACE_METADATA_QUEUE = 1,
++   TRACE_QUEUE_COUNT = 2,
+    TRACE_MEMORY_BYTES = 16 * 1024 * 1024,
+    TRACE_END_BYTES = 4096,
+ };
+ 
+ static uint64_t trace_next_command;
+ 
+-/* tu_darwin_trace_state owns one device's bounded CPU event queue. The u_trace
+- * worker supplies completed GPU timestamps; Metal supplies command metadata.
+- * The transport thread polls capture control, sends batches, and releases its
+- * producer after admitted submissions retire and their events are sent. */
++/* tu_darwin_trace_queue holds records from one class of producers. */
++struct tu_darwin_trace_queue {
++   NativeAdrenoTraceEvent events[TRACE_QUEUE_EVENTS];
++   uint32_t head;
++   uint32_t count;
++};
++
++/* tu_darwin_trace_state owns separate bounded queues for completed GPU
++ * timestamps and CPU metadata. Only the u_trace worker waits for queue space.
++ * The transport thread alternates queues, polls capture control, and releases
++ * its producer after admitted submissions retire and both queues are sent. */
+ struct tu_darwin_trace_state {
+    struct tu_device *device;
+    pthread_t worker;
+@@ -37,9 +47,8 @@
+    bool stop;
+    uint32_t active_generation;
+    NativeAdrenoTraceProducer producer;
+-   NativeAdrenoTraceEvent events[TRACE_LOCAL_EVENTS];
+-   uint32_t head;
+-   uint32_t count;
++   tu_darwin_trace_queue queues[TRACE_QUEUE_COUNT];
++   uint32_t next_queue;
+    uint32_t dropped;
+    uint32_t budget_dropped;
+    uint32_t queue_dropped;
+@@ -54,6 +63,7 @@
+    uint64_t timestamp_dwords;
+    uint64_t copy_dwords;
+    uint64_t wait_dwords;
++   uint64_t extra_idle_dwords;
+    uint64_t stage_commands[12];
+    mach_timebase_info_data_t timebase;
+ };
+@@ -101,14 +111,17 @@
+    if (!state->producer.producer_id || generation != state->producer.generation) {
+       return;
+    }
+-   if (state->count == TRACE_LOCAL_EVENTS) {
++   tu_darwin_trace_queue &queue = state->queues[
++      event.clock_domain == NativeAdrenoTraceClockGpuNanoseconds ?
++      TRACE_GPU_QUEUE : TRACE_METADATA_QUEUE];
++   if (queue.count == TRACE_QUEUE_EVENTS) {
+       state->dropped++;
+       state->queue_dropped++;
+       return;
+    }
+ 
+-   state->events[(state->head + state->count) % TRACE_LOCAL_EVENTS] = event;
+-   state->count++;
++   queue.events[(queue.head + queue.count) % TRACE_QUEUE_EVENTS] = event;
++   queue.count++;
+    pthread_cond_broadcast(&state->changed);
+ }
+ 
+@@ -320,7 +333,7 @@
+    }
+ 
+    pthread_mutex_lock(&state->mutex);
+-   while (state->count == TRACE_LOCAL_EVENTS &&
++   while (state->queues[TRACE_GPU_QUEUE].count == TRACE_QUEUE_EVENTS &&
+           generation == state->producer.generation && state->producer.producer_id) {
+       pthread_cond_wait(&state->changed, &state->mutex);
+    }
+@@ -334,7 +347,9 @@
+    for (uint32_t sent = 0; ; ++sent) {
+       NativeAdrenoTraceBatch batch = {};
+       pthread_mutex_lock(&state->mutex);
+-      if (!state->count || !state->producer.producer_id ||
++      const uint32_t available = state->queues[TRACE_GPU_QUEUE].count +
++                                 state->queues[TRACE_METADATA_QUEUE].count;
++      if (!available || !state->producer.producer_id ||
+           (p_atomic_read(&state->active_generation) && sent == 128)) {
+          pthread_mutex_unlock(&state->mutex);
+          return;
+@@ -342,12 +357,18 @@
+       batch.version = NativeAdrenoTraceVersion;
+       batch.generation = state->producer.generation;
+       batch.producer_id = state->producer.producer_id;
+-      batch.count = MIN2(state->count, (uint32_t)NativeAdrenoTraceBatchEvents);
++      batch.count = MIN2(available, (uint32_t)NativeAdrenoTraceBatchEvents);
+       for (uint32_t i = 0; i < batch.count; ++i) {
+-         batch.events[i] = state->events[state->head];
+-         state->head = (state->head + 1) % TRACE_LOCAL_EVENTS;
++         uint32_t selected = state->next_queue;
++         if (!state->queues[selected].count) {
++            selected ^= 1;
++         }
++         tu_darwin_trace_queue &queue = state->queues[selected];
++         batch.events[i] = queue.events[queue.head];
++         queue.head = (queue.head + 1) % TRACE_QUEUE_EVENTS;
++         queue.count--;
++         state->next_queue = selected ^ 1;
+       }
+-      state->count -= batch.count;
+       pthread_cond_broadcast(&state->changed);
+       pthread_mutex_unlock(&state->mutex);
+ 
+@@ -369,10 +390,11 @@
+    if (!state->end_records_written) {
+       NativeAdrenoTraceEvent cost = trace_cpu_event(state, NativeAdrenoTraceTurnipInstrumentation,
+                                                    "trace_command_dwords");
++      cost.flags = 1u << 16; /* Additional WFI dwords were counted at emission. */
+       trace_argument(&cost, NativeAdrenoTraceArgTimestampDwords, state->timestamp_dwords);
+       trace_argument(&cost, NativeAdrenoTraceArgCopyDwords, state->copy_dwords);
+       trace_argument(&cost, NativeAdrenoTraceArgWaitForMeDwords, state->wait_dwords);
+-      trace_argument(&cost, NativeAdrenoTraceArgExtraWaitForIdleDwords, 0);
++      trace_argument(&cost, NativeAdrenoTraceArgExtraWaitForIdleDwords, state->extra_idle_dwords);
+       trace_append_locked(state, state->producer.generation, cost);
+ 
+       NativeAdrenoTraceEvent loss = trace_cpu_event(state, NativeAdrenoTraceTurnipRecordCounts,
+@@ -437,6 +459,8 @@
+             state->timestamp_dwords = 0;
+             state->copy_dwords = 0;
+             state->wait_dwords = 0;
++            state->extra_idle_dwords = 0;
++            state->next_queue = TRACE_METADATA_QUEUE;
+             state->end_records_written = false;
+             p_atomic_set(&state->active_generation, producer.generation);
+             pthread_mutex_unlock(&state->mutex);
+@@ -470,7 +494,7 @@
+          deadline.tv_nsec -= 1000000000;
+       }
+       pthread_mutex_lock(&state->mutex);
+-      if (!state->count) {
++      if (!state->queues[TRACE_GPU_QUEUE].count && !state->queues[TRACE_METADATA_QUEUE].count) {
+          pthread_cond_timedwait(&state->changed, &state->mutex, &deadline);
+       }
+       pthread_mutex_unlock(&state->mutex);
+@@ -695,7 +719,7 @@
+ void
+ tu_darwin_trace_command_cost(struct tu_device *device, uint32_t generation,
+                              uint32_t timestamp_dwords, uint32_t copy_dwords,
+-                             uint32_t wait_dwords)
++                             uint32_t wait_dwords, uint32_t extra_idle_dwords)
+ {
+    tu_darwin_trace_state *state = trace_state(device);
+    if (!state || (!generation && !copy_dwords)) {
+@@ -706,6 +730,9 @@
+       state->timestamp_dwords += timestamp_dwords;
+       state->copy_dwords += copy_dwords;
+       state->wait_dwords += wait_dwords;
++      if (generation) {
++         state->extra_idle_dwords += extra_idle_dwords;
++      }
+    }
+    pthread_mutex_unlock(&state->mutex);
+ }
+--- a/src/freedreno/vulkan/tu_darwin_trace.h
++++ b/src/freedreno/vulkan/tu_darwin_trace.h
+@@ -26,7 +26,7 @@
+ void tu_darwin_trace_retire(struct tu_device *device, struct tu_u_trace_submission_data *data);
+ void tu_darwin_trace_command_cost(struct tu_device *device, uint32_t generation,
+                                  uint32_t timestamp_dwords, uint32_t copy_dwords,
+-                                 uint32_t wait_dwords);
++                                 uint32_t wait_dwords, uint32_t extra_idle_dwords);
+ int tu_darwin_trace_call(struct tu_device *device, uint32_t method,
+                          const void *input, size_t input_size,
+                          void *output, size_t output_size);
+@@ -58,7 +58,7 @@
+ {
+ }
+ static inline void tu_darwin_trace_command_cost(struct tu_device *, uint32_t,
+-                                               uint32_t, uint32_t, uint32_t)
++                                               uint32_t, uint32_t, uint32_t, uint32_t)
+ {
+ }
+ static inline VkBool32 VKAPI_CALL tu_NativeAdrenoTraceEnabled(VkDevice)
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -271,11 +271,16 @@
+       tu_cond_exec_end(cs);
+    }
+ 
++   uint32_t extra_idle_dwords = 0;
+    if (!already_idle) {
+       tu_cs_emit_wfi(cs);
++      if (tu_cs_get_record_result(cs) == VK_SUCCESS) {
++         extra_idle_dwords = 1;
++      }
+    }
+    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+-   tu_darwin_trace_command_cost(cmd->device, dst->external_generation, 0, 0, 1);
++   tu_darwin_trace_command_cost(cmd->device, dst->external_generation, 0, 0, 1,
++                                extra_idle_dwords);
+    dst->external_flags = external_flags;
+    u_trace_clone_append(begin, end, dst, cs, tu_copy_buffer);
+    dst->external_flags = 0;
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2291,7 +2291,7 @@
+ 
+    tu_cs_use_range(ts_cs, bo->iova + offset_B, sizeof(uint64_t), TU_RESOURCE_WRITE);
+    tu_darwin_trace_command_cost((struct tu_device *)ut->utctx->pctx,
+-                                ut->external_generation, CHIP == A6XX ? 5 : 4, 0, 0);
++                                ut->external_generation, CHIP == A6XX ? 5 : 4, 0, 0, 0);
+ 
+    if (CHIP == A6XX) {
+       tu_cs_emit_pkt7(ts_cs, CP_EVENT_WRITE, 4);
+@@ -2379,7 +2379,7 @@
+    tu_cs_emit_qw(cs, src_iova);
+    tu_cs_emit_qw(cs, bo_to->iova + to_offset_B);
+    tu_darwin_trace_command_cost((struct tu_device *)utctx->pctx,
+-                                0, 0, 6, 0);
++                                0, 0, 6, 0, 0);
+ }
+ 
+ static void
+@@ -2440,10 +2440,23 @@
+    }
+ 
+    tu_cs *cs = &submission_data->timestamp_copy_data->cs;
++   uint32_t external_generation = 0;
++   for (uint32_t i = 0; i < cmd_buffer_count; ++i) {
++      struct tu_cmd_buffer *cmd = cmd_buffers[i];
++      if (u_trace_has_points(&cmd->trace) &&
++          !(cmd->usage_flags & VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT) &&
++          cmd->trace.external_generation) {
++         external_generation = cmd->trace.external_generation;
++         break;
++      }
++   }
+ 
+    tu_cs_begin(cs);
+ 
+    tu_cs_emit_wfi(cs);
++   if (tu_cs_get_record_result(cs) == VK_SUCCESS) {
++      tu_darwin_trace_command_cost(device, external_generation, 0, 0, 0, 1);
++   }
+    tu_cs_emit_pkt7(cs, CP_WAIT_FOR_ME, 0);
+ 
+    for (uint32_t i = 0; i < cmd_buffer_count; i++) {
+@@ -2460,6 +2473,9 @@
+    }
+ 
+    tu_cs_emit_wfi(cs);
++   if (tu_cs_get_record_result(cs) == VK_SUCCESS) {
++      tu_darwin_trace_command_cost(device, external_generation, 0, 0, 0, 1);
++   }
+    tu_cs_end(cs);
+ 
+    return VK_SUCCESS;
