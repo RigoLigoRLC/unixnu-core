@@ -1,0 +1,107 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.h b/src/freedreno/vulkan/tu_cmd_buffer.h
+--- a/src/freedreno/vulkan/tu_cmd_buffer.h
++++ b/src/freedreno/vulkan/tu_cmd_buffer.h
+@@ -668,6 +668,9 @@
+    struct u_trace_iterator trace_renderpass_start;
+    struct u_trace trace, rp_trace;
+    uint64_t darwin_trace_id;
++   uint64_t darwin_trace_copy_id;
++   uint64_t darwin_trace_copy_source;
++   uint64_t darwin_trace_copy_destination;
+    uint32_t darwin_trace_generation;
+    bool darwin_trace_pending;
+ 
+diff --git a/src/freedreno/vulkan/tu_darwin_trace.cc b/src/freedreno/vulkan/tu_darwin_trace.cc
+--- a/src/freedreno/vulkan/tu_darwin_trace.cc
++++ b/src/freedreno/vulkan/tu_darwin_trace.cc
+@@ -298,6 +298,9 @@
+       const struct trace_start_copy_buffer_to_image *data =
+          (const struct trace_start_copy_buffer_to_image *)payload;
+       trace_argument(&event, NativeAdrenoTraceArgDestinationFormat, data->format);
++      trace_argument(&event, NativeAdrenoTraceArgSourceBuffer, data->source_buffer);
++      trace_argument(&event, NativeAdrenoTraceArgDestinationImage, data->destination_image);
++      trace_argument(&event, NativeAdrenoTraceArgCopyOperation, data->copy_operation_id);
+    } else if (begin && !strcmp(stage, "copy_image_to_buffer")) {
+       const struct trace_start_copy_image_to_buffer *data =
+          (const struct trace_start_copy_image_to_buffer *)payload;
+@@ -576,6 +579,9 @@
+       pthread_mutex_unlock(&state->mutex);
+    }
+    cmd->darwin_trace_pending = false;
++   cmd->darwin_trace_copy_id = 0;
++   cmd->darwin_trace_copy_source = 0;
++   cmd->darwin_trace_copy_destination = 0;
+    cmd->darwin_trace_generation = 0;
+    cmd->trace.external_generation = 0;
+    cmd->rp_trace.external_generation = 0;
+@@ -719,7 +725,7 @@
+ {
+    VK_FROM_HANDLE(tu_device, device, handle);
+    tu_darwin_trace_state *state = trace_state(device);
+-   if (!state || !words || type < 1 || type > 7 || count > 4) {
++   if (!state || !words || type < 1 || type > 14 || count > 4) {
+       return;
+    }
+    const uint32_t generation = p_atomic_read(&state->active_generation);
+@@ -727,13 +733,21 @@
+       return;
+    }
+    static const char *names[] = {"", "metal_encoder", "metal_render_pass", "metal_attachment",
+-                                "metal_texture", "metal_pipeline", "metal_draw", "metal_encoder_end"};
++                                "metal_texture", "metal_pipeline", "metal_draw", "metal_encoder_end",
++                                "metal_copy", "metal_copy_region", "metal_copy_subresource",
++                                "metal_copy_offset", "metal_texture_image", "metal_image_layout",
++                                "metal_inplace_reason"};
+    NativeAdrenoTraceEvent event = trace_cpu_event(state, type, names[type]);
+    event.source = NativeAdrenoTraceSourceMetal;
+    event.flags = flags << 16;
+    if (command) {
+       VK_FROM_HANDLE(tu_cmd_buffer, cmd, command);
+       event.command_buffer_id = cmd->darwin_trace_id;
++      if (type == 8 && count == 4 && cmd->darwin_trace_generation == generation) {
++         cmd->darwin_trace_copy_id = words[0];
++         cmd->darwin_trace_copy_source = words[1];
++         cmd->darwin_trace_copy_destination = words[2];
++      }
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+       trace_argument(&event, type * 16 + i, words[i]);
+diff --git a/src/freedreno/vulkan/tu_tracepoints.py b/src/freedreno/vulkan/tu_tracepoints.py
+--- a/src/freedreno/vulkan/tu_tracepoints.py
++++ b/src/freedreno/vulkan/tu_tracepoints.py
+@@ -229,7 +229,10 @@
+ 
+ begin_end_tp('copy_buffer_to_image',
+     toggle_name='clear_blit',
+-    args=[Arg(type='enum VkFormat',  var='format',  c_format='%s', to_prim_type='vk_format_description({})->short_name')])
++    args=[Arg(type='enum VkFormat', var='format', c_format='%s', to_prim_type='vk_format_description({})->short_name'),
++          Arg(type='uint64_t', var='source_buffer', c_format='%" PRIu64 "'),
++          Arg(type='uint64_t', var='destination_image', c_format='%" PRIu64 "'),
++          Arg(type='uint64_t', var='copy_operation_id', c_format='%" PRIu64 "')])
+ 
+ begin_end_tp('copy_image_to_buffer',
+     toggle_name='clear_blit',
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -2912,7 +2912,19 @@
+    tu_cmd_use_buffer(cmd, src_buffer, TU_RESOURCE_READ);
+    tu_cmd_use_image(cmd, dst_image, TU_RESOURCE_WRITE);
+ 
+-   trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format);
++   const uint64_t source_buffer = (uint64_t)pCopyBufferToImageInfo->srcBuffer;
++   const uint64_t destination_image = (uint64_t)pCopyBufferToImageInfo->dstImage;
++   uint64_t copy_operation_id = 0;
++   if (cmd->darwin_trace_copy_source == source_buffer &&
++       cmd->darwin_trace_copy_destination == destination_image) {
++      copy_operation_id = cmd->darwin_trace_copy_id;
++   }
++   cmd->darwin_trace_copy_id = 0;
++   cmd->darwin_trace_copy_source = 0;
++   cmd->darwin_trace_copy_destination = 0;
++
++   trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format,
++                                   source_buffer, destination_image, copy_operation_id);
+ 
+    for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
+       tu_copy_buffer_to_image<CHIP>(cmd, src_buffer, dst_image,
