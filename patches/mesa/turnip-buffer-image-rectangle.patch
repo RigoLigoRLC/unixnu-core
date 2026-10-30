@@ -1,0 +1,255 @@
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -954,6 +954,39 @@
+                              .dest_type = nir_type_int32);
+ 
+    nir_store_var(b, out_color, tex, 0xf);
++   return b->shader;
++}
++
++static nir_shader *
++build_buffer_copy_fs_shader(void)
++{
++   nir_builder builder =
++      nir_builder_init_simple_shader(MESA_SHADER_FRAGMENT, NULL, "buffer copy fs");
++   nir_builder *b = &builder;
++
++   nir_variable *out_color =
++      nir_create_variable_with_location(b->shader, nir_var_shader_out,
++                                        FRAG_RESULT_DATA0, glsl_vec4_type());
++   nir_variable *in_coords =
++      nir_create_variable_with_location(b->shader, nir_var_shader_in,
++                                        VARYING_SLOT_VAR0, glsl_vec2_type());
++
++   b->shader->info.num_textures = 1;
++   BITSET_SET(b->shader->info.textures_used, 0);
++   BITSET_SET(b->shader->info.textures_used_by_txf, 0);
++
++   /* The full destination rectangle addresses source rows by their actual
++    * stride, as Mesa's vk_meta buffer-to-image fragment copy does. Turnip's
++    * formatted buffer descriptor supplies the UNORM conversion and swizzle.
++    */
++   nir_def *coords = nir_f2u32(b, nir_load_var(b, in_coords));
++   nir_def *row = nir_imul(b, nir_channel(b, coords, 1), load_const(b, 0, 1));
++   nir_def *index = nir_iadd(b, row, nir_channel(b, coords, 0));
++   nir_def *texel = nir_txf(b, index,
++                           .texture_index = 0,
++                           .dim = GLSL_SAMPLER_DIM_BUF,
++                           .dest_type = nir_type_float32);
++   nir_store_var(b, out_color, texel, 0xf);
+    return b->shader;
+ }
+ 
+@@ -1037,6 +1070,7 @@
+    compile_shader(dev, build_blit_fs_shader(false), 0, &offset, GLOBAL_SH_FS_BLIT);
+    compile_shader(dev, build_blit_fs_shader(true), 0, &offset, GLOBAL_SH_FS_BLIT_ZSCALE);
+    compile_shader(dev, build_ms_copy_fs_shader(), 0, &offset, GLOBAL_SH_FS_COPY_MS);
++   compile_shader(dev, build_buffer_copy_fs_shader(), 1, &offset, GLOBAL_SH_FS_COPY_BUFFER);
+ 
+    for (uint32_t num_rts = 0; num_rts <= MAX_RTS; num_rts++) {
+       compile_shader(dev, build_clear_fs_shader(num_rts), num_rts, &offset,
+@@ -1059,6 +1093,7 @@
+    R3D_CLEAR,
+    R3D_BLIT,
+    R3D_MULTI_BLIT,
++   R3D_BUFFER_COPY,
+ };
+ 
+ template <chip CHIP>
+@@ -1080,6 +1115,8 @@
+       fs_id = GLOBAL_SH_FS_BLIT_ZSCALE;
+    else if (src_samples != VK_SAMPLE_COUNT_1_BIT)
+       fs_id = GLOBAL_SH_FS_COPY_MS;
++   else if (type == R3D_BUFFER_COPY)
++      fs_id = GLOBAL_SH_FS_COPY_BUFFER;
+ 
+    unsigned num_rts = util_bitcount(rts_mask);
+    if (type == R3D_CLEAR)
+@@ -1861,6 +1898,7 @@
+    R3D_USE_MULTI_BLIT = 1 << 3,
+    R3D_OUTSIDE_PASS = 1 << 4,
+    R3D_OVERLAPPING = 1 << 5,
++   R3D_BUFFER_FETCH = 1 << 6,
+ };
+ 
+ template <chip CHIP>
+@@ -1918,8 +1956,9 @@
+       }
+    }
+ 
+-   const enum r3d_type type = (clear) ? R3D_CLEAR :
+-      ((blit_param & R3D_USE_MULTI_BLIT) ? R3D_MULTI_BLIT : R3D_BLIT);
++   const enum r3d_type type = clear ? R3D_CLEAR :
++      (blit_param & R3D_BUFFER_FETCH) ? R3D_BUFFER_COPY :
++      (blit_param & R3D_USE_MULTI_BLIT) ? R3D_MULTI_BLIT : R3D_BLIT;
+    r3d_common<CHIP>(cmd, cs, type, 1, blit_param & R3D_Z_SCALE, src_samples,
+                     dst_samples);
+ 
+@@ -2787,6 +2826,12 @@
+       *height = DIV_ROUND_UP(*height, block_height);
+ }
+ 
++enum tu_buffer_image_copy_path {
++   TU_BUFFER_IMAGE_COPY_LEGACY = 1 << 0,
++   TU_BUFFER_IMAGE_COPY_ROW_BATCH = 1 << 1,
++   TU_BUFFER_IMAGE_COPY_BUFFER_FETCH = 1 << 2,
++};
++
+ /* tu_buffer_image_copy_stats counts the commands and texels recorded for one
+  * Vulkan buffer-to-image copy, including all of its regions and layers. */
+ struct tu_buffer_image_copy_stats {
+@@ -2794,8 +2839,75 @@
+    uint64_t rows;           /* Copied rows across every region and layer. */
+    uint64_t commands;       /* CP_BLIT and RECTLIST draw packets. */
+    uint64_t batched_draws;  /* RECTLIST packets using the multi-blit shader. */
++   uint32_t paths;          /* Copy paths used by any region or layer. */
+ };
++
++template <chip CHIP>
++static bool
++tu_copy_buffer_to_image_rectangle(struct tu_cmd_buffer *cmd,
++                                  const struct fdl6_view *dst,
++                                  enum pipe_format format,
++                                  uint64_t src_va, uint32_t pitch,
++                                  uint64_t layer_size, uint32_t layers,
++                                  VkOffset3D offset, VkExtent3D extent,
++                                  struct tu_buffer_image_copy_stats *stats)
++{
++   if (CHIP != A6XX || extent.height < 2 ||
++       !((src_va & 63) || (pitch & 63))) {
++      return false;
++   }
+ 
++   switch (format) {
++   case PIPE_FORMAT_R8_UNORM:
++   case PIPE_FORMAT_R8G8_UNORM:
++   case PIPE_FORMAT_R8G8B8A8_UNORM:
++   case PIPE_FORMAT_B8G8R8A8_UNORM:
++      break;
++   default:
++      return false;
++   }
++
++   const uint32_t block_size = util_format_get_blocksize(format);
++   const uint64_t copied_span = (uint64_t)(extent.height - 1) * pitch +
++                                (uint64_t)extent.width * block_size;
++   const uint32_t max_elements =
++      cmd->device->physical_device->info->props.max_texel_buffer_range_elements;
++   if (src_va % block_size || copied_span > UINT32_MAX ||
++       copied_span / block_size > max_elements) {
++      return false;
++   }
++
++   struct tu_cs *cs = &cmd->cs;
++   r3d_setup<CHIP>(cmd, cs, format, format, VK_IMAGE_ASPECT_COLOR_BIT,
++                   R3D_COPY | R3D_BUFFER_FETCH, false, dst->ubwc_enabled,
++                   VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT);
++   const uint32_t source_stride[] = {pitch / block_size, 0, 0, 0};
++   tu6_emit_blit_consts_load(cmd, cs, CP_LOAD_STATE6_FRAG, SB6_FS_SHADER, 0,
++                             source_stride, 1);
++   r3d_coords(cmd, cs, {offset.x, offset.y}, {0, 0}, {extent.width, extent.height});
++
++   for (uint32_t layer = 0; layer < layers; layer++) {
++      uint32_t descriptor[FDL6_TEX_CONST_DWORDS];
++      /* The buffer descriptor retains the source's texel offset within its
++       * aligned address. Its range includes row gaps through the last texel;
++       * the shader fetches only coordinates inside the destination rectangle.
++       */
++      fdl6_buffer_view_init<CHIP>(descriptor, format, tu_swiz(X, Y, Z, W),
++                                  src_va + layer_size * layer, copied_span);
++      r3d_src_common<CHIP>(cmd, cs, descriptor, 0, 0, VK_FILTER_NEAREST);
++      r3d_dst<CHIP>(cs, dst, layer, format);
++      if (vk_command_buffer_has_error(&cmd->vk) || cs->record_result != VK_SUCCESS) {
++         return true;
++      }
++      r3d_run(cmd, cs);
++      stats->commands++;
++   }
++
++   stats->paths |= TU_BUFFER_IMAGE_COPY_BUFFER_FETCH;
++   r3d_teardown<CHIP>(cmd, cs);
++   return true;
++}
++
+ template <chip CHIP>
+ static bool
+ tu_copy_buffer_to_image_batched(struct tu_cmd_buffer *cmd,
+@@ -2890,6 +3002,7 @@
+       }
+    }
+ 
++   stats->paths |= TU_BUFFER_IMAGE_COPY_ROW_BATCH;
+    r3d_teardown<CHIP>(cmd, cs);
+    return true;
+ }
+@@ -2947,12 +3060,21 @@
+ 
+    if (info->imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+        dst_image->layout[0].nr_samples == 1 &&
++       tu_copy_buffer_to_image_rectangle<CHIP>(cmd, &dst, dst_format,
++          vk_buffer_address(&src_buffer->vk, info->bufferOffset), pitch,
++          layer_size, layers, offset, extent, stats)) {
++      return;
++   }
++
++   if (info->imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
++       dst_image->layout[0].nr_samples == 1 &&
+        tu_copy_buffer_to_image_batched<CHIP>(cmd, &dst, dst_format,
+           vk_buffer_address(&src_buffer->vk, info->bufferOffset), pitch,
+           layer_size, layers, offset, extent, stats)) {
+       return;
+    }
+ 
++   stats->paths |= TU_BUFFER_IMAGE_COPY_LEGACY;
+    ops->setup(cmd, cs, src_format, dst_format,
+               info->imageSubresource.aspectMask, blit_param, false, dst_image->layout[0].ubwc,
+               (VkSampleCountFlagBits) dst_image->layout[0].nr_samples,
+@@ -3059,7 +3181,7 @@
+    }
+ 
+    trace_end_copy_buffer_to_image(&cmd->trace, &cmd->cs, stats.bytes, stats.rows,
+-                                  stats.commands, stats.batched_draws);
++                                  stats.commands, stats.batched_draws, stats.paths);
+ }
+ TU_GENX(tu_CmdCopyBufferToImage2);
+ 
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -51,6 +51,7 @@
+    GLOBAL_SH_FS_BLIT,
+    GLOBAL_SH_FS_BLIT_ZSCALE,
+    GLOBAL_SH_FS_COPY_MS,
++   GLOBAL_SH_FS_COPY_BUFFER,
+    GLOBAL_SH_FS_CLEAR0,
+    GLOBAL_SH_FS_CLEAR_MAX = GLOBAL_SH_FS_CLEAR0 + MAX_RTS,
+    GLOBAL_SH_COUNT,
+--- a/src/freedreno/vulkan/tu_tracepoints.py
++++ b/src/freedreno/vulkan/tu_tracepoints.py
+@@ -236,7 +236,8 @@
+     end_args=[Arg(type='uint64_t', var='bytes', c_format='%" PRIu64 "'),
+               Arg(type='uint64_t', var='rows', c_format='%" PRIu64 "'),
+               Arg(type='uint64_t', var='commands', c_format='%" PRIu64 "'),
+-              Arg(type='uint64_t', var='batched_draws', c_format='%" PRIu64 "')])
++              Arg(type='uint64_t', var='batched_draws', c_format='%" PRIu64 "'),
++              Arg(type='uint32_t', var='paths', c_format='%u')])
+ 
+ begin_end_tp('copy_image_to_buffer',
+     toggle_name='clear_blit',
+--- a/src/freedreno/vulkan/tu_darwin_trace.cc
++++ b/src/freedreno/vulkan/tu_darwin_trace.cc
+@@ -321,6 +321,15 @@
+       trace_argument(&event, NativeAdrenoTraceArgDrawCount, data->commands);
+       trace_argument(&event, NativeAdrenoTraceArgCopyRows, data->rows);
+       trace_argument(&event, NativeAdrenoTraceArgCopyBatchedDraws, data->batched_draws);
++      if (data->paths & (1u << 0)) {
++         event.flags |= NativeAdrenoTraceCopyLegacy;
++      }
++      if (data->paths & (1u << 1)) {
++         event.flags |= NativeAdrenoTraceCopyRowMultiBlit;
++      }
++      if (data->paths & (1u << 2)) {
++         event.flags |= NativeAdrenoTraceCopyBufferFetchRectangle;
++      }
+    } else if (begin && !strcmp(stage, "copy_image_to_buffer")) {
+       const struct trace_start_copy_image_to_buffer *data =
+          (const struct trace_start_copy_image_to_buffer *)payload;
