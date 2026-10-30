@@ -1,0 +1,488 @@
+diff --git a/src/freedreno/vulkan/tu_pipeline.cc b/src/freedreno/vulkan/tu_pipeline.cc
+--- a/src/freedreno/vulkan/tu_pipeline.cc
++++ b/src/freedreno/vulkan/tu_pipeline.cc
+@@ -19,6 +19,7 @@
+ #include "vk_nir.h"
+ #include "vk_pipeline.h"
+ #include "vk_render_pass.h"
++#include "vk_shader_module.h"
+ #include "vk_util.h"
+ 
+ #include "common/freedreno_guardband.h"
+@@ -32,6 +33,76 @@
+ #include "tu_pass.h"
+ #include "tu_rmv.h"
+ 
++#include <atomic>
++#include <mutex>
++#include <string>
++#include <vector>
++#include <fcntl.h>
++#include <errno.h>
++#include <sys/stat.h>
++#include <time.h>
++#include <unistd.h>
++
++/* ShaderCaptureFiles owns one process's bounded output directory. Its writer
++ * publishes completed files with rename and records refusals in a status file.
++ * AIR libraries, translator output and driver output have separate byte budgets.
++ */
++struct ShaderCaptureFiles {
++   std::mutex lock;
++   std::string prefix;
++   uint64_t session = 0;
++   uint64_t bytes[3] = {};
++   uint64_t files = 0;
++   uint64_t refused = 0;
++   uint64_t failures = 0;
++   const char *reason = "initializing";
++
++   ShaderCaptureFiles()
++   {
++      const char *root = "/private/var/mobile/Library/Caches/NativeAdrenoShaderCapture";
++      const char *marker = "/private/var/ngpu/addons/NativeAdrenoMetal.shadercapture";
++      std::string enabled = std::string(root) + "/enabled";
++      if (access(marker, R_OK) && access(enabled.c_str(), R_OK)) {
++         reason = "disabled";
++         return;
++      }
++
++      mkdir(root, 0777);
++      chmod(root, 0777);
++      std::string directory = std::string(root) + "/" + std::to_string(getpid());
++      mkdir(directory.c_str(), 0700);
++      if (access(directory.c_str(), W_OK)) {
++         reason = "directory-not-writable";
++         return;
++      }
++
++      struct timespec now = {};
++      clock_gettime(CLOCK_MONOTONIC, &now);
++      session = uint64_t(now.tv_sec) * 1000000000ull + now.tv_nsec;
++      prefix = directory + "/s" + std::to_string(session) + "_";
++      reason = "enabled";
++   }
++};
++
++static ShaderCaptureFiles &
++shader_capture_files()
++{
++   static ShaderCaptureFiles files;
++   return files;
++}
++
++static bool
++shader_capture_enabled()
++{
++   return !shader_capture_files().prefix.empty();
++}
++
++static void capture_pipeline(VkDevice device, VkPipeline pipeline,
++                             VkPipelineCreateFlags2KHR flags,
++                             uint32_t feedback_flags,
++                             const VkPipelineShaderStageCreateInfo *stages,
++                             uint32_t stage_count, const void *next);
++
+ /* Emit IB that preloads the descriptors that the shader uses */
+ 
+ static void
+@@ -4886,12 +4957,24 @@
+    for (; i < count; i++) {
+       VkPipelineCreateFlags2KHR flags =
+          vk_graphics_pipeline_create_flags(&pCreateInfos[i]);
++      if (shader_capture_enabled()) {
++         flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR |
++                  VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
++      }
+ 
+       VkResult result =
+          tu_graphics_pipeline_create<CHIP>(device, pipelineCache,
+                                            &pCreateInfos[i], flags,
+                                            pAllocator, &pPipelines[i]);
+ 
++      if (result == VK_SUCCESS && shader_capture_enabled()) {
++         const VkPipelineCreationFeedbackCreateInfo *feedback =
++            vk_find_struct_const(pCreateInfos[i].pNext, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
++         capture_pipeline(device, pPipelines[i], flags,
++            feedback ? feedback->pPipelineCreationFeedback->flags : UINT32_MAX,
++            pCreateInfos[i].pStages, pCreateInfos[i].stageCount, pCreateInfos[i].pNext);
++      }
++
+       if (result != VK_SUCCESS) {
+          final_result = result;
+          pPipelines[i] = VK_NULL_HANDLE;
+@@ -5099,11 +5182,22 @@
+    for (; i < count; i++) {
+       VkPipelineCreateFlags2KHR flags =
+          vk_compute_pipeline_create_flags(&pCreateInfos[i]);
++      if (shader_capture_enabled()) {
++         flags |= VK_PIPELINE_CREATE_2_CAPTURE_INTERNAL_REPRESENTATIONS_BIT_KHR |
++                  VK_PIPELINE_CREATE_2_CAPTURE_STATISTICS_BIT_KHR;
++      }
+ 
+       VkResult result =
+          tu_compute_pipeline_create<CHIP>(device, pipelineCache,
+                                           &pCreateInfos[i], flags,
+                                           pAllocator, &pPipelines[i]);
++      if (result == VK_SUCCESS && shader_capture_enabled()) {
++         const VkPipelineCreationFeedbackCreateInfo *feedback =
++            vk_find_struct_const(pCreateInfos[i].pNext, PIPELINE_CREATION_FEEDBACK_CREATE_INFO);
++         capture_pipeline(device, pPipelines[i], flags,
++            feedback ? feedback->pPipelineCreationFeedback->flags : UINT32_MAX,
++            &pCreateInfos[i].stage, 1, pCreateInfos[i].pNext);
++      }
+       if (result != VK_SUCCESS) {
+          final_result = result;
+          pPipelines[i] = VK_NULL_HANDLE;
+@@ -5292,4 +5386,299 @@
+    }
+ 
+    return incomplete_text ? VK_INCOMPLETE : vk_outarray_status(&out);
++}
++
++static bool
++capture_write_file(const std::string &path, const void *bytes, size_t size)
++{
++   std::string temporary = path + ".part";
++   int descriptor = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
++   if (descriptor < 0) {
++      return false;
++   }
++
++   size_t at = 0;
++   while (at < size) {
++      ssize_t written = write(descriptor, static_cast<const char *>(bytes) + at, size - at);
++      if (written < 0 && errno == EINTR) {
++         continue;
++      }
++      if (written <= 0) {
++         break;
++      }
++      at += written;
++   }
++
++   bool complete = at == size;
++   if (close(descriptor)) {
++      complete = false;
++   }
++   if (complete && !rename(temporary.c_str(), path.c_str())) {
++      return true;
++   }
++   unlink(temporary.c_str());
++   return false;
+ }
++
++static void
++capture_status(ShaderCaptureFiles &files)
++{
++   char status[768];
++   int size = snprintf(status, sizeof(status),
++      "{\"version\":1,\"pid\":%d,\"session_id\":%llu,\"files\":%llu,"
++      "\"input_bytes\":%llu,\"spirv_metadata_bytes\":%llu,\"driver_bytes\":%llu,"
++      "\"refused\":%llu,\"write_failures\":%llu,\"last_reason\":\"%s\","
++      "\"file_limit\":4096,\"single_file_limit\":16777216,"
++      "\"input_limit\":33554432,\"spirv_metadata_limit\":33554432,"
++      "\"driver_limit\":67108864}\n",
++      getpid(), (unsigned long long)files.session, (unsigned long long)files.files,
++      (unsigned long long)files.bytes[0], (unsigned long long)files.bytes[1],
++      (unsigned long long)files.bytes[2], (unsigned long long)files.refused,
++      (unsigned long long)files.failures, files.reason);
++   capture_write_file(files.prefix + "status.json", status, size);
++}
++
++VKAPI_ATTR uint64_t VKAPI_CALL
++tu_NativeAdrenoShaderCaptureWrite(VkDevice device, const char *name,
++                                 const void *bytes, size_t size)
++{
++   (void)device;
++   ShaderCaptureFiles &files = shader_capture_files();
++   if (files.prefix.empty()) {
++      return 0;
++   }
++   std::lock_guard<std::mutex> guard(files.lock);
++   if (!name) {
++      capture_status(files);
++      return files.session;
++   }
++
++   size_t length = strnlen(name, 161);
++   bool valid = length && length <= 160 && bytes;
++   for (size_t i = 0; valid && i < length; ++i) {
++      char c = name[i];
++      valid = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
++              c == '-' || c == '_' || c == '.';
++   }
++   valid = valid && !strstr(name, "..");
++
++   std::string path = files.prefix + name;
++   if (valid && !access(path.c_str(), F_OK)) {
++      return files.session;
++   }
++
++   unsigned category = !strncmp(name, "input-", 6) ? 0 :
++                       !strncmp(name, "driver-", 7) ? 2 : 1;
++   const uint64_t limits[] = {32ull << 20, 32ull << 20, 64ull << 20};
++   if (!valid || size > (16ull << 20) || files.files >= 4095 ||
++       size > limits[category] - files.bytes[category]) {
++      ++files.refused;
++      files.reason = !valid ? "invalid-name" : size > (16ull << 20) ?
++         "single-file-limit" : files.files >= 4095 ? "file-count-limit" :
++         category == 0 ? "input-byte-limit" : category == 1 ?
++         "spirv-metadata-byte-limit" : "driver-byte-limit";
++      capture_status(files);
++      return 0;
++   }
++
++   if (!capture_write_file(path, bytes, size)) {
++      ++files.failures;
++      files.reason = "write-failed";
++      capture_status(files);
++      return 0;
++   }
++
++   ++files.files;
++   files.bytes[category] += size;
++   files.reason = "written";
++   capture_status(files);
++   return files.session;
++}
++
++VKAPI_ATTR uint64_t VKAPI_CALL
++tu_NativeAdrenoShaderCapturePipelineId(VkDevice device, VkPipeline handle)
++{
++   (void)device;
++   VK_FROM_HANDLE(tu_pipeline, pipeline, handle);
++   return pipeline ? pipeline->shader_capture_id : 0;
++}
++
++const char *
++tu_NativeAdrenoShaderCapturePrefix(void)
++{
++   return shader_capture_files().prefix.c_str();
++}
++
++/* capture_pipeline reads the driver's existing KHR executable representations.
++ * Each record names the actual VkPipeline and an allocation-specific ID, so a
++ * later pipeline reusing its address remains distinguishable in the capture.
++ */
++static void
++capture_pipeline(VkDevice device, VkPipeline handle,
++                  VkPipelineCreateFlags2KHR flags, uint32_t feedback_flags,
++                  const VkPipelineShaderStageCreateInfo *stages,
++                  uint32_t stage_count, const void *next)
++{
++   VK_FROM_HANDLE(tu_pipeline, pipeline, handle);
++   static std::atomic<uint64_t> next_id{1};
++   pipeline->shader_capture_id = next_id.fetch_add(1);
++   std::string stem = "driver-pipeline-" + std::to_string(pipeline->shader_capture_id);
++   VkPipelineInfoKHR info = {};
++   info.sType = VK_STRUCTURE_TYPE_PIPELINE_INFO_KHR;
++   info.pipeline = handle;
++   uint32_t count = 0;
++   VkResult result = tu_GetPipelineExecutablePropertiesKHR(device, &info, &count, NULL);
++   if (result != VK_SUCCESS || count > 32) {
++      std::string error = "version=1\ncapture_id=" + std::to_string(pipeline->shader_capture_id) +
++         "\nexecutable_query_result=" + std::to_string(result) +
++         "\nexecutable_count=" + std::to_string(count) + "\n";
++      tu_NativeAdrenoShaderCaptureWrite(device, (stem + ".txt").c_str(), error.data(), error.size());
++      return;
++   }
++
++   std::vector<VkPipelineExecutablePropertiesKHR> executables(count);
++   for (auto &entry : executables) {
++      entry.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_PROPERTIES_KHR;
++   }
++   result = tu_GetPipelineExecutablePropertiesKHR(device, &info, &count, executables.data());
++   std::string metadata = "version=1\npid=" + std::to_string(getpid()) +
++      "\ncapture_id=" + std::to_string(pipeline->shader_capture_id) +
++      "\nvk_pipeline=" + std::to_string((uintptr_t)handle) +
++      "\ncreate_flags=" + std::to_string(flags) +
++      "\ncreation_feedback_flags=" + std::to_string(feedback_flags) +
++      "\napplication_pipeline_cache_hit=" +
++         (feedback_flags == UINT32_MAX ? std::string("unreported") :
++          std::to_string(!!(feedback_flags & VK_PIPELINE_CREATION_FEEDBACK_APPLICATION_PIPELINE_CACHE_HIT_BIT))) +
++      "\nquery_result=" + std::to_string(result) + "\n";
++
++   const VkPipelineLibraryCreateInfoKHR *libraries =
++      vk_find_struct_const(next, PIPELINE_LIBRARY_CREATE_INFO_KHR);
++   if (libraries) {
++      for (uint32_t i = 0; i < libraries->libraryCount; ++i) {
++         metadata += "linked_pipeline_capture_id=" + std::to_string(
++            tu_NativeAdrenoShaderCapturePipelineId(device, libraries->pLibraries[i])) + "\n";
++      }
++   }
++   for (uint32_t i = 0; i < stage_count; ++i) {
++      VK_FROM_HANDLE(vk_shader_module, module, stages[i].module);
++      metadata += "source_stage=" + std::to_string(stages[i].stage) +
++         " entry=" + (stages[i].pName ? stages[i].pName : "") +
++         " module=" + std::to_string((uintptr_t)stages[i].module) + "\n";
++      if (module && module->size) {
++         static const char digits[] = "0123456789abcdef";
++         std::string identity;
++         for (unsigned j = 0; j < sizeof(module->hash); ++j) {
++            uint8_t byte = reinterpret_cast<const uint8_t *>(&module->hash)[j];
++            identity += digits[byte >> 4];
++            identity += digits[byte & 15];
++         }
++         std::string file = "spirv-input-" + identity + ".spv";
++         uint64_t saved = tu_NativeAdrenoShaderCaptureWrite(device, file.c_str(),
++            module->data, module->size);
++         metadata += "spirv=" + file + " saved=" + std::to_string(saved != 0) + "\n";
++      }
++      const VkSpecializationInfo *specialization = stages[i].pSpecializationInfo;
++      if (specialization) {
++         const uint8_t *values = static_cast<const uint8_t *>(specialization->pData);
++         for (uint32_t j = 0; j < specialization->mapEntryCount; ++j) {
++            const VkSpecializationMapEntry &entry = specialization->pMapEntries[j];
++            metadata += "spec id=" + std::to_string(entry.constantID) +
++               " offset=" + std::to_string(entry.offset) +
++               " size=" + std::to_string(entry.size) + " bytes=";
++            if (entry.offset <= specialization->dataSize &&
++                entry.size <= specialization->dataSize - entry.offset) {
++               for (size_t k = 0; k < entry.size; ++k) {
++                  char byte[3];
++                  snprintf(byte, sizeof(byte), "%02x", values[entry.offset + k]);
++                  metadata += byte;
++               }
++            }
++            metadata += "\n";
++         }
++      }
++   }
++
++   for (uint32_t i = 0; result == VK_SUCCESS && i < count; ++i) {
++      VkPipelineExecutableInfoKHR executable = {};
++      executable.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INFO_KHR;
++      executable.pipeline = handle;
++      executable.executableIndex = i;
++      std::string stage = stem + "-stage-" + std::to_string(i);
++      metadata += "executable=" + std::to_string(i) + " name=" + executables[i].name +
++         " stages=" + std::to_string(executables[i].stages) +
++         " subgroup=" + std::to_string(executables[i].subgroupSize) + "\n";
++
++      uint32_t statistics_count = 0;
++      VkResult statistics_result = tu_GetPipelineExecutableStatisticsKHR(
++         device, &executable, &statistics_count, NULL);
++      if (statistics_result == VK_SUCCESS && statistics_count <= 128) {
++         std::vector<VkPipelineExecutableStatisticKHR> statistics(statistics_count);
++         for (auto &statistic : statistics) {
++            statistic.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_STATISTIC_KHR;
++         }
++         statistics_result = tu_GetPipelineExecutableStatisticsKHR(
++            device, &executable, &statistics_count, statistics.data());
++         for (const auto &statistic : statistics) {
++            std::string value;
++            switch (statistic.format) {
++               case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_BOOL32_KHR:
++                  value = std::to_string(statistic.value.b32);
++                  break;
++               case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_INT64_KHR:
++                  value = std::to_string(statistic.value.i64);
++                  break;
++               case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_UINT64_KHR:
++                  value = std::to_string(statistic.value.u64);
++                  break;
++               case VK_PIPELINE_EXECUTABLE_STATISTIC_FORMAT_FLOAT64_KHR:
++                  value = std::to_string(statistic.value.f64);
++                  break;
++               default:
++                  value = "unsupported";
++                  break;
++            }
++            metadata += "stat stage=" + std::to_string(i) + " name=" + statistic.name +
++               " value=" + value + " description=" + statistic.description + "\n";
++         }
++      }
++
++      uint32_t ir_count = 0;
++      VkResult ir_result = tu_GetPipelineExecutableInternalRepresentationsKHR(
++         device, &executable, &ir_count, NULL);
++      if (ir_result != VK_SUCCESS || ir_count > 8) {
++         metadata += "ir-query-failed=" + std::to_string(ir_result) + "\n";
++         continue;
++      }
++      std::vector<VkPipelineExecutableInternalRepresentationKHR> representations(ir_count);
++      for (auto &ir : representations) {
++         ir.sType = VK_STRUCTURE_TYPE_PIPELINE_EXECUTABLE_INTERNAL_REPRESENTATION_KHR;
++      }
++      ir_result = tu_GetPipelineExecutableInternalRepresentationsKHR(
++         device, &executable, &ir_count, representations.data());
++      std::vector<std::vector<char>> buffers(ir_count);
++      for (uint32_t j = 0; j < ir_count; ++j) {
++         if (representations[j].dataSize > (16u << 20)) {
++            metadata += "ir-too-large=" + std::to_string(j) + "\n";
++            continue;
++         }
++         buffers[j].resize(representations[j].dataSize);
++         representations[j].pData = buffers[j].data();
++      }
++      ir_result = tu_GetPipelineExecutableInternalRepresentationsKHR(
++         device, &executable, &ir_count, representations.data());
++      for (uint32_t j = 0; j < ir_count; ++j) {
++         if (buffers[j].empty()) {
++            continue;
++         }
++         std::string file = stage + "-ir-" + std::to_string(j) + ".txt";
++         uint64_t saved = tu_NativeAdrenoShaderCaptureWrite(device, file.c_str(),
++            buffers[j].data(), buffers[j].size());
++         metadata += "ir stage=" + std::to_string(i) + " file=" + file +
++            " name=" + representations[j].name + " bytes=" +
++            std::to_string(buffers[j].size()) + " saved=" + std::to_string(saved != 0) +
++            " query_result=" + std::to_string(ir_result) + "\n";
++      }
++   }
++   tu_NativeAdrenoShaderCaptureWrite(device, (stem + ".txt").c_str(),
++      metadata.data(), metadata.size());
++}
+diff --git a/src/freedreno/vulkan/tu_pipeline.h b/src/freedreno/vulkan/tu_pipeline.h
+--- a/src/freedreno/vulkan/tu_pipeline.h
++++ b/src/freedreno/vulkan/tu_pipeline.h
+@@ -180,6 +180,7 @@
+ {
+    struct vk_object_base base;
+    enum tu_pipeline_type type;
++   uint64_t shader_capture_id;
+ 
+    struct tu_cs cs;
+    struct tu_suballoc_bo bo;
+@@ -228,7 +229,16 @@
+    /* tu_pipeline_executable */
+    struct util_dynarray executables;
+ };
++
++VKAPI_ATTR uint64_t VKAPI_CALL
++tu_NativeAdrenoShaderCaptureWrite(VkDevice device, const char *name,
++                                 const void *bytes, size_t size);
++
++VKAPI_ATTR uint64_t VKAPI_CALL
++tu_NativeAdrenoShaderCapturePipelineId(VkDevice device, VkPipeline pipeline);
+ 
++const char *tu_NativeAdrenoShaderCapturePrefix(void);
++
+ struct tu_graphics_lib_pipeline {
+    struct tu_pipeline base;
+ 
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -33,6 +33,7 @@
+ #include "tu_darwin_trace.h"
+ #include "tu_dynamic_rendering.h"
+ #include "tu_knl.h"
++#include "tu_pipeline.h"
+ #include "tu_queue.h"
+ #include "tu_rmv.h"
+ 
+@@ -2972,6 +2973,12 @@
+    if (!strcmp(name, "vkNativeAdrenoTraceMetal")) {
+       return (PFN_vkVoidFunction)tu_NativeAdrenoTraceMetal;
+    }
++   if (!strcmp(name, "vkNativeAdrenoShaderCaptureWrite")) {
++      return (PFN_vkVoidFunction)tu_NativeAdrenoShaderCaptureWrite;
++   }
++   if (!strcmp(name, "vkNativeAdrenoShaderCapturePipelineId")) {
++      return (PFN_vkVoidFunction)tu_NativeAdrenoShaderCapturePipelineId;
++   }
+    if (!strcmp(name, "vkNativeAdrenoDeviceHostCoherent") ||
+        !strcmp(name, "vkNativeAdrenoDeviceCacheMaintenance")) {
+       return (PFN_vkVoidFunction)tu_NativeAdrenoDeviceHostCoherent;
