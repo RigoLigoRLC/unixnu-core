@@ -1,3 +1,4 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
 --- a/src/freedreno/vulkan/tu_knl_darwin.cc
 +++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -31,6 +31,7 @@
@@ -99,6 +100,7 @@
        p_atomic_set(&queue->fence, fence);
     } else {
        /* Nothing to run: the signals resolve with the last earlier submission. */
+diff --git a/src/freedreno/vulkan/meson.build b/src/freedreno/vulkan/meson.build
 --- a/src/freedreno/vulkan/meson.build
 +++ b/src/freedreno/vulkan/meson.build
 @@ -139,7 +139,7 @@
@@ -110,6 +112,8 @@
    tu_flags += '-DTU_BUILTIN_SOURCE_ID="' + get_option('tu-builtin-source-id') + '"'
    if get_option('tu-builtin-pack-header') != ''
      tu_flags += '-DTU_BUILTIN_PACK_HEADER="' + get_option('tu-builtin-pack-header') + '"'
+diff --git a/src/freedreno/vulkan/tu_darwin_pm4.h b/src/freedreno/vulkan/tu_darwin_pm4.h
+new file mode 100644
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_darwin_pm4.h
 @@ -0,0 +1,18 @@
@@ -131,6 +135,8 @@
 +void tu_darwin_pm4_end(struct tu_darwin_pm4_snapshot *capture, int32_t result, uint32_t completion);
 +
 +#endif
+diff --git a/src/freedreno/vulkan/tu_darwin_pm4.cc b/src/freedreno/vulkan/tu_darwin_pm4.cc
+new file mode 100644
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_darwin_pm4.cc
 @@ -0,0 +1,453 @@
