@@ -1,0 +1,589 @@
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -31,6 +31,7 @@
+ #include "tu_cs.h"
+ #include "tu_device.h"
+ #include "tu_darwin_trace.h"
++#include "tu_darwin_pm4.h"
+ #include "tu_dynamic_rendering.h"
+ #include "tu_knl.h"
+ #include "tu_pipeline.h"
+@@ -2024,6 +2025,8 @@
+    struct util_dynarray native_ranges; /* NativeAdrenoAbiSubmitResourceV2 */
+    VkResult result;
+    uint32_t fallback_reasons;
++   uint64_t recording_ids[256];
++   unsigned recording_count;
+ };
+ 
+ struct darwin_submit_resource {
+@@ -2103,6 +2106,10 @@
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    submit->fallback_reasons |= cmd->resource_fallback_reasons;
++   if (submit->recording_count < ARRAY_SIZE(submit->recording_ids)) {
++      submit->recording_ids[submit->recording_count] = cmd->darwin_trace_id;
++   }
++   ++submit->recording_count;
+ 
+    const struct tu_cs *streams[] = {
+       &cmd->cs, &cmd->draw_cs, &cmd->tile_store_cs, &cmd->draw_epilogue_cs,
+@@ -2875,6 +2882,32 @@
+    }
+ }
+ 
++static tu_darwin_pm4_snapshot *
++darwin_capture_pm4(struct tu_queue *queue, struct tu_darwin_queue_submit *submit)
++{
++   if (!util_dynarray_num_elements(&submit->commands, NativeAdrenoAbiSubmitBuffer)) {
++      return nullptr;
++   }
++   tu_darwin_pm4_snapshot *capture = tu_darwin_pm4_begin(queue);
++   if (!capture) {
++      return nullptr;
++   }
++   util_dynarray_foreach (&submit->resources, struct darwin_submit_resource, resource) {
++      tu_darwin_pm4_resource(capture, resource->bo);
++   }
++   util_dynarray_foreach (&submit->commands, NativeAdrenoAbiSubmitBuffer, command) {
++      tu_darwin_pm4_ib(capture, command->iova, command->bytes);
++   }
++   for (unsigned i = 0; i < MIN2(submit->recording_count, ARRAY_SIZE(submit->recording_ids)); ++i) {
++      tu_darwin_pm4_command(capture, submit->recording_ids[i]);
++   }
++   if (submit->recording_count > ARRAY_SIZE(submit->recording_ids)) {
++      tu_darwin_pm4_command(capture, 0);
++   }
++   tu_darwin_pm4_prepare(capture);
++   return capture;
++}
++
+ static VkResult
+ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+                     struct vk_sync_wait *waits, uint32_t wait_count,
+@@ -2895,8 +2928,10 @@
+          return result;
+       }
+       uint32_t completion = 0;
++      tu_darwin_pm4_snapshot *capture = darwin_capture_pm4(queue, submit);
+       result = darwin_submit_v2(queue, submit, caps, &completion,
+          waits, wait_count, signals, signal_count);
++      tu_darwin_pm4_end(capture, result, completion);
+       if (result != VK_SUCCESS) {
+          return result;
+       }
+@@ -2929,6 +2964,7 @@
+ 
+       const NativeAdrenoAbiSubmitBuffer *all =
+          util_dynarray_element(&submit->commands, NativeAdrenoAbiSubmitBuffer, 0);
++      tu_darwin_pm4_snapshot *capture = darwin_capture_pm4(queue, submit);
+       const unsigned increment = caps.version ? total : (unsigned)NativeAdrenoAbiMaxBuffers;
+       for (unsigned at = 0; at < total; at += increment) {
+          unsigned count = MIN2(total - at, (unsigned)NativeAdrenoAbiMaxBuffers);
+@@ -2936,14 +2972,17 @@
+          VkResult result = caps.version ?
+             darwin_submit_v2(queue, submit, caps, &chunk_fence) :
+             darwin_submit_chunk(queue, all + at, count, &chunk_fence);
+-         if (result != VK_SUCCESS)
++         if (result != VK_SUCCESS) {
++            tu_darwin_pm4_end(capture, result, fence);
+             return result;
++         }
+          darwin_publish_resource_fence(submit, chunk_fence);
+          pthread_mutex_lock(&dw.lock);
+          darwin_note_fence(&dw, chunk_fence);
+          pthread_mutex_unlock(&dw.lock);
+          fence = chunk_fence;
+       }
++      tu_darwin_pm4_end(capture, VK_SUCCESS, fence);
+       p_atomic_set(&queue->fence, fence);
+    } else {
+       /* Nothing to run: the signals resolve with the last earlier submission. */
+--- a/src/freedreno/vulkan/meson.build
++++ b/src/freedreno/vulkan/meson.build
+@@ -139,7 +139,7 @@
+ 
+ if freedreno_kmds.contains('darwin')
+   tu_flags += '-DTU_HAS_DARWIN'
+-  libtu_files += files('tu_knl_darwin.cc', 'tu_builtin_cache.cc', 'tu_darwin_trace.cc')
++  libtu_files += files('tu_knl_darwin.cc', 'tu_builtin_cache.cc', 'tu_darwin_trace.cc', 'tu_darwin_pm4.cc')
+   tu_flags += '-DTU_BUILTIN_SOURCE_ID="' + get_option('tu-builtin-source-id') + '"'
+   if get_option('tu-builtin-pack-header') != ''
+     tu_flags += '-DTU_BUILTIN_PACK_HEADER="' + get_option('tu-builtin-pack-header') + '"'
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_darwin_pm4.h
+@@ -0,0 +1,18 @@
++/* SPDX-License-Identifier: MIT */
++#ifndef TU_DARWIN_PM4_H
++#define TU_DARWIN_PM4_H
++
++#include <stdint.h>
++
++struct tu_bo;
++struct tu_queue;
++struct tu_darwin_pm4_snapshot;
++
++struct tu_darwin_pm4_snapshot *tu_darwin_pm4_begin(struct tu_queue *queue);
++void tu_darwin_pm4_resource(struct tu_darwin_pm4_snapshot *capture, struct tu_bo *bo);
++void tu_darwin_pm4_ib(struct tu_darwin_pm4_snapshot *capture, uint64_t address, uint32_t bytes);
++void tu_darwin_pm4_command(struct tu_darwin_pm4_snapshot *capture, uint64_t recording_id);
++void tu_darwin_pm4_prepare(struct tu_darwin_pm4_snapshot *capture);
++void tu_darwin_pm4_end(struct tu_darwin_pm4_snapshot *capture, int32_t result, uint32_t completion);
++
++#endif
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_darwin_pm4.cc
+@@ -0,0 +1,453 @@
++/* SPDX-License-Identifier: MIT */
++#include "tu_darwin_pm4.h"
++#include "tu_device.h"
++#include "tu_knl.h"
++#include "tu_pipeline.h"
++#include "tu_queue.h"
++#include "common/freedreno_pm4.h"
++#include "common/redump.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <errno.h>
++#include <fcntl.h>
++#include <pthread.h>
++#include <sstream>
++#include <string>
++#include <sys/stat.h>
++#include <unistd.h>
++
++static constexpr size_t byte_limit = 16u << 20;
++static constexpr unsigned object_limit = 4096;
++static constexpr unsigned reference_limit = 2048;
++
++struct pm4_range {
++   uint64_t address;
++   uint32_t bytes;
++   uint32_t offset;
++};
++
++struct pm4_reference {
++   uint64_t address;
++   uint64_t parent;
++   uint32_t bytes;
++   unsigned kind; /* 0 top-level IB, 1 nested IB, 2 draw state, 3 external state address. */
++   const char *reason;
++};
++
++struct pm4_object {
++   uint64_t address, bytes;
++   uint32_t flags;
++   bool mapped;
++};
++
++/* tu_darwin_pm4_snapshot owns a bounded CPU copy of one submission. The submit
++ * thread reads retained resource mappings before calling the kernel. The worker
++ * writes only these copies after publication; BO pointers never reach its IO. */
++struct tu_darwin_pm4_snapshot {
++   uint8_t data[byte_limit];
++   tu_bo *objects[object_limit];
++   pm4_object object_info[object_limit];
++   pm4_range ranges[reference_limit];
++   pm4_reference references[reference_limit];
++   uint64_t commands[256];
++   unsigned object_count, range_count, reference_count, command_count;
++   unsigned metadata_dropped, malformed_packets, scan_bytes, top_count;
++   size_t used;
++   uint64_t serial, mesa_submit, device, queue, chip;
++   uint32_t completion;
++   int32_t result;
++   const char *reason;
++};
++
++enum pm4_state { idle, armed, copying, ready, finished };
++static std::atomic<unsigned> state{idle};
++static std::atomic<uint64_t> last_submit{0};
++static uint64_t target_submit;
++static tu_darwin_pm4_snapshot *snapshot;
++static pthread_once_t worker_once = PTHREAD_ONCE_INIT;
++
++static bool
++write_file(const std::string &path, const void *data, size_t bytes)
++{
++   const std::string temporary = path + ".part";
++   int fd = open(temporary.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
++   if (fd < 0) {
++      return false;
++   }
++
++   size_t at = 0;
++   while (at < bytes) {
++      ssize_t count = write(fd, static_cast<const char *>(data) + at, bytes - at);
++      if (count < 0 && errno == EINTR) {
++         continue;
++      }
++      if (count <= 0) {
++         break;
++      }
++      at += count;
++   }
++
++   bool complete = at == bytes;
++   if (close(fd)) {
++      complete = false;
++   }
++   if (complete && !rename(temporary.c_str(), path.c_str())) {
++      return true;
++   }
++   unlink(temporary.c_str());
++   return false;
++}
++
++static bool
++section(tu_darwin_pm4_snapshot *s, unsigned type, const void *data, uint32_t bytes)
++{
++   if (s->used > byte_limit - 8 || bytes > byte_limit - s->used - 8) {
++      return false;
++   }
++   uint32_t header[] = {type, bytes};
++   memcpy(s->data + s->used, header, sizeof(header));
++   memcpy(s->data + s->used + sizeof(header), data, bytes);
++   s->used += sizeof(header) + bytes;
++   return true;
++}
++
++static const pm4_range *
++saved_range(tu_darwin_pm4_snapshot *s, uint64_t address, uint32_t bytes)
++{
++   for (unsigned i = 0; i < s->range_count; ++i) {
++      const pm4_range &range = s->ranges[i];
++      if (address >= range.address && bytes <= range.bytes &&
++          address - range.address <= range.bytes - bytes) {
++         return &range;
++      }
++   }
++   return nullptr;
++}
++
++static tu_bo *
++source_bo(tu_darwin_pm4_snapshot *s, uint64_t address, uint32_t bytes)
++{
++   for (unsigned i = 0; i < s->object_count; ++i) {
++      tu_bo *bo = s->objects[i];
++      if (address >= bo->iova && bytes <= bo->size && address - bo->iova <= bo->size - bytes) {
++         return bo;
++      }
++   }
++   return nullptr;
++}
++
++static const char *
++save_range(tu_darwin_pm4_snapshot *s, uint64_t address, uint32_t bytes, bool commands)
++{
++   if (saved_range(s, address, bytes)) {
++      return "saved";
++   }
++   tu_bo *bo = source_bo(s, address, bytes);
++   if (!bo) {
++      return "resource-not-retained";
++   }
++   if (!(bo->darwin_alloc_flags & TU_BO_ALLOC_COMMAND_STREAM) &&
++       !(commands && (bo->darwin_alloc_flags & TU_BO_ALLOC_INTERNAL_RESOURCE) &&
++         (bo->darwin_alloc_flags & TU_BO_ALLOC_GPU_READ_ONLY))) {
++      return "excluded-resource-content";
++   }
++   if (!bo->map) {
++      return "no-existing-cpu-map";
++   }
++   if (s->range_count == reference_limit ||
++       s->used + 28 + bytes + s->top_count * 20 > byte_limit) {
++      return "snapshot-byte-or-range-limit";
++   }
++
++   uint32_t gpuaddr[] = {uint32_t(address), bytes, uint32_t(address >> 32)};
++   section(s, RD_GPUADDR, gpuaddr, sizeof(gpuaddr));
++   uint32_t offset = s->used + 8;
++   section(s, RD_BUFFER_CONTENTS, static_cast<uint8_t *>(bo->map) + address - bo->iova, bytes);
++   s->ranges[s->range_count++] = {address, bytes, offset};
++   return "saved";
++}
++
++static void
++reference(tu_darwin_pm4_snapshot *s, uint64_t address, uint32_t bytes,
++          unsigned kind, uint64_t parent)
++{
++   if (!bytes) {
++      return;
++   }
++   if (s->reference_count == reference_limit) {
++      ++s->metadata_dropped;
++      return;
++   }
++   s->references[s->reference_count++] = {address, parent, bytes, kind, "pending"};
++}
++
++void
++tu_darwin_pm4_prepare(tu_darwin_pm4_snapshot *s)
++{
++   if (!s) {
++      return;
++   }
++   section(s, RD_CHIP_ID, &s->chip, sizeof(s->chip));
++   section(s, RD_CMD, "tu-pm4\0", 8);
++
++   for (unsigned i = 0; i < s->reference_count; ++i) {
++      pm4_reference &ref = s->references[i];
++      if (ref.kind == 3) {
++         ref.reason = saved_range(s, ref.address, ref.bytes) ?
++            "address-saved-extent-unresolved" : "external-state-data-excluded";
++         continue;
++      }
++      ref.reason = save_range(s, ref.address, ref.bytes, ref.kind != 3);
++      if (strcmp(ref.reason, "saved")) {
++         continue;
++      }
++      bool scanned = false;
++      for (unsigned j = 0; j < i; ++j) {
++         scanned |= s->references[j].address == ref.address &&
++                    s->references[j].bytes == ref.bytes && s->references[j].kind != 3;
++      }
++      if (scanned) {
++         continue;
++      }
++      if (ref.bytes > byte_limit - s->scan_bytes) {
++         ref.reason = "saved-scan-budget-exhausted";
++         continue;
++      }
++      s->scan_bytes += ref.bytes;
++      const pm4_range *range = saved_range(s, ref.address, ref.bytes);
++      const uint32_t *words = reinterpret_cast<const uint32_t *>(
++         s->data + range->offset + ref.address - range->address);
++      unsigned count = ref.bytes / 4;
++      for (unsigned at = 0; at < count;) {
++         uint32_t header = words[at];
++         bool type7 = pkt_is_type7(header);
++         unsigned length = type7 ? type7_pkt_size(header) :
++                           pkt_is_type4(header) ? type4_pkt_size(header) : 0;
++         if ((!type7 && !pkt_is_type4(header)) || length > count - at - 1) {
++            ++s->malformed_packets;
++            break;
++         }
++         const uint32_t *args = words + at + 1;
++         unsigned opcode = cp_type7_opcode(header);
++         uint64_t parent = ref.address + at * 4;
++         if (type7 && (opcode == 0x3f || opcode == 0x37 || opcode == 0x57) && length >= 3) {
++            reference(s, uint64_t(args[0]) | uint64_t(args[1]) << 32,
++                      (args[2] & 0xfffff) * 4, 1, parent);
++         } else if (type7 && opcode == 0x43) {
++            for (unsigned entry = 0; entry + 2 < length; entry += 3) {
++               if (!(args[entry] & ((1u << 17) | (1u << 18)))) {
++                  reference(s, uint64_t(args[entry + 1]) | uint64_t(args[entry + 2]) << 32,
++                            (args[entry] & 0xffff) * 4, 2, parent);
++               }
++            }
++         } else if (type7 && (opcode == 0x32 || opcode == 0x34 || opcode == 0x36) && length >= 3 &&
++                    ((args[0] >> 16) & 3) == 2) {
++            reference(s, uint64_t(args[1]) | uint64_t(args[2]) << 32, 4, 3, parent);
++         }
++         at += length + 1;
++      }
++   }
++
++   for (unsigned i = 0; i < s->reference_count; ++i) {
++      const pm4_reference &ref = s->references[i];
++      if (ref.kind == 0) {
++         uint32_t ib[] = {uint32_t(ref.address), ref.bytes / 4, uint32_t(ref.address >> 32)};
++         if (!section(s, RD_CMDSTREAM_ADDR, ib, sizeof(ib))) {
++            ++s->metadata_dropped;
++         }
++      }
++   }
++}
++
++static std::string
++manifest(tu_darwin_pm4_snapshot *s, uint64_t session)
++{
++   std::ostringstream out;
++   out << "{\"version\":1,\"pid\":" << getpid() << ",\"session_id\":" << session
++       << ",\"pm4_submit_serial\":" << s->serial << ",\"mesa_submit_count\":" << s->mesa_submit
++       << ",\"device_index\":" << s->device << ",\"queue_id\":" << s->queue
++       << ",\"completion_receipt\":" << s->completion << ",\"submit_result\":" << s->result
++       << ",\"rd_bytes\":" << s->used << ",\"metadata_dropped\":" << s->metadata_dropped
++       << ",\"malformed_packets\":" << s->malformed_packets
++       << ",\"external_state_extent\":\"address-only\",\"reason\":\"" << s->reason
++       << "\",\"command_buffer_recording_ids\":[";
++   for (unsigned i = 0; i < s->command_count; ++i) {
++      out << (i ? "," : "") << s->commands[i];
++   }
++   out << "],\"saved_ranges\":[";
++   for (unsigned i = 0; i < s->range_count; ++i) {
++      const pm4_range &range = s->ranges[i];
++      out << (i ? "," : "") << "{\"address\":" << range.address
++          << ",\"bytes\":" << range.bytes << ",\"rd_offset\":" << range.offset << "}";
++   }
++   out << "],\"references\":[";
++   for (unsigned i = 0; i < s->reference_count; ++i) {
++      const pm4_reference &ref = s->references[i];
++      out << (i ? "," : "") << "{\"address\":" << ref.address << ",\"bytes\":" << ref.bytes
++          << ",\"parent_packet\":" << ref.parent << ",\"kind\":" << ref.kind
++          << ",\"coverage\":\"" << ref.reason << "\"}";
++   }
++   out << "],\"submitted_resources\":[";
++   for (unsigned i = 0; i < s->object_count; ++i) {
++      const pm4_object &object = s->object_info[i];
++      out << (i ? "," : "") << "{\"address\":" << object.address
++          << ",\"bytes\":" << object.bytes << ",\"allocation_flags\":" << object.flags
++          << ",\"cpu_mapped\":" << (object.mapped ? "true" : "false")
++          << ",\"resource_class\":\""
++          << ((object.flags & TU_BO_ALLOC_COMMAND_STREAM) ? "command-stream" :
++              (object.flags & TU_BO_ALLOC_INTERNAL_RESOURCE) ? "driver-internal" : "application-resource")
++          << "\",\"content_policy\":\"referenced-command-ranges-only\"}";
++   }
++   out << "]}\n";
++   return out.str();
++}
++
++static void *
++worker(void *)
++{
++   const std::string prefix = tu_NativeAdrenoShaderCapturePrefix();
++   if (prefix.empty()) {
++      return nullptr;
++   }
++   const char *base = strrchr(prefix.c_str(), '/');
++   uint64_t session = strtoull(base + 2, nullptr, 10);
++   const char *reason = "idle";
++   unsigned ticks = 0, armed_ticks = 0;
++   for (;;) {
++      unsigned current = state.load(std::memory_order_acquire);
++      if (current == idle) {
++         int fd = open((prefix + "pm4_request.txt").c_str(), O_RDONLY | O_NOFOLLOW);
++         if (fd >= 0) {
++            char buffer[128] = {};
++            struct stat st;
++            ssize_t bytes = fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
++               st.st_size >= (off_t)sizeof(buffer) ?
++               -1 : read(fd, buffer, sizeof(buffer) - 1);
++            close(fd);
++            unsigned version = 0;
++            unsigned long long requested_session = 0, requested_submit = 0;
++            char extra = 0;
++            if (bytes <= 0 || sscanf(buffer, "%u %llu %llu %c", &version,
++                                    &requested_session, &requested_submit, &extra) != 3 ||
++                version != 1 || requested_session != session) {
++               reason = "invalid-request";
++               state.store(finished);
++            } else {
++               snapshot = static_cast<tu_darwin_pm4_snapshot *>(calloc(1, sizeof(*snapshot)));
++               target_submit = requested_submit;
++               if (!snapshot) {
++                  reason = "allocation-failed";
++                  state.store(finished);
++               } else {
++                  reason = "armed";
++                  state.store(armed, std::memory_order_release);
++               }
++            }
++         }
++      } else if (current == armed && ++armed_ticks >= 600) {
++         unsigned expected = armed;
++         if (state.compare_exchange_strong(expected, finished)) {
++            reason = "request-expired";
++         }
++      } else if (current == ready) {
++         std::string stem = prefix + "pm4-" + std::to_string(snapshot->serial);
++         std::string json = manifest(snapshot, session);
++         bool rd_ok = write_file(stem + ".rd", snapshot->data, snapshot->used);
++         bool json_ok = write_file(stem + ".json", json.data(), json.size());
++         reason = rd_ok && json_ok ? snapshot->reason : "write-failed";
++         state.store(finished);
++      }
++      if (ticks++ % 10 == 0 || state.load() == finished) {
++         std::string status = "{\"version\":1,\"pid\":" + std::to_string(getpid()) +
++            ",\"session_id\":" + std::to_string(session) + ",\"last_submit\":" +
++            std::to_string(last_submit.load()) + ",\"target_submit\":" +
++            std::to_string(target_submit) + ",\"state\":" + std::to_string(state.load()) +
++            ",\"reason\":\"" + reason + "\"}\n";
++         write_file(prefix + "pm4_status.json", status.data(), status.size());
++      }
++      if (state.load() == finished) {
++         free(snapshot);
++         snapshot = nullptr;
++         return nullptr;
++      }
++      usleep(100000);
++   }
++}
++
++static void
++start_worker()
++{
++   pthread_t thread;
++   if (!pthread_create(&thread, nullptr, worker, nullptr)) {
++      pthread_detach(thread);
++   }
++}
++
++tu_darwin_pm4_snapshot *
++tu_darwin_pm4_begin(tu_queue *queue)
++{
++   pthread_once(&worker_once, start_worker);
++   uint64_t serial = last_submit.fetch_add(1) + 1;
++   if (state.load(std::memory_order_acquire) != armed || (target_submit && serial < target_submit)) {
++      return nullptr;
++   }
++   unsigned expected = armed;
++   if (!state.compare_exchange_strong(expected, copying, std::memory_order_acquire)) {
++      return nullptr;
++   }
++
++   snapshot->serial = serial;
++   snapshot->mesa_submit = queue->device->submit_count;
++   snapshot->device = queue->device->device_idx;
++   snapshot->queue = queue->msm_queue_id;
++   snapshot->chip = queue->device->physical_device->dev_id.chip_id;
++   snapshot->reason = "captured";
++   if (target_submit && serial != target_submit) {
++      snapshot->reason = "target-already-passed";
++      state.store(ready, std::memory_order_release);
++      return nullptr;
++   }
++   return snapshot;
++}
++
++void
++tu_darwin_pm4_resource(tu_darwin_pm4_snapshot *s, tu_bo *bo)
++{
++   if (s->object_count < object_limit) {
++      s->objects[s->object_count] = bo;
++      s->object_info[s->object_count++] = {
++         bo->iova, bo->size, bo->darwin_alloc_flags, bo->map != nullptr};
++   } else {
++      ++s->metadata_dropped;
++   }
++}
++
++void
++tu_darwin_pm4_ib(tu_darwin_pm4_snapshot *s, uint64_t address, uint32_t bytes)
++{
++   ++s->top_count;
++   reference(s, address, bytes, 0, 0);
++}
++
++void
++tu_darwin_pm4_command(tu_darwin_pm4_snapshot *s, uint64_t recording_id)
++{
++   if (recording_id && s->command_count < 256) {
++      s->commands[s->command_count++] = recording_id;
++   } else {
++      ++s->metadata_dropped;
++   }
++}
++
++void
++tu_darwin_pm4_end(tu_darwin_pm4_snapshot *s, int32_t result, uint32_t completion)
++{
++   if (s) {
++      s->result = result;
++      s->completion = completion;
++      state.store(ready, std::memory_order_release);
++   }
++}

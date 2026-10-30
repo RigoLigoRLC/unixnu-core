@@ -67,7 +67,8 @@
     "patches/mesa/turnip-unaligned-buffer-image-batch.patch",
     "patches/mesa/turnip-buffer-image-rectangle.patch",
     "patches/mesa/turnip-darwin-submitted-pass-profile.patch",
-    "patches/mesa/turnip-darwin-shader-capture.patch"
+    "patches/mesa/turnip-darwin-shader-capture.patch",
+    "patches/mesa/turnip-darwin-pm4-capture.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",
