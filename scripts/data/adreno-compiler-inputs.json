@@ -63,7 +63,8 @@
     "patches/mesa/turnip-darwin-metal-cache-stats.patch",
     "patches/mesa/turnip-darwin-perfetto-capture.patch",
     "patches/mesa/turnip-darwin-copy-metadata.patch",
-    "patches/mesa/turnip-darwin-trace-queue-accounting.patch"
+    "patches/mesa/turnip-darwin-trace-queue-accounting.patch",
+    "patches/mesa/turnip-unaligned-buffer-image-batch.patch"
   ],
   "integer_fma_reference": {
     "repository": "https://github.com/ucb-bar/berkeley-softfloat-3",

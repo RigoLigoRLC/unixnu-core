@@ -1,0 +1,236 @@
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -2786,13 +2786,121 @@
+    if (height)
+       *height = DIV_ROUND_UP(*height, block_height);
+ }
++
++/* tu_buffer_image_copy_stats counts the commands and texels recorded for one
++ * Vulkan buffer-to-image copy, including all of its regions and layers. */
++struct tu_buffer_image_copy_stats {
++   uint64_t bytes;          /* Copied texel bytes, excluding row padding. */
++   uint64_t rows;           /* Copied rows across every region and layer. */
++   uint64_t commands;       /* CP_BLIT and RECTLIST draw packets. */
++   uint64_t batched_draws;  /* RECTLIST packets using the multi-blit shader. */
++};
+ 
+ template <chip CHIP>
++static bool
++tu_copy_buffer_to_image_batched(struct tu_cmd_buffer *cmd,
++                                const struct fdl6_view *dst,
++                                enum pipe_format format,
++                                uint64_t src_va, uint32_t pitch,
++                                uint64_t layer_size, uint32_t layers,
++                                VkOffset3D offset, VkExtent3D extent,
++                                struct tu_buffer_image_copy_stats *stats)
++{
++   if (CHIP != A6XX || extent.height < 2 ||
++       !((src_va & 63) || (pitch & 63))) {
++      return false;
++   }
++
++   switch (format) {
++   case PIPE_FORMAT_R8_UNORM:
++   case PIPE_FORMAT_R8G8_UNORM:
++   case PIPE_FORMAT_R8G8B8A8_UNORM:
++   case PIPE_FORMAT_B8G8R8A8_UNORM:
++      break;
++   default:
++      return false;
++   }
++
++   const uint32_t block_size = util_format_get_blocksize(format);
++   const uint32_t view_width = MAX_VIEWPORT_SIZE;
++   const uint32_t view_pitch = view_width * block_size;
++   const uint64_t copied_span = (uint64_t)(extent.height - 1) * pitch +
++                                (uint64_t)extent.width * block_size;
++   if (src_va % block_size ||
++       copied_span + 63 > (uint64_t)view_pitch * MAX_VIEWPORT_SIZE) {
++      return false;
++   }
++
++   struct tu_cs *cs = &cmd->cs;
++   r3d_setup<CHIP>(cmd, cs, format, format, VK_IMAGE_ASPECT_COLOR_BIT,
++                   R3D_COPY | R3D_USE_MULTI_BLIT, false, dst->ubwc_enabled,
++                   VK_SAMPLE_COUNT_1_BIT, VK_SAMPLE_COUNT_1_BIT);
++
++   /* The sampler reads the buffer through aligned rows. Each copied row is
++    * split where it crosses a sampler row, preserving the caller's pitch.
++    * The existing multi-blit shader consumes two vec4 coordinates per
++    * rectangle; each batch uses 8 KiB of its 64 KiB UBO address range.
++    */
++   VkRect2D dst_rects[256];
++   tu_rect2d_float src_rects[256];
++   for (uint32_t layer = 0; layer < layers; layer++) {
++      const uint64_t layer_va = src_va + layer_size * layer;
++      const uint32_t prefix = layer_va & 63;
++      const uint32_t view_height = DIV_ROUND_UP(prefix + copied_span, view_pitch);
++      r3d_src_buffer<CHIP>(cmd, cs, format, layer_va & ~UINT64_C(63),
++                           view_pitch, view_width, view_height, format);
++      r3d_dst<CHIP>(cs, dst, layer, format);
++
++      unsigned count = 0;
++      for (uint32_t y = 0; y < extent.height; y++) {
++         uint64_t texel = ((uint64_t)prefix + (uint64_t)y * pitch) / block_size;
++         uint32_t copied_width = 0;
++         while (copied_width < extent.width) {
++            const uint32_t src_x = texel % view_width;
++            const uint32_t src_y = texel / view_width;
++            const uint32_t width = MIN2(extent.width - copied_width,
++                                       view_width - src_x);
++            dst_rects[count] = {
++               .offset = {offset.x + (int32_t)copied_width, offset.y + (int32_t)y},
++               .extent = {width, 1},
++            };
++            src_rects[count] = {
++               .x_start = (float)src_x,
++               .y_start = (float)src_y,
++               .x_end = (float)(src_x + width),
++               .y_end = (float)(src_y + 1),
++            };
++            count++;
++            texel += width;
++            copied_width += width;
++
++            if (count == ARRAY_SIZE(dst_rects) ||
++                (y + 1 == extent.height && copied_width == extent.width)) {
++               r3d_coords_multi(cmd, cs, dst_rects, src_rects, count);
++               if (vk_command_buffer_has_error(&cmd->vk) ||
++                   cs->record_result != VK_SUCCESS) {
++                  return true;
++               }
++               r3d_run_multi(cmd, cs, count);
++               stats->commands++;
++               stats->batched_draws++;
++               count = 0;
++            }
++         }
++      }
++   }
++
++   r3d_teardown<CHIP>(cmd, cs);
++   return true;
++}
++
++template <chip CHIP>
+ static void
+ tu_copy_buffer_to_image(struct tu_cmd_buffer *cmd,
+                         struct tu_buffer *src_buffer,
+                         struct tu_image *dst_image,
+-                        const VkBufferImageCopy2 *info)
++                        const VkBufferImageCopy2 *info,
++                        struct tu_buffer_image_copy_stats *stats)
+ {
+    struct tu_cs *cs = &cmd->cs;
+    uint32_t layers = MAX2(info->imageExtent.depth,
+@@ -2828,17 +2936,28 @@
+ 
+    uint32_t block_size = util_format_get_blocksize(src_format);
+    uint32_t pitch = src_width * block_size;
+-   uint32_t layer_size = src_height * pitch;
++   uint64_t layer_size = (uint64_t)src_height * pitch;
+ 
+-   ops->setup(cmd, cs, src_format, dst_format,
+-              info->imageSubresource.aspectMask, blit_param, false, dst_image->layout[0].ubwc,
+-              (VkSampleCountFlagBits) dst_image->layout[0].nr_samples,
+-              (VkSampleCountFlagBits) dst_image->layout[0].nr_samples);
++   stats->rows += (uint64_t)extent.height * layers;
++   stats->bytes += (uint64_t)extent.width * extent.height * layers * block_size;
+ 
+    struct fdl6_view dst;
+    tu_image_view_copy<CHIP>(&dst, dst_image, dst_format,
+                             &info->imageSubresource, offset.z);
+ 
++   if (info->imageSubresource.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
++       dst_image->layout[0].nr_samples == 1 &&
++       tu_copy_buffer_to_image_batched<CHIP>(cmd, &dst, dst_format,
++          vk_buffer_address(&src_buffer->vk, info->bufferOffset), pitch,
++          layer_size, layers, offset, extent, stats)) {
++      return;
++   }
++
++   ops->setup(cmd, cs, src_format, dst_format,
++              info->imageSubresource.aspectMask, blit_param, false, dst_image->layout[0].ubwc,
++              (VkSampleCountFlagBits) dst_image->layout[0].nr_samples,
++              (VkSampleCountFlagBits) dst_image->layout[0].nr_samples);
++
+    for (uint32_t i = 0; i < layers; i++) {
+       ops->dst(cs, &dst, i, src_format);
+ 
+@@ -2862,6 +2981,7 @@
+             ops->coords(cmd, cs, (VkOffset2D) {offset.x, offset.y + y},  (VkOffset2D) {x},
+                         (VkExtent2D) {clamped_width, 1});
+             ops->run(cmd, cs);
++            stats->commands++;
+ 
+             if (excess_width) {
+                uint64_t src_va_overflow =
+@@ -2874,6 +2994,7 @@
+                   (VkOffset2D) { offset.x + clamped_width, offset.y + y },
+                   (VkOffset2D) { 0 }, (VkExtent2D) { excess_width, 1 });
+                ops->run(cmd, cs);
++               stats->commands++;
+             }
+             src_va += pitch;
+          }
+@@ -2894,6 +3015,7 @@
+          }
+          coords(ops, cmd, cs, offset, (VkOffset3D) {}, extent);
+          ops->run(cmd, cs);
++         stats->commands++;
+       }
+    }
+ 
+@@ -2926,15 +3048,18 @@
+    trace_start_copy_buffer_to_image(&cmd->trace, &cmd->cs, cmd, dst_image->vk.format,
+                                    source_buffer, destination_image, copy_operation_id);
+ 
+-   for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i)
++   struct tu_buffer_image_copy_stats stats = {};
++   for (unsigned i = 0; i < pCopyBufferToImageInfo->regionCount; ++i) {
+       tu_copy_buffer_to_image<CHIP>(cmd, src_buffer, dst_image,
+-                              pCopyBufferToImageInfo->pRegions + i);
++                                   pCopyBufferToImageInfo->pRegions + i, &stats);
++   }
+ 
+    if (dst_image->lrz_layout.lrz_total_size) {
+       tu_disable_lrz<CHIP>(cmd, &cmd->cs, dst_image);
+    }
+ 
+-   trace_end_copy_buffer_to_image(&cmd->trace, &cmd->cs);
++   trace_end_copy_buffer_to_image(&cmd->trace, &cmd->cs, stats.bytes, stats.rows,
++                                  stats.commands, stats.batched_draws);
+ }
+ TU_GENX(tu_CmdCopyBufferToImage2);
+ 
+--- a/src/freedreno/vulkan/tu_tracepoints.py
++++ b/src/freedreno/vulkan/tu_tracepoints.py
+@@ -232,7 +232,11 @@
+     args=[Arg(type='enum VkFormat', var='format', c_format='%s', to_prim_type='vk_format_description({})->short_name'),
+           Arg(type='uint64_t', var='source_buffer', c_format='%" PRIu64 "'),
+           Arg(type='uint64_t', var='destination_image', c_format='%" PRIu64 "'),
+-          Arg(type='uint64_t', var='copy_operation_id', c_format='%" PRIu64 "')])
++          Arg(type='uint64_t', var='copy_operation_id', c_format='%" PRIu64 "')],
++    end_args=[Arg(type='uint64_t', var='bytes', c_format='%" PRIu64 "'),
++              Arg(type='uint64_t', var='rows', c_format='%" PRIu64 "'),
++              Arg(type='uint64_t', var='commands', c_format='%" PRIu64 "'),
++              Arg(type='uint64_t', var='batched_draws', c_format='%" PRIu64 "')])
+ 
+ begin_end_tp('copy_image_to_buffer',
+     toggle_name='clear_blit',
+--- a/src/freedreno/vulkan/tu_darwin_trace.cc
++++ b/src/freedreno/vulkan/tu_darwin_trace.cc
+@@ -314,6 +314,13 @@
+       trace_argument(&event, NativeAdrenoTraceArgSourceBuffer, data->source_buffer);
+       trace_argument(&event, NativeAdrenoTraceArgDestinationImage, data->destination_image);
+       trace_argument(&event, NativeAdrenoTraceArgCopyOperation, data->copy_operation_id);
++   } else if (!begin && !strcmp(stage, "copy_buffer_to_image")) {
++      const struct trace_end_copy_buffer_to_image *data =
++         (const struct trace_end_copy_buffer_to_image *)payload;
++      trace_argument(&event, NativeAdrenoTraceArgBytes, data->bytes);
++      trace_argument(&event, NativeAdrenoTraceArgDrawCount, data->commands);
++      trace_argument(&event, NativeAdrenoTraceArgCopyRows, data->rows);
++      trace_argument(&event, NativeAdrenoTraceArgCopyBatchedDraws, data->batched_draws);
+    } else if (begin && !strcmp(stage, "copy_image_to_buffer")) {
+       const struct trace_start_copy_image_to_buffer *data =
+          (const struct trace_start_copy_image_to_buffer *)payload;
