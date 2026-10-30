@@ -139,7 +139,7 @@ diff --git a/src/freedreno/vulkan/tu_darwin_pm4.cc b/src/freedreno/vulkan/tu_dar
 new file mode 100644
 --- /dev/null
 +++ b/src/freedreno/vulkan/tu_darwin_pm4.cc
-@@ -0,0 +1,453 @@
+@@ -0,0 +1,458 @@
 +/* SPDX-License-Identifier: MIT */
 +#include "tu_darwin_pm4.h"
 +#include "tu_device.h"
@@ -465,6 +465,11 @@ new file mode 100644
 +         if (fd >= 0) {
 +            char buffer[128] = {};
 +            struct stat st;
++            if (!fstat(fd, &st) && S_ISREG(st.st_mode) && st.st_nlink == 2) {
++               close(fd);
++               usleep(100000);
++               continue;
++            }
 +            ssize_t bytes = fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_nlink != 1 ||
 +               st.st_size >= (off_t)sizeof(buffer) ?
 +               -1 : read(fd, buffer, sizeof(buffer) - 1);
