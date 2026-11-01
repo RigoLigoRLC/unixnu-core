@@ -203,7 +203,19 @@ def arm_io_window(hardware):
 
 
 STRINGS = {'compatible', 'device_type', 'reg-names', 'interrupt-names', 'clock-names', 'method'}
-U32 = {'phandle', 'linux,phandle', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency'}
+STRINGS.add('native-adreno-reg-names')
+U32 = {'phandle', 'linux,phandle', '#address-cells', '#size-cells', '#interrupt-cells', '#iommu-cells', '#clock-cells', 'clock-frequency', 'timebase-frequency',
+       'native-ufs-stream-id', 'native-ufs-interrupt', 'cluster-type', 'die-cluster-id', 'cluster-core-id'}
+U32.update({
+    'native-adreno-chip-id', 'native-adreno-gmem-bytes', 'native-adreno-frequency-hz',
+    'native-adreno-ddr-type',
+    'native-adreno-highest-bank-bit', 'native-adreno-gpu-bank', 'native-adreno-gpu-asid',
+    'native-adreno-gpu-slot', 'native-adreno-gpu-sid', 'native-adreno-gpu-sid-mask',
+    'native-adreno-gmu-bank', 'native-adreno-gmu-asid', 'native-adreno-gmu-slot',
+    'native-adreno-gmu-sid', 'native-adreno-gmu-sid-mask',
+    'native-adreno-lpac-bank', 'native-adreno-lpac-asid', 'native-adreno-lpac-slot',
+    'native-adreno-lpac-sid', 'native-adreno-lpac-sid-mask',
+})
 U64 = {'redistributor-stride'}
 FLAGS = {'interrupt-controller', 'dma-coherent'}
 REFERENCES = {'interrupt-parent': None, 'iommus': '#iommu-cells', 'clocks': '#clock-cells'}
@@ -211,6 +223,9 @@ REFERENCES = {'interrupt-parent': None, 'iommus': '#iommu-cells', 'clocks': '#cl
 
 def hardware_properties(entry, handles, base=0):
     properties = []
+    handle = entry.properties.get('phandle', entry.properties.get('linux,phandle'))
+    if handle is not None:
+        properties.append(('AAPL,phandle', struct.pack('<I', number(struct.unpack('>I', handle)))))
     for key, raw in entry.properties.items():
         if key in STRINGS:
             entry.strings(key)
@@ -222,6 +237,17 @@ def hardware_properties(entry, handles, base=0):
             if len(cells) not in (1, 2):
                 raise Error(f'{entry.name}: {key} requires one or two cells')
             properties.append((key, struct.pack('<Q', number(cells))))
+        elif key == 'native-ufs-smmu-reg':
+            cells = entry.cells(key)
+            if len(cells) != 4:
+                raise Error(f'{entry.name}: {key} requires a physical u64 address and u64 size')
+            properties.append((key, struct.pack('<QQ', number(cells[:2]), number(cells[2:]))))
+        elif key == 'native-adreno-platform-reg':
+            cells = entry.cells(key)
+            if not cells or len(cells) % 4:
+                raise Error(f'{entry.name}: {key} requires physical u64 address/size pairs')
+            values = [number(cells[index:index + 2]) for index in range(0, len(cells), 2)]
+            properties.append((key, struct.pack(f'<{len(values)}Q', *values)))
         elif key in FLAGS:
             if raw:
                 raise Error(f'{entry.name}: {key} is a flag')
@@ -308,19 +334,33 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
     # xnu-12377 takes 4 x 64 seed bytes on ARM and panics with fewer; older kernels read the first 64.
     chosen = [('random-seed', os.urandom(256)), ('dram-base', struct.pack('<Q', dram_base)),
               ('dram-size', struct.pack('<Q', dram_size)), *empty_nvram_proxy()]
+    personalized = options.get('personalization_from_ipsw', False)
     if unique_chip_id:
         seed = int(str(unique_chip_id), 16)
         chip = int(str(options['chip_id']), 16)
         if not 0 < seed < 1 << 64 or not 0 < chip < 1 << 32:
             raise Error('Platform identity requires a nonzero u64 seed and u32 chip ID')
-        chosen += [('unique-chip-id', struct.pack('<Q', seed)), ('chip-id', struct.pack('<I', chip))]
+        chip_property = 'unixnu,platform-uuid-chip-id' if personalized else 'chip-id'
+        chosen += [('unique-chip-id', struct.pack('<Q', seed)), (chip_property, struct.pack('<I', chip))]
     elif options.get('unique_chip_id') == 'required':
         raise Error('Pass --unique-chip-id HEX for this board')
+    if personalized:
+        identity = config.get('ipsw', {})
+        for property_name, config_name in (('chip-id', 'chip_id'), ('board-id', 'board_id'),
+                                           ('security-domain', 'security_domain')):
+            value = identity.get(config_name)
+            if type(value) is not int or not 0 <= value < 1 << 32 or (config_name == 'chip_id' and not value):
+                raise Error(f'IPSW personalization requires [ipsw] {config_name} as a u32 from its build identity')
+            chosen.append((property_name, struct.pack('<I', value)))
     if options.get('owned_memory_size'):
-        size = int(str(options['owned_memory_size']), 0)
-        if not 0x10000000 <= size <= 0x200000000 or size % 0x200000:
-            raise Error('Owned memory must be 256 MiB to 8 GiB in 2 MiB steps')
-        chosen.append(('darwinboot-memory-size', struct.pack('<Q', size)))
+        if options['owned_memory_size'] == 'auto':
+            maximum = min(dram_size, 0x200000000) & ~0x1fffff
+            chosen.append(('darwinboot-memory-range', struct.pack('<QQ', 0x40000000, maximum)))
+        else:
+            size = int(str(options['owned_memory_size']), 0)
+            if not 0x10000000 <= size <= 0x200000000 or size % 0x200000:
+                raise Error('Owned memory must be 256 MiB to 8 GiB in 2 MiB steps')
+            chosen.append(('darwinboot-memory-size', struct.pack('<Q', size)))
     if options.get('root_match_volume_uuid'):
         volume = str(uuid.UUID(options['root_match_volume_uuid'])).upper()
         chosen.append(('root-matching', ('<dict><key>IOProviderClass</key><string>IOMedia</string>'
@@ -358,6 +398,13 @@ def generate(dtb, config, *, unique_chip_id=None, data=False, trust=False, addon
             if kind not in (['E'], ['P']):
                 raise Error(f'{entry.name}: unixnu,cluster-type must be "E" or "P"')
             properties.append(('cluster-type', struct.pack('<I', ord(kind[0]))))
+        elif 'cluster-type' in entry.properties:
+            properties.append(('cluster-type', struct.pack('<I', entry.scalar('cluster-type'))))
+
+        for key in ('die-cluster-id', 'cluster-core-id'):
+            if key in entry.properties:
+                properties.append((key, struct.pack('<I', entry.scalar(key))))
+
         cpu_nodes.append(node(f'cpu{len(cpu_nodes)}', properties))
     if not cpu_nodes:
         raise Error('Hardware DTS requires an enabled boot CPU')

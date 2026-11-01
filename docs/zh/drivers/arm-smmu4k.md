@@ -12,6 +12,10 @@ ARM SMMUv2 原生 4 KiB 表 kit。构建并编程 stage-1/stage-2 context 表。
 
 Adreno740 和存储驱动使用它。
 
+`coherent_walk = 1` 将页表读取设为 Outer Shareable、WBWA。平台持有 CPU
+write-back 页表内存，并在发布回调中通过写屏障确保 CPU 写入先于设备访问。
+live 更新继续执行对应的 TLB 失效和同步顺序。
+
 live 更新在一个事务内映射或解除一批页：每批只发布一次页表页、同步一次 TLB、复查一次。`ArmSmmu4KLiveMapContextBatchExclusive` 映射调用方独占的物理页，跳过与已有区间的别名检查，批内各页之间仍互相检查。解除不超过 512 页时逐页发 TLBIVAL，更多时按 ASID 失效。
 
 ## 构建

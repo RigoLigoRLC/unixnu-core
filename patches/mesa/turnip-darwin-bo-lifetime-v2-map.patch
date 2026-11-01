@@ -1,0 +1,1543 @@
+diff --git a/src/freedreno/vulkan/tu_device.cc b/src/freedreno/vulkan/tu_device.cc
+index 527a4d4..88f7287 100644
+--- a/src/freedreno/vulkan/tu_device.cc
++++ b/src/freedreno/vulkan/tu_device.cc
+@@ -2860,6 +2860,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+    device->instance = physical_device->instance;
+    device->physical_device = physical_device;
+    device->device_idx = device->physical_device->device_count++;
++   device->va_start = physical_device->va_start;
++   device->va_size = physical_device->va_size;
+ 
+    result = tu_drm_device_init(device);
+    if (result != VK_SUCCESS) {
+@@ -2898,8 +2900,8 @@ tu_CreateDevice(VkPhysicalDevice physicalDevice,
+ 
+    if (physical_device->has_set_iova) {
+       mtx_init(&device->vma_mutex, mtx_plain);
+-      util_vma_heap_init(&device->vma, physical_device->va_start,
+-                         ROUND_DOWN_TO(physical_device->va_size, os_page_size));
++      util_vma_heap_init(&device->vma, device->va_start,
++                         ROUND_DOWN_TO(device->va_size, os_page_size));
+    }
+ 
+    if (TU_DEBUG(BOS))
+diff --git a/src/freedreno/vulkan/tu_device.h b/src/freedreno/vulkan/tu_device.h
+index 356ab86..34b7eed 100644
+--- a/src/freedreno/vulkan/tu_device.h
++++ b/src/freedreno/vulkan/tu_device.h
+@@ -303,6 +303,8 @@ struct tu_device
+    struct vk_device vk;
+    struct tu_instance *instance;
+    void *darwin_retire; /* Darwin KMD's bounded deferred BO retirement state. */
++   uint64_t va_start; /* GPU VA window assigned to this device's native connection. */
++   uint64_t va_size;
+ 
+    struct tu_queue *queues[TU_MAX_QUEUE_FAMILIES];
+    int queue_count[TU_MAX_QUEUE_FAMILIES];
+diff --git a/src/freedreno/vulkan/tu_knl.h b/src/freedreno/vulkan/tu_knl.h
+index 0b840b4..392f2a7 100644
+--- a/src/freedreno/vulkan/tu_knl.h
++++ b/src/freedreno/vulkan/tu_knl.h
+@@ -63,6 +63,8 @@ struct tu_bo {
+    uint64_t darwin_handle;
+    /* The token selects this BO's IOConnectMapMemory64 descriptor. */
+    uint32_t darwin_token;
++   /* A V2 map ID owns the kernel's completed CPU mapping and its BO lease. */
++   uint64_t darwin_map_id;
+    uint32_t darwin_alloc_flags;
+    VkMemoryPropertyFlags darwin_mem_property;
+    uint64_t darwin_alignment;
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 61b7968..a5ccf3f 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -6,6 +6,7 @@
+ 
+ #include <errno.h>
+ #include <pthread.h>
++#include <sched.h>
+ #include <string.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
+@@ -16,6 +17,7 @@
+ #include "NativeAdrenoABI.h"
+ 
+ #include "util/os_time.h"
++#include "util/list.h"
+ #include "util/timespec.h"
+ #include "util/u_debug.h"
+ #include "util/u_idalloc.h"
+@@ -33,9 +35,10 @@
+ /* 'NTNL': first word of a tunnelled call, as served by the driver (NativeAdrenoPublish.cpp). */
+ #define DW_TUNNEL_MAGIC 0x4e544e4cu
+ 
+-/* One GPU per process: the kernel service has a single connection slot, so the connection and the fence bookkeeping are
+- * process state rather than per tu_device state. */
+-static struct {
++/* darwin_connection belongs to one Vulkan device and selects its native
++ * handle table, CPU leases, queue scope and GPU VA window. Its mutex protects
++ * only the fence sequence; IOKit operations run without that mutex. */
++struct darwin_connection {
+    io_connect_t conn;
+    bool open;
+    pthread_mutex_t lock;
+@@ -49,16 +52,23 @@ static struct {
+    bool tunnel;
+    uint32_t selector;
+    uint32_t last_fence;
+-   uint64_t next_profile_device;
+    NativeAdrenoAbiDeviceInfo info;
+    NativeAdrenoAbiParams params;
+-} dw = { .lock = PTHREAD_MUTEX_INITIALIZER };
++};
++
++static pthread_mutex_t profile_device_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint64_t next_profile_device;
+ 
+ enum {
+-   DARWIN_RETIRED_BOS = 256,
+-   DARWIN_CACHED_BOS = 64,
++   /* Every native handle reserves its retirement metadata before allocation.
++    * This bound matches the kernel's per-client handle table. */
++   DARWIN_NATIVE_BO_LIMIT = 4096,
++   DARWIN_CACHE_SIZE_CLASSES = 64,
++   DARWIN_CACHE_ATTRIBUTE_BUCKETS = 16,
+    DARWIN_BO_CACHE_BYTES = 128 * 1024 * 1024,
+    DARWIN_BO_CACHE_MAX_OBJECT_BYTES = 64 * 1024 * 1024,
++   DARWIN_RECLAIM_HIGH_BYTES = 64 * 1024 * 1024,
++   DARWIN_RECLAIM_LOW_BYTES = 32 * 1024 * 1024,
+ };
+ 
+ /* darwin_retired_bo owns the native allocation, CPU mapping and GPU address
+@@ -66,6 +76,7 @@ enum {
+  * the allocation can enter the reuse cache or be returned to the kernel. */
+ struct darwin_retired_bo {
+    uint64_t handle, iova, size;
++   uint64_t map_id;
+    void *mapping;
+    uint32_t token, fence;
+    uint32_t gem_handle, alloc_flags;
+@@ -75,21 +86,52 @@ struct darwin_retired_bo {
+    char name[32];
+ };
+ 
+-/* darwin_retire_state retains unfinished BOs and completed private BOs. Its
+- * mutex protects both bounded arrays and the independent Mesa ID allocator.
+- * Fence waits that may block run after releasing this mutex. */
++enum darwin_bo_state {
++   DARWIN_BO_ACTIVE,
++   DARWIN_BO_PENDING,
++   DARWIN_BO_CACHED,
++   DARWIN_BO_RECLAIM,
++   DARWIN_BO_RELEASING,
++   DARWIN_BO_RELEASED,
++   DARWIN_BO_QUARANTINED,
++};
++
++/* darwin_bo_node belongs to one native allocation from reservation until
++ * successful BoFree. The queue link transfers ownership between lists; the
++ * bucket link additionally indexes completed cache entries by compatibility. */
++struct darwin_bo_node {
++   struct darwin_retired_bo bo;
++   struct list_head link;
++   struct list_head bucket_link;
++   enum darwin_bo_state state;
++   uint64_t retry_generation;
++};
++
++/* darwin_retire_state owns one node per native handle, including active BOs.
++ * The worker alone waits for retirement and destroys storage, outside lock.
++ * Allocation callers return released GPU ranges before recycling node IDs;
++ * consequently the worker never touches the device's VMA heap during teardown. */
+ struct darwin_retire_state {
++   struct darwin_connection connection;
+    pthread_mutex_t lock;
+    struct util_idalloc ids;
+-   struct darwin_retired_bo entries[DARWIN_RETIRED_BOS];
+-   /* Cache entries are ordered from the oldest completed BO to the newest. */
+-   struct darwin_retired_bo cache[DARWIN_CACHED_BOS];
+-   unsigned head, count;
++   struct darwin_bo_node nodes[DARWIN_NATIVE_BO_LIMIT + 1];
++   struct list_head pending, cache, reclaim, retry, released;
++   struct list_head buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
++   struct list_head pending_buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
++   unsigned count, node_count;
++   unsigned trim_waiters;
+    unsigned cache_count;
+    VkResult failure;
+    uint64_t enqueued, reaped, pressure_waits;
+    uint64_t cache_bytes, cache_peak_bytes, cache_hits, cache_misses, cache_evictions;
+    uint64_t pending_bytes;
++   uint64_t reclaim_bytes;
++   uint64_t work_generation, progress_generation;
++   pthread_t worker;
++   pthread_cond_t work_wake, progress;
++   bool worker_started, worker_stop;
++   struct tu_device *device;
+    NativeAdrenoAbiBoCacheCounters profile;
+    NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
+    NativeAdrenoAbiBoCacheBin usages[NativeAdrenoBoProfileUsageCount];
+@@ -103,10 +145,17 @@ struct darwin_retire_state {
+    uint32_t profile_selector;
+ };
+ 
++static struct darwin_connection *
++darwin_connection_for(struct tu_device *dev)
++{
++   return &((struct darwin_retire_state *)dev->darwin_retire)->connection;
++}
++
+ static kern_return_t
+-dw_call(uint32_t method, const void *in, size_t in_size, void *out,
++dw_call(struct darwin_connection *connection, uint32_t method, const void *in, size_t in_size, void *out,
+         size_t out_size)
+ {
++   struct darwin_connection &dw = *connection;
+    size_t out_bytes = out_size;
+    if (!dw.tunnel)
+       return IOConnectCallStructMethod(dw.conn, method, in, in_size, out_size ? out : NULL,
+@@ -122,6 +171,51 @@ dw_call(uint32_t method, const void *in, size_t in_size, void *out,
+                                     out_size ? &out_bytes : NULL);
+ }
+ 
++static kern_return_t
++dw_call(struct tu_device *dev, uint32_t method, const void *in, size_t in_size, void *out,
++        size_t out_size)
++{
++   return dw_call(darwin_connection_for(dev), method, in, in_size, out, out_size);
++}
++
++static VkResult
++darwin_unmap_cpu_storage(struct tu_device *dev, uint64_t handle, void **mapping,
++                         uint32_t *token, uint64_t *map_id)
++{
++   struct darwin_connection &dw = *darwin_connection_for(dev);
++   if (*map_id) {
++      NativeAdrenoAbiBoCpuUnmapV2 request = {.handle = handle, .map_id = *map_id};
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoCpuUnmapV2, &request,
++                                sizeof(request), NULL, 0);
++      if (kr != KERN_SUCCESS) {
++         return vk_device_set_lost(&dev->vk, "CPU mapping release failed: 0x%x", kr);
++      }
++      *mapping = NULL;
++      *map_id = 0;
++      *token = 0;
++      return VK_SUCCESS;
++   }
++
++   if (*token) {
++      if (*mapping) {
++         kern_return_t kr = IOConnectUnmapMemory64(dw.conn, *token, mach_task_self(),
++                                                 (mach_vm_address_t)(uintptr_t)*mapping);
++         if (kr != KERN_SUCCESS) {
++            return vk_device_set_lost(&dev->vk, "CPU unmap failed: 0x%x", kr);
++         }
++         *mapping = NULL;
++      }
++      NativeAdrenoAbiBoCpuUnmap request = {.handle = handle, .token = *token};
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoCpuUnmap, &request,
++                                sizeof(request), NULL, 0);
++      if (kr != KERN_SUCCESS) {
++         return vk_device_set_lost(&dev->vk, "CPU lease release failed: 0x%x", kr);
++      }
++      *token = 0;
++   }
++   return VK_SUCCESS;
++}
++
+ static void
+ darwin_profile_name(char *target, size_t capacity, const char *name)
+ {
+@@ -230,6 +324,7 @@ darwin_profile_reporter(void *argument)
+    uint64_t sent_slow = 0;
+    for (;;) {
+       NativeAdrenoAbiBoCacheCounters counters;
++      NativeAdrenoAbiBoCacheBudget budget = {};
+       NativeAdrenoAbiBoCacheBin sizes[NativeAdrenoBoProfileSizeCount];
+       NativeAdrenoAbiBoCacheBin usages[NativeAdrenoBoProfileUsageCount];
+       NativeAdrenoAbiBoProfile slow[NativeAdrenoBoProfileSlowCount];
+@@ -252,6 +347,13 @@ darwin_profile_reporter(void *argument)
+       counters.pending_bytes = retire->pending_bytes;
+       counters.pressure_waits = retire->pressure_waits;
+       counters.reaped = retire->reaped;
++      budget.node_objects = retire->node_count;
++      budget.node_limit = DARWIN_NATIVE_BO_LIMIT;
++      budget.metadata_bytes = sizeof(*retire);
++      budget.cache_budget_bytes = DARWIN_BO_CACHE_BYTES;
++      budget.reclaim_bytes = retire->reclaim_bytes;
++      budget.reclaim_high_bytes = DARWIN_RECLAIM_HIGH_BYTES;
++      budget.reclaim_low_bytes = DARWIN_RECLAIM_LOW_BYTES;
+       memcpy(sizes, retire->sizes, sizeof(sizes));
+       memcpy(usages, retire->usages, sizeof(usages));
+       memcpy(slow, retire->slow, sizeof(slow));
+@@ -265,6 +367,11 @@ darwin_profile_reporter(void *argument)
+       record.kind = NativeAdrenoBoProfileCounters;
+       record.data.counters = counters;
+       uint64_t failures = darwin_send_profile(retire, &record) != KERN_SUCCESS;
++      if (retire->connection.params.flags & NativeAdrenoParamsBoProfileBudget) {
++         record.kind = NativeAdrenoBoProfileBudget;
++         record.data.budget = budget;
++         failures += darwin_send_profile(retire, &record) != KERN_SUCCESS;
++      }
+       for (unsigned i = 0; i < NativeAdrenoBoProfileSizeCount; ++i) {
+          if (!sizes[i].requests) {
+             continue;
+@@ -308,8 +415,9 @@ darwin_profile_reporter(void *argument)
+ 
+ /* Finds an admitted selector: the driver answers a tunnel probe (method 0xffffffff) with success for every selector the sandbox lets through. */
+ static bool
+-dw_probe_selector(void)
++dw_probe_selector(struct darwin_connection *connection)
+ {
++   struct darwin_connection &dw = *connection;
+    const uint32_t header[2] = {DW_TUNNEL_MAGIC, 0xffffffffu};
+    for (uint32_t s = 0; s < 256; s++) {
+       if (IOConnectCallStructMethod(dw.conn, s, header, sizeof(header), NULL, NULL) == KERN_SUCCESS) {
+@@ -321,8 +429,12 @@ dw_probe_selector(void)
+ }
+ 
+ static VkResult
+-dw_open_connection(struct tu_instance *instance)
++dw_open_connection(struct darwin_connection *connection, struct tu_instance *instance)
+ {
++   struct darwin_connection &dw = *connection;
++   if (pthread_mutex_init(&dw.lock, NULL)) {
++      return VK_ERROR_INITIALIZATION_FAILED;
++   }
+    /* TU_DARWIN_SERVICE names the IOKit service (default: the AGX accelerator the original Metal discovery finds), TU_DARWIN_OPEN_TYPE its open
+     * type (default 0x4147, the type the driver serves to the plugin). NativeAdrenoGpuPublished with type 0 is the unsandboxed direct form. */
+    const char *service_name = getenv("TU_DARWIN_SERVICE");
+@@ -335,30 +447,35 @@ dw_open_connection(struct tu_instance *instance)
+       open_type = 0;
+    io_service_t service = IOServiceGetMatchingService(
+       kIOMainPortDefault, IOServiceMatching(service_name));
+-   if (!service)
++   if (!service) {
++      pthread_mutex_destroy(&dw.lock);
+       return VK_ERROR_INCOMPATIBLE_DRIVER;
++   }
+ 
+    kern_return_t kr = IOServiceOpen(service, mach_task_self(), open_type, &dw.conn);
+    IOObjectRelease(service);
+    if (kr != KERN_SUCCESS) {
++      pthread_mutex_destroy(&dw.lock);
+       return vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                                "IOServiceOpen(%s, 0x%x) failed: 0x%x", service_name, open_type, kr);
+    }
+    dw.tunnel = !direct;
+-   if (dw.tunnel && !dw_probe_selector()) {
++   if (dw.tunnel && !dw_probe_selector(connection)) {
+       IOServiceClose(dw.conn);
+       dw.conn = 0;
++      pthread_mutex_destroy(&dw.lock);
+       return vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "no external-method selector is admitted for this process");
+    }
+ 
+-   kr = dw_call(NativeAdrenoMethodQuery, NULL, 0, &dw.params, sizeof(dw.params));
++   kr = dw_call(connection, NativeAdrenoMethodQuery, NULL, 0, &dw.params, sizeof(dw.params));
+    if (kr == KERN_SUCCESS && dw.params.abi_version != NativeAdrenoAbiVersion)
+       kr = kIOReturnUnsupported;
+    if (kr == KERN_SUCCESS)
+-      kr = dw_call(NativeAdrenoMethodGetDeviceInfo, NULL, 0, &dw.info, sizeof(dw.info));
++      kr = dw_call(connection, NativeAdrenoMethodGetDeviceInfo, NULL, 0, &dw.info, sizeof(dw.info));
+    if (kr != KERN_SUCCESS) {
+       IOServiceClose(dw.conn);
+       dw.conn = 0;
++      pthread_mutex_destroy(&dw.lock);
+       return vk_startup_errorf(instance, VK_ERROR_INITIALIZATION_FAILED,
+                                "NativeAdreno query failed: 0x%x", kr);
+    }
+@@ -369,12 +486,14 @@ dw_open_connection(struct tu_instance *instance)
+ }
+ 
+ static void
+-dw_close_connection(void)
++dw_close_connection(struct darwin_connection *connection)
+ {
++   struct darwin_connection &dw = *connection;
+    if (dw.open) {
+       IOServiceClose(dw.conn);
+       dw.conn = 0;
+       dw.open = false;
++      pthread_mutex_destroy(&dw.lock);
+    }
+ }
+ 
+@@ -398,7 +517,7 @@ dw_wait_fence_raw(struct tu_device *dev, uint32_t fence, uint64_t abs_timeout_ns
+       if (abs_timeout_ns != UINT64_MAX && abs_timeout_ns <= now)
+          slice = 0;
+       NativeAdrenoAbiWaitFence req = {.fence = fence, .timeout_ns = slice};
+-      kern_return_t kr = dw_call(NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodWaitFence, &req, sizeof(req), NULL, 0);
+       if (kr == KERN_SUCCESS)
+          return VK_SUCCESS;
+       if (kr != kIOReturnTimeout)
+@@ -477,65 +596,61 @@ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
+    mtx_unlock(&dev->vma_mutex);
+ }
+ 
+-/* The caller holds retire->lock and has observed this BO's fence completion.
+- * A busy kernel handle keeps its ID and GPU address for the next collection. */
++/* The worker owns this node exclusively after observing its fence completion.
++ * Successful storage destruction leaves its ID and GPU range for the next
++ * allocation caller to recycle under the metadata and VMA locks. */
+ static VkResult
+-darwin_release_bo_storage_locked(struct tu_device *dev, struct darwin_retire_state *retire,
+-                                 struct darwin_retired_bo *bo)
++darwin_release_bo_storage(struct tu_device *dev, struct darwin_retired_bo *bo)
+ {
+-   if (bo->token) {
+-      if (bo->mapping) {
+-         kern_return_t kr = IOConnectUnmapMemory64(dw.conn, bo->token, mach_task_self(),
+-                                                  (mach_vm_address_t)(uintptr_t)bo->mapping);
+-         if (kr != KERN_SUCCESS) {
+-            return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU unmap failed: 0x%x", kr);
+-         }
+-         bo->mapping = NULL;
+-      }
+-
+-      NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->handle, .token = bo->token};
+-      kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
+-      if (kr != KERN_SUCCESS) {
+-         return retire->failure = vk_device_set_lost(&dev->vk, "deferred CPU lease release failed: 0x%x", kr);
+-      }
+-      bo->token = 0;
++   VkResult unmapped = darwin_unmap_cpu_storage(dev, bo->handle, &bo->mapping,
++                                               &bo->token, &bo->map_id);
++   if (unmapped != VK_SUCCESS) {
++      return unmapped;
+    }
+ 
+    NativeAdrenoAbiBoFree release = {.handle = bo->handle};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++   kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (kr == kIOReturnBusy) {
+       return VK_NOT_READY;
+    }
+    if (kr != KERN_SUCCESS) {
+-      return retire->failure = vk_device_set_lost(&dev->vk, "deferred BoFree failed: 0x%x", kr);
++      return vk_device_set_lost(&dev->vk, "deferred BoFree failed: 0x%x", kr);
+    }
+-
+-   darwin_free_iova(dev, bo->iova, bo->size);
+-   util_idalloc_free(&retire->ids, bo->gem_handle);
+-   *bo = {};
+-
++   bo->handle = 0;
+    return VK_SUCCESS;
+ }
+ 
+-static VkResult
+-darwin_release_bo_locked(struct tu_device *dev, struct darwin_retire_state *retire,
+-                         struct darwin_retired_bo *bo)
++/* The cache uses Freedreno's four sizes per power of two. The returned
++ * capacity is allocated and mapped in full, so reusing it preserves all
++ * existing CPU and GPU address bounds. */
++static uint64_t
++darwin_cache_capacity(uint64_t bytes, unsigned *size_class)
+ {
+-   const uint64_t began = os_time_get_nano() / 1000;
+-   const NativeAdrenoAbiBoSlowEvent event = darwin_profile_bo_event(bo, NativeAdrenoBoSlowRelease);
+-   VkResult result = darwin_release_bo_storage_locked(dev, retire, bo);
+-   darwin_profile_slow_locked(retire, began, event, result);
+-   return result;
++   unsigned index = 0;
++   for (uint64_t capacity = os_page_size; capacity < 4 * os_page_size;
++        capacity += os_page_size, ++index) {
++      if (bytes <= capacity) {
++         *size_class = index;
++         return capacity;
++      }
++   }
++   for (uint64_t base = 4 * os_page_size; base <= DARWIN_BO_CACHE_MAX_OBJECT_BYTES; base <<= 1) {
++      for (unsigned quarter = 0; quarter < 4; ++quarter, ++index) {
++         const uint64_t capacity = base + quarter * (base / 4);
++         if (bytes <= capacity) {
++            *size_class = index;
++            return capacity;
++         }
++      }
++   }
++   *size_class = DARWIN_CACHE_SIZE_CLASSES - 1;
++   return bytes;
+ }
+ 
+-static void
+-darwin_remove_cached_locked(struct darwin_retire_state *retire, unsigned index, uint64_t size)
++static unsigned
++darwin_cache_attributes(uint32_t flags, VkMemoryPropertyFlags properties, uint64_t alignment)
+ {
+-   --retire->cache_count;
+-   memmove(&retire->cache[index], &retire->cache[index + 1],
+-           (retire->cache_count - index) * sizeof(retire->cache[0]));
+-   retire->cache[retire->cache_count] = {};
+-   retire->cache_bytes -= size;
++   return (flags ^ (properties * 7) ^ (alignment >> 12)) % DARWIN_CACHE_ATTRIBUTE_BUCKETS;
+ }
+ 
+ enum darwin_cache_evict_reason {
+@@ -546,17 +661,26 @@ enum darwin_cache_evict_reason {
+    DARWIN_EVICT_CLOSE,
+ };
+ 
+-static VkResult
+-darwin_evict_oldest_locked(struct tu_device *dev, struct darwin_retire_state *retire,
+-                           enum darwin_cache_evict_reason reason)
++static void
++darwin_remove_cached_locked(struct darwin_retire_state *retire, struct darwin_bo_node *node)
+ {
+-   uint64_t size = retire->cache[0].size;
+-   VkResult result = darwin_release_bo_locked(dev, retire, &retire->cache[0]);
+-   if (result != VK_SUCCESS) {
+-      return result;
+-   }
++   list_del(&node->link);
++   list_del(&node->bucket_link);
++   --retire->cache_count;
++   retire->cache_bytes -= node->bo.size;
++}
+ 
+-   darwin_remove_cached_locked(retire, 0, size);
++static void
++darwin_evict_oldest_locked(struct darwin_retire_state *retire,
++                          enum darwin_cache_evict_reason reason)
++{
++   struct darwin_bo_node *node = list_first_entry(&retire->cache, struct darwin_bo_node, link);
++   darwin_remove_cached_locked(retire, node);
++   node->state = DARWIN_BO_RECLAIM;
++   list_addtail(&node->link, &retire->reclaim);
++   ++retire->count;
++   retire->pending_bytes += node->bo.size;
++   retire->reclaim_bytes += node->bo.size;
+    ++retire->cache_evictions;
+    switch (reason) {
+    case DARWIN_EVICT_OBJECTS:
+@@ -576,73 +700,146 @@ darwin_evict_oldest_locked(struct tu_device *dev, struct darwin_retire_state *re
+       break;
+    }
+ 
+-   return VK_SUCCESS;
+ }
+ 
+-static VkResult
+-darwin_cache_completed_locked(struct tu_device *dev, struct darwin_retire_state *retire,
+-                              struct darwin_retired_bo *bo)
++static void
++darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_bo_node *node)
+ {
+-   if (!bo->cacheable) {
+-      return darwin_release_bo_locked(dev, retire, bo);
++   struct darwin_retired_bo *bo = &node->bo;
++   if (!bo->cacheable || retire->trim_waiters) {
++      node->state = DARWIN_BO_RECLAIM;
++      list_addtail(&node->link, &retire->reclaim);
++      retire->reclaim_bytes += bo->size;
++      return;
+    }
+ 
+-   while (retire->cache_count == DARWIN_CACHED_BOS ||
+-          bo->size > DARWIN_BO_CACHE_BYTES - retire->cache_bytes) {
+-      const enum darwin_cache_evict_reason reason = retire->cache_count == DARWIN_CACHED_BOS ?
+-         DARWIN_EVICT_OBJECTS : DARWIN_EVICT_BYTES;
+-      VkResult result = darwin_evict_oldest_locked(dev, retire, reason);
+-      if (result != VK_SUCCESS) {
+-         return result;
+-      }
++   while (bo->size > DARWIN_BO_CACHE_BYTES - retire->cache_bytes) {
++      darwin_evict_oldest_locked(retire, DARWIN_EVICT_BYTES);
+    }
+ 
+-   retire->cache[retire->cache_count++] = *bo;
++   unsigned size_class;
++   darwin_cache_capacity(bo->size, &size_class);
++   unsigned attributes = darwin_cache_attributes(bo->alloc_flags, bo->mem_property, bo->alignment);
++   node->state = DARWIN_BO_CACHED;
++   list_addtail(&node->link, &retire->cache);
++   list_addtail(&node->bucket_link, &retire->buckets[size_class][attributes]);
++   ++retire->cache_count;
+    retire->cache_bytes += bo->size;
+    retire->cache_peak_bytes = MAX2(retire->cache_peak_bytes, retire->cache_bytes);
+    retire->profile.peak_objects = MAX2(retire->profile.peak_objects, retire->cache_count);
+    ++retire->profile.puts;
+-   *bo = {};
++   --retire->count;
++   retire->pending_bytes -= bo->size;
++}
+ 
+-   return VK_SUCCESS;
++static void
++darwin_wake_worker_locked(struct darwin_retire_state *retire)
++{
++   ++retire->work_generation;
++   pthread_cond_signal(&retire->work_wake);
+ }
+ 
+-/* The caller holds retire->lock. Every fence poll uses a zero timeout. */
+-static VkResult
+-darwin_reap_locked(struct tu_device *dev, struct darwin_retire_state *retire)
+-{
+-   if (retire->failure != VK_SUCCESS)
+-      return retire->failure;
+-   /* Cache only within this sweep. Persisting a bare 32-bit fence across sweeps
+-    * could mistake a later wrapped value for an old observed completion. */
+-   uint32_t completed_fence = 0;
+-   bool have_completed_fence = false;
+-   while (retire->count) {
+-      struct darwin_retired_bo *bo = &retire->entries[retire->head];
+-      if (bo->fence && (!have_completed_fence || bo->fence != completed_fence)) {
+-         VkResult result = dw_wait_fence_raw(dev, bo->fence, 0);
+-         if (result == VK_TIMEOUT)
+-            return VK_SUCCESS;
+-         if (result != VK_SUCCESS)
+-            return retire->failure = result;
+-         have_completed_fence = true;
+-         completed_fence = bo->fence;
++/* The worker processes at most 32 nodes or 1 ms before yielding the CPU. A
++ * single IOKit operation can exceed that budget; it remains charged until it
++ * returns. Fence waits use a 1 ms deadline so shutdown observes stop promptly. */
++static void *
++darwin_retire_worker(void *argument)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)argument;
++   struct tu_device *dev = retire->device;
++   unsigned processed = 0;
++   uint64_t turn_bytes = 0;
++   uint32_t observed_fence = 0;
++   uint64_t turn_start = os_time_get_nano();
++   pthread_mutex_lock(&retire->lock);
++   for (;;) {
++      if (retire->worker_stop) {
++         break;
+       }
+-      const uint64_t bytes = bo->size;
+-      VkResult result = darwin_cache_completed_locked(dev, retire, bo);
+-      if (result == VK_NOT_READY) {
+-         return VK_SUCCESS;
++
++      list_for_each_entry_safe(struct darwin_bo_node, node, &retire->retry, link) {
++         if (node->retry_generation != retire->work_generation) {
++            list_del(&node->link);
++            node->state = DARWIN_BO_RECLAIM;
++            list_addtail(&node->link, &retire->reclaim);
++         }
+       }
+-      if (result != VK_SUCCESS) {
+-         return result;
++      if (retire->failure != VK_SUCCESS ||
++          (list_is_empty(&retire->pending) && list_is_empty(&retire->reclaim))) {
++         pthread_cond_wait(&retire->work_wake, &retire->lock);
++         processed = 0;
++         turn_bytes = 0;
++         observed_fence = 0;
++         turn_start = os_time_get_nano();
++         continue;
+       }
+ 
+-      retire->head = (retire->head + 1) % DARWIN_RETIRED_BOS;
+-      --retire->count;
+-      retire->pending_bytes -= bytes;
+-      ++retire->reaped;
++      const bool destroy = !list_is_empty(&retire->reclaim) &&
++         (list_is_empty(&retire->pending) || retire->reclaim_bytes >= DARWIN_RECLAIM_HIGH_BYTES);
++      struct list_head *queue = destroy ? &retire->reclaim : &retire->pending;
++      struct darwin_bo_node *node = list_first_entry(queue, struct darwin_bo_node, link);
++      list_del(&node->link);
++      node->state = DARWIN_BO_RELEASING;
++      const uint64_t began = os_time_get_nano() / 1000;
++      NativeAdrenoAbiBoSlowEvent event = darwin_profile_bo_event(&node->bo, NativeAdrenoBoSlowRelease);
++      pthread_mutex_unlock(&retire->lock);
++
++      VkResult result = destroy ? darwin_release_bo_storage(dev, &node->bo) :
++         node->bo.fence && node->bo.fence != observed_fence ?
++         dw_wait_fence_raw(dev, node->bo.fence, os_time_get_nano() + 1000000) : VK_SUCCESS;
++
++      pthread_mutex_lock(&retire->lock);
++      if (destroy) {
++         darwin_profile_slow_locked(retire, began, event, result);
++      }
++      if (result == VK_SUCCESS) {
++         if (destroy) {
++            node->state = DARWIN_BO_RELEASED;
++            list_addtail(&node->link, &retire->released);
++            --retire->count;
++            retire->pending_bytes -= node->bo.size;
++            retire->reclaim_bytes -= node->bo.size;
++         } else {
++            observed_fence = node->bo.fence;
++            if (node->bo.cacheable) {
++               list_del(&node->bucket_link);
++            }
++            darwin_cache_completed_locked(retire, node);
++            ++retire->reaped;
++         }
++         ++retire->progress_generation;
++         pthread_cond_broadcast(&retire->progress);
++      } else if (result == VK_TIMEOUT && !destroy) {
++         node->state = DARWIN_BO_PENDING;
++         list_add(&node->link, &retire->pending);
++      } else if (result == VK_NOT_READY && destroy) {
++         node->state = DARWIN_BO_RECLAIM;
++         node->retry_generation = retire->work_generation;
++         list_addtail(&node->link, &retire->retry);
++      } else {
++         if (!destroy && node->bo.cacheable) {
++            list_del(&node->bucket_link);
++         }
++         node->state = DARWIN_BO_QUARANTINED;
++         retire->failure = result;
++         pthread_cond_broadcast(&retire->progress);
++      }
++
++      turn_bytes += node->bo.size;
++      if (++processed >= 32 || turn_bytes >= 4 * 1024 * 1024 ||
++          os_time_get_nano() - turn_start >= 1000000) {
++         pthread_mutex_unlock(&retire->lock);
++         sched_yield();
++         pthread_mutex_lock(&retire->lock);
++         processed = 0;
++         turn_bytes = 0;
++         observed_fence = 0;
++         turn_start = os_time_get_nano();
++      }
+    }
+-   return VK_SUCCESS;
++   pthread_cond_broadcast(&retire->progress);
++   pthread_mutex_unlock(&retire->lock);
++   return NULL;
+ }
+ 
+ static VkResult
+@@ -650,22 +847,62 @@ darwin_collect_retired(struct tu_device *dev)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+-   VkResult result = darwin_reap_locked(dev, retire);
++   VkResult result = retire->failure;
++   darwin_wake_worker_locked(retire);
+    pthread_mutex_unlock(&retire->lock);
+    return result;
+ }
+ 
++/* Released nodes still hold their GPU range until an allocation caller can
++ * return it. This helper performs no kernel call and runs before ID reuse. */
++static void
++darwin_recycle_released_locked(struct tu_device *dev, struct darwin_retire_state *retire)
++{
++   list_for_each_entry_safe(struct darwin_bo_node, node, &retire->released, link) {
++      list_del(&node->link);
++      darwin_free_iova(dev, node->bo.iova, node->bo.size);
++      util_idalloc_free(&retire->ids, node->bo.gem_handle);
++      --retire->node_count;
++      *node = {};
++   }
++}
++
++static VkResult darwin_trim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason);
++
+ static uint32_t
+ darwin_allocate_bo_id(struct tu_device *dev)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
+-   uint32_t id = util_idalloc_alloc(&retire->ids);
++   darwin_recycle_released_locked(dev, retire);
++   if (retire->node_count == DARWIN_NATIVE_BO_LIMIT) {
++      pthread_mutex_unlock(&retire->lock);
++      darwin_trim_cache(dev, DARWIN_EVICT_OBJECTS);
++      pthread_mutex_lock(&retire->lock);
++      darwin_recycle_released_locked(dev, retire);
++   }
++   uint32_t id = 0;
++   if (retire->failure == VK_SUCCESS && retire->node_count < DARWIN_NATIVE_BO_LIMIT) {
++      id = util_idalloc_alloc(&retire->ids);
++      retire->nodes[id].bo.gem_handle = id;
++      retire->nodes[id].state = DARWIN_BO_ACTIVE;
++      ++retire->node_count;
++   }
+    pthread_mutex_unlock(&retire->lock);
+-
+    return id;
+ }
+ 
++static void
++darwin_cancel_bo_id(struct tu_device *dev, uint32_t id)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&retire->lock);
++   util_idalloc_free(&retire->ids, id);
++   --retire->node_count;
++   retire->nodes[id] = {};
++   pthread_mutex_unlock(&retire->lock);
++}
++
+ static bool
+ darwin_bo_matches(const struct darwin_retired_bo *bo, uint64_t size, uint64_t alignment,
+                   uint32_t alloc_flags, VkMemoryPropertyFlags mem_property)
+@@ -703,31 +940,23 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+       ++profile->bypass_oversize;
+    }
+ 
+-   VkResult result = darwin_reap_locked(dev, retire);
++   unsigned size_class;
++   const uint64_t capacity = eligible ? darwin_cache_capacity(size, &size_class) : size;
++   const unsigned attributes = darwin_cache_attributes(alloc_flags, mem_property, alignment);
++   VkResult result = retire->failure;
++   darwin_wake_worker_locked(retire);
+    if (result == VK_SUCCESS && eligible) {
+       bool same_size = false;
+       bool same_alignment = false;
+       bool same_flags = false;
+-      for (unsigned i = 0; i < retire->cache_count; ++i) {
+-         const struct darwin_retired_bo *bo = &retire->cache[i];
+-         if (bo->size != size) {
+-            continue;
+-         }
+-         same_size = true;
+-         if (bo->alignment != alignment) {
+-            continue;
+-         }
+-         same_alignment = true;
+-         if (bo->alloc_flags != alloc_flags) {
+-            continue;
+-         }
+-         same_flags = true;
+-         if (bo->mem_property != mem_property) {
++      list_for_each_entry(struct darwin_bo_node, node, &retire->buckets[size_class][attributes], bucket_link) {
++         if (!darwin_bo_matches(&node->bo, capacity, alignment, alloc_flags, mem_property)) {
+             continue;
+          }
+ 
+-         *out = *bo;
+-         darwin_remove_cached_locked(retire, i, size);
++         *out = node->bo;
++         darwin_remove_cached_locked(retire, node);
++         node->state = DARWIN_BO_ACTIVE;
+          ++retire->cache_hits;
+          ++profile->hits;
+          ++size_bin->hits;
+@@ -741,15 +970,21 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+          ++size_bin->misses;
+          ++usage_bin->misses;
+          bool compatible_pending = false;
+-         for (unsigned i = 0; i < retire->count; ++i) {
+-            const struct darwin_retired_bo *bo = &retire->entries[(retire->head + i) % DARWIN_RETIRED_BOS];
+-            if (darwin_bo_matches(bo, size, alignment, alloc_flags, mem_property)) {
++         list_for_each_entry(struct darwin_bo_node, node, &retire->pending_buckets[size_class][attributes], bucket_link) {
++            if (darwin_bo_matches(&node->bo, capacity, alignment, alloc_flags, mem_property)) {
+                compatible_pending = true;
+                break;
+             }
+          }
+-         /* A matching entry behind an unfinished queue head cannot be reused
+-          * yet. No extra fence polling is introduced for measurement. */
++         for (unsigned bucket = 0; bucket < DARWIN_CACHE_ATTRIBUTE_BUCKETS; ++bucket) {
++            list_for_each_entry(struct darwin_bo_node, node, &retire->buckets[size_class][bucket], bucket_link) {
++               same_size = true;
++               if (node->bo.alignment == alignment) {
++                  same_alignment = true;
++                  same_flags |= node->bo.alloc_flags == alloc_flags;
++               }
++            }
++         }
+          if (compatible_pending) {
+             *reason = NativeAdrenoBoCachePending;
+             ++profile->miss_pending;
+@@ -781,36 +1016,84 @@ darwin_take_cached(struct tu_device *dev, uint64_t size, uint64_t alignment,
+    return result;
+ }
+ 
+-/* Allocation pressure releases only completed cached objects. Pending fences
+- * remain in the retirement queue and are polled by later collections. */
++/* Allocation pressure transfers completed cache entries to the worker and
++ * waits for real storage release. A five-second deadline bounds admission;
++ * timeout preserves queued ownership and lets the caller retry once against
++ * the storage that has actually been released. */
+ static VkResult
+ darwin_trim_cache(struct tu_device *dev, enum darwin_cache_evict_reason reason)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   struct timespec deadline;
++   clock_gettime(CLOCK_REALTIME, &deadline);
++   deadline.tv_sec += 5;
+    pthread_mutex_lock(&retire->lock);
+-   VkResult result = retire->failure;
+-   while (result == VK_SUCCESS && retire->cache_count) {
+-      result = darwin_evict_oldest_locked(dev, retire, reason);
++   ++retire->trim_waiters;
++   while (retire->failure == VK_SUCCESS && retire->cache_count) {
++      darwin_evict_oldest_locked(retire, reason);
++   }
++   darwin_wake_worker_locked(retire);
++   while (retire->failure == VK_SUCCESS && !retire->worker_stop && retire->count) {
++      ++retire->pressure_waits;
++      if (pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline) == ETIMEDOUT) {
++         break;
++      }
+    }
++   --retire->trim_waiters;
++   darwin_recycle_released_locked(dev, retire);
++   VkResult result = retire->failure;
+    pthread_mutex_unlock(&retire->lock);
++   return result;
++}
+ 
+-   return result == VK_NOT_READY ? VK_SUCCESS : result;
++/* Cold allocations wait only when completed destruction has accumulated a
++ * full high-water budget. Existing cache hits and all BO frees keep moving. */
++static VkResult
++darwin_wait_reclaim_budget(struct tu_device *dev)
++{
++   struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   struct timespec deadline;
++   clock_gettime(CLOCK_REALTIME, &deadline);
++   deadline.tv_sec += 5;
++   pthread_mutex_lock(&retire->lock);
++   VkResult result = retire->failure;
++   if (retire->reclaim_bytes >= DARWIN_RECLAIM_HIGH_BYTES) {
++      darwin_wake_worker_locked(retire);
++      while (retire->failure == VK_SUCCESS && !retire->worker_stop &&
++             retire->reclaim_bytes > DARWIN_RECLAIM_LOW_BYTES) {
++         ++retire->pressure_waits;
++         if (pthread_cond_timedwait(&retire->progress, &retire->lock, &deadline) == ETIMEDOUT) {
++            result = VK_ERROR_OUT_OF_DEVICE_MEMORY;
++            break;
++         }
++      }
++   }
++   if (retire->failure != VK_SUCCESS) {
++      result = retire->failure;
++   }
++   pthread_mutex_unlock(&retire->lock);
++   return result;
+ }
+ 
+ static VkResult
+ darwin_map_failure(struct tu_device *dev, uint64_t handle, uint64_t iova,
+-                   uint64_t size, kern_return_t map_error)
++                   uint64_t size, uint32_t gem_handle, kern_return_t map_error)
+ {
+    NativeAdrenoAbiBoFree release = {.handle = handle};
+-   kern_return_t cleanup = dw_call(NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
++   kern_return_t cleanup = dw_call(dev, NativeAdrenoMethodBoFree, &release, sizeof(release), NULL, 0);
+    if (cleanup == KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      darwin_cancel_bo_id(dev, gem_handle);
+       return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoMap failed: 0x%x", map_error);
+    }
+    /* A failed map may have modified tables. Unknown cleanup never authorizes
+     * reusing its IOVA, even though no tu_bo could be published to the caller. */
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    pthread_mutex_lock(&retire->lock);
++   retire->nodes[gem_handle].bo = {
++      .handle = handle, .iova = iova, .size = size, .gem_handle = gem_handle,
++   };
++   retire->nodes[gem_handle].state = DARWIN_BO_QUARANTINED;
+    retire->failure = vk_device_set_lost(&dev->vk, "BoMap cleanup failed: 0x%x; retaining native allocation and IOVA", cleanup);
+    VkResult result = retire->failure;
+    pthread_mutex_unlock(&retire->lock);
+@@ -845,34 +1128,50 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       return result;
+    }
+ 
++   if (cacheable) {
++      unsigned size_class;
++      size = darwin_cache_capacity(size, &size_class);
++   }
+    if (!storage.handle) {
++      result = darwin_wait_reclaim_budget(dev);
++      if (result != VK_SUCCESS) {
++         return result;
++      }
++      storage.gem_handle = darwin_allocate_bo_id(dev);
++      if (!storage.gem_handle) {
++         return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++      }
+       uint64_t iova;
+       result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+       if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY ||
+           result == VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS) {
+          result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
+          if (result != VK_SUCCESS) {
++            darwin_cancel_bo_id(dev, storage.gem_handle);
+             return result;
+          }
+          result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+       }
+       if (result != VK_SUCCESS) {
++         darwin_cancel_bo_id(dev, storage.gem_handle);
+          return result;
+       }
+ 
+       NativeAdrenoAbiBoAlloc alloc = {.bytes = size, .align_log2 = 12, .contiguous = 0};
+       NativeAdrenoAbiBoAllocReply reply = {};
+-      kern_return_t kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+       if (kr != KERN_SUCCESS) {
+          result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
+          if (result != VK_SUCCESS) {
+             darwin_free_iova(dev, iova, size);
++            darwin_cancel_bo_id(dev, storage.gem_handle);
+             return result;
+          }
+-         kr = dw_call(NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
++         kr = dw_call(dev, NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+       }
+       if (kr != KERN_SUCCESS) {
+          darwin_free_iova(dev, iova, size);
++         darwin_cancel_bo_id(dev, storage.gem_handle);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+ 
+@@ -884,15 +1183,14 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+          .shareability = 2,
+       };
+       NativeAdrenoAbiBoMapReply mapped = {};
+-      kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
++      kr = dw_call(dev, NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+       if (kr != KERN_SUCCESS) {
+-         return darwin_map_failure(dev, reply.handle, iova, size, kr);
++         return darwin_map_failure(dev, reply.handle, iova, size, storage.gem_handle, kr);
+       }
+ 
+       storage.handle = reply.handle;
+       storage.iova = iova;
+       storage.size = size;
+-      storage.gem_handle = darwin_allocate_bo_id(dev);
+    }
+ 
+    struct tu_bo *bo = tu_device_lookup_bo(dev, storage.gem_handle);
+@@ -916,6 +1214,7 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+    };
+    bo->darwin_handle = storage.handle;
+    bo->darwin_token = storage.token;
++   bo->darwin_map_id = storage.map_id;
+    bo->darwin_alloc_flags = flags;
+    bo->darwin_mem_property = mem_property;
+    bo->darwin_alignment = alignment;
+@@ -972,47 +1271,59 @@ darwin_bo_init(struct tu_device *dev, struct vk_object_base *base,
+ static VkResult
+ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void *pointer, uint64_t size)
+ {
++   struct darwin_connection &dw = *darwin_connection_for(dev);
+    if (!(dw.params.flags & NativeAdrenoParamsHostImport))
+       return vk_error(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE);
+    VkResult collected = darwin_collect_retired(dev);
+    if (collected != VK_SUCCESS)
+       return collected;
++   VkResult admitted = darwin_wait_reclaim_budget(dev);
++   if (admitted != VK_SUCCESS) {
++      return admitted;
++   }
++   uint32_t gem_handle = darwin_allocate_bo_id(dev);
++   if (!gem_handle) {
++      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
+    uint64_t iova;
+    VkResult result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+    if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+       result = darwin_trim_cache(dev, DARWIN_EVICT_IOVA);
+       if (result != VK_SUCCESS) {
++         darwin_cancel_bo_id(dev, gem_handle);
+          return result;
+       }
+       result = darwin_allocate_iova(dev, size, 0, TU_BO_ALLOC_NO_FLAGS, &iova);
+    }
+    if (result != VK_SUCCESS) {
++      darwin_cancel_bo_id(dev, gem_handle);
+       return result;
+    }
+ 
+    NativeAdrenoAbiBoImport import = {.address = (uint64_t)(uintptr_t)pointer, .bytes = size};
+    NativeAdrenoAbiBoAllocReply reply = {};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
++   kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+    if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
+       result = darwin_trim_cache(dev, DARWIN_EVICT_ALLOCATION);
+       if (result != VK_SUCCESS) {
+          darwin_free_iova(dev, iova, size);
++         darwin_cancel_bo_id(dev, gem_handle);
+          return result;
+       }
+-      kr = dw_call(NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
++      kr = dw_call(dev, NativeAdrenoMethodBoImport, &import, sizeof(import), &reply, sizeof(reply));
+    }
+    if (kr != KERN_SUCCESS) {
+       darwin_free_iova(dev, iova, size);
++      darwin_cancel_bo_id(dev, gem_handle);
+       return vk_errorf(dev, VK_ERROR_INVALID_EXTERNAL_HANDLE, "BoImport failed: 0x%x", kr);
+    }
+    NativeAdrenoAbiBoMap map = {.handle = reply.handle, .iova = iova, .permissions = 3u, .writeback = 0, .shareability = 2};
+    NativeAdrenoAbiBoMapReply mapped = {};
+-   kr = dw_call(NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
++   kr = dw_call(dev, NativeAdrenoMethodBoMap, &map, sizeof(map), &mapped, sizeof(mapped));
+    if (kr != KERN_SUCCESS) {
+-      return darwin_map_failure(dev, reply.handle, iova, size, kr);
++      return darwin_map_failure(dev, reply.handle, iova, size, gem_handle, kr);
+    }
+ 
+-   uint32_t gem_handle = darwin_allocate_bo_id(dev);
+    struct tu_bo *bo = tu_device_lookup_bo(dev, gem_handle);
+    assert(bo && bo->gem_handle == 0);
+    *bo = (struct tu_bo) {
+@@ -1025,6 +1336,7 @@ darwin_bo_init_host_recorded(struct tu_device *dev, struct tu_bo **out_bo, void
+    };
+    bo->darwin_handle = reply.handle;
+    bo->darwin_token = 0;
++   bo->darwin_map_id = 0;
+    bo->map = pointer;
+    bo->never_unmap = true;
+    darwin_profile_name(bo->darwin_profile_name, sizeof(bo->darwin_profile_name), "host import");
+@@ -1075,26 +1387,50 @@ darwin_bo_export_dmabuf(struct tu_device *dev, struct tu_bo *bo)
+ static VkResult
+ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+ {
+-   if (bo->map && bo->darwin_token) {
+-      kern_return_t kr = IOConnectUnmapMemory64(dw.conn, bo->darwin_token, mach_task_self(),
+-                                               (mach_vm_address_t)(uintptr_t)bo->map);
+-      if (kr != KERN_SUCCESS) {
+-         return vk_device_set_lost(&dev->vk, "cached CPU unmap failed: 0x%x", kr);
++   struct darwin_connection &dw = *darwin_connection_for(dev);
++   if (bo->darwin_token || bo->darwin_map_id) {
++      VkResult result = darwin_unmap_cpu_storage(dev, bo->darwin_handle, &bo->map,
++                                               &bo->darwin_token, &bo->darwin_map_id);
++      if (result != VK_SUCCESS) {
++         return result;
+       }
+-      bo->map = NULL;
++      TU_RMV(bo_unmap, dev, bo);
++   }
+ 
+-      NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = bo->darwin_token};
+-      kr = dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
+-      if (kr != KERN_SUCCESS) {
+-         return vk_device_set_lost(&dev->vk, "cached CPU lease release failed: 0x%x", kr);
++   if (dw.params.flags & NativeAdrenoParamsCpuMapV2) {
++      NativeAdrenoAbiBoCpuMapV2 request = {
++         .handle = bo->darwin_handle,
++         .address = (uint64_t)(uintptr_t)placed_addr,
++         .version = NativeAdrenoCpuMapVersion,
++      };
++      NativeAdrenoAbiBoCpuMapV2Reply reply = {};
++      kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoCpuMapV2, &request, sizeof(request),
++                                &reply, sizeof(reply));
++      if (kr == KERN_SUCCESS) {
++         bo->map = (void *)(uintptr_t)reply.address;
++         bo->darwin_map_id = reply.map_id;
++         bo->darwin_token = 0;
++         bo->never_unmap = true;
++         if (!reply.map_id || !reply.address || reply.bytes < bo->size ||
++             (placed_addr && bo->map != placed_addr)) {
++            VkResult result = darwin_unmap_cpu_storage(dev, bo->darwin_handle, &bo->map,
++                                                     &bo->darwin_token, &bo->darwin_map_id);
++            if (result != VK_SUCCESS) {
++               return result;
++            }
++            return vk_device_set_lost(&dev->vk, "CPU mapping reply is invalid");
++         }
++         TU_RMV(bo_map, dev, bo);
++         return VK_SUCCESS;
++      }
++      if (kr != kIOReturnUnsupported) {
++         return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "BoCpuMapV2 failed: 0x%x", kr);
+       }
+-      bo->darwin_token = 0;
+-      TU_RMV(bo_unmap, dev, bo);
+    }
+ 
+    NativeAdrenoAbiBoCpuMap req = {.handle = bo->darwin_handle};
+    NativeAdrenoAbiBoCpuMapReply reply = {};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodBoCpuMap, &req, sizeof(req), &reply, sizeof(reply));
++   kern_return_t kr = dw_call(dev, NativeAdrenoMethodBoCpuMap, &req, sizeof(req), &reply, sizeof(reply));
+    if (kr != KERN_SUCCESS)
+       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "BoCpuMap failed: 0x%x", kr);
+ 
+@@ -1106,8 +1442,13 @@ darwin_bo_map(struct tu_device *dev, struct tu_bo *bo, void *placed_addr)
+    uint32_t options = (placed_addr ? 0 : kIOMapAnywhere) | kIOMapWriteCombineCache;
+    kr = IOConnectMapMemory64(dw.conn, reply.token, mach_task_self(), &address, &length, options);
+    if (kr != KERN_SUCCESS || !address || length < bo->size) {
+-      NativeAdrenoAbiBoCpuUnmap undo = {.handle = bo->darwin_handle, .token = reply.token};
+-      dw_call(NativeAdrenoMethodBoCpuUnmap, &undo, sizeof(undo), NULL, 0);
++      bo->map = kr == KERN_SUCCESS ? (void *)(uintptr_t)address : NULL;
++      bo->darwin_token = reply.token;
++      VkResult result = darwin_unmap_cpu_storage(dev, bo->darwin_handle, &bo->map,
++                                               &bo->darwin_token, &bo->darwin_map_id);
++      if (result != VK_SUCCESS) {
++         return result;
++      }
+       return vk_errorf(dev, VK_ERROR_MEMORY_MAP_FAILED, "IOConnectMapMemory64 failed: 0x%x", kr);
+    }
+ 
+@@ -1132,7 +1473,7 @@ darwin_bo_set_metadata(struct tu_device *dev, struct tu_bo *bo, void *metadata,
+       return;
+    NativeAdrenoAbiMetadata req = {.handle = bo->darwin_handle, .bytes = metadata_size};
+    memcpy(req.text, metadata, metadata_size);
+-   dw_call(NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
++   dw_call(dev, NativeAdrenoMethodSetMetadata, &req, sizeof(req), NULL, 0);
+ }
+ 
+ static int
+@@ -1142,28 +1483,16 @@ darwin_bo_get_metadata(struct tu_device *dev, struct tu_bo *bo, void *metadata,
+    NativeAdrenoAbiMetadata req = {.handle = bo->darwin_handle,
+                                   .bytes = MIN2(metadata_size, NativeAdrenoAbiMetadataBytes)};
+    NativeAdrenoAbiMetadata reply = {};
+-   if (dw_call(NativeAdrenoMethodGetMetadata, &req, sizeof(req), &reply, sizeof(reply)) != KERN_SUCCESS)
++   if (dw_call(dev, NativeAdrenoMethodGetMetadata, &req, sizeof(req), &reply, sizeof(reply)) != KERN_SUCCESS)
+       return -1;
+    memcpy(metadata, reply.text, MIN2(reply.bytes, metadata_size));
+    return 0;
+ }
+ 
+-/* Waits until every submission made so far has retired, so a freed buffer cannot still be in flight. The kernel also
+- * retires completed jobs itself; this only covers the window before the GPU passes the last fence. */
+-static VkResult
+-darwin_wait_idle(struct tu_device *dev)
+-{
+-   pthread_mutex_lock(&dw.lock);
+-   uint32_t last = dw.last_fence;
+-   pthread_mutex_unlock(&dw.lock);
+-   if (last)
+-      return dw_wait_fence_locked_free(dev, last, os_time_get_nano() + 5000000000ull);
+-   return VK_SUCCESS;
+-}
+-
+ static void
+ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+ {
++   struct darwin_connection &dw = *darwin_connection_for(dev);
+    const uint64_t began = os_time_get_nano() / 1000;
+    assert(bo->gem_handle);
+ 
+@@ -1187,57 +1516,49 @@ darwin_bo_finish(struct tu_device *dev, struct tu_bo *bo)
+    tu_debug_bos_del(dev, bo);
+    tu_dump_bo_del(dev, bo);
+ 
+-   if (bo->map && bo->darwin_token)
++   if (bo->map && (bo->darwin_token || bo->darwin_map_id))
+       TU_RMV(bo_unmap, dev, bo);
+    TU_RMV(bo_destroy, dev, bo);
+ 
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
++   pthread_mutex_lock(&dw.lock);
++   uint32_t fence = dw.last_fence;
++   pthread_mutex_unlock(&dw.lock);
++   event.connection_fence = fence;
+    pthread_mutex_lock(&retire->lock);
+-   darwin_reap_locked(dev, retire);
+-   if (retire->count == DARWIN_RETIRED_BOS && retire->failure == VK_SUCCESS) {
+-      ++retire->pressure_waits;
+-      pthread_mutex_unlock(&retire->lock);
+-      VkResult waited = darwin_wait_idle(dev);
+-      pthread_mutex_lock(&retire->lock);
+-      if (waited != VK_SUCCESS)
+-         retire->failure = vk_device_set_lost(&dev->vk, "deferred BO pressure wait failed");
+-      else
+-         darwin_reap_locked(dev, retire);
+-   }
+-   if (retire->count < DARWIN_RETIRED_BOS) {
+-      pthread_mutex_lock(&dw.lock);
+-      uint32_t fence = dw.last_fence;
+-      pthread_mutex_unlock(&dw.lock);
+-      event.connection_fence = fence;
+-      unsigned slot = (retire->head + retire->count) % DARWIN_RETIRED_BOS;
+-      retire->entries[slot] = {
+-         .handle = bo->darwin_handle,
+-         .iova = bo->iova,
+-         .size = bo->size,
+-         .mapping = bo->map,
+-         .token = bo->darwin_token,
+-         .fence = fence,
+-         .gem_handle = bo->gem_handle,
+-         .alloc_flags = bo->darwin_alloc_flags,
+-         .mem_property = bo->darwin_mem_property,
+-         .alignment = bo->darwin_alignment,
+-         .cacheable = bo->darwin_cacheable,
+-      };
+-      memcpy(retire->entries[slot].name, event.name, sizeof(event.name));
+-      ++retire->count;
+-      ++retire->enqueued;
+-      retire->pending_bytes += bo->size;
+-
+-      /* The sparse-array entry becomes empty before another allocation can
+-       * obtain this handle from the completed cache. */
+-      memset(bo, 0, sizeof(*bo));
+-      darwin_reap_locked(dev, retire);
+-   } else {
+-      /* No reusable range is reported on error. The kernel still owns the handle
+-       * and view; connection teardown must drain them, even if this record cannot fit. */
+-      retire->failure = vk_device_set_lost(&dev->vk, "deferred BO queue remains full; retaining native allocation");
+-      memset(bo, 0, sizeof(*bo));
+-   }
++   struct darwin_bo_node *node = &retire->nodes[bo->gem_handle];
++   node->bo = {
++      .handle = bo->darwin_handle,
++      .iova = bo->iova,
++      .size = bo->size,
++      .map_id = bo->darwin_map_id,
++      .mapping = bo->map,
++      .token = bo->darwin_token,
++      .fence = fence,
++      .gem_handle = bo->gem_handle,
++      .alloc_flags = bo->darwin_alloc_flags,
++      .mem_property = bo->darwin_mem_property,
++      .alignment = bo->darwin_alignment,
++      .cacheable = bo->darwin_cacheable,
++   };
++   memcpy(node->bo.name, event.name, sizeof(event.name));
++   node->state = DARWIN_BO_PENDING;
++   list_addtail(&node->link, &retire->pending);
++   if (node->bo.cacheable) {
++      unsigned size_class;
++      darwin_cache_capacity(node->bo.size, &size_class);
++      unsigned attributes = darwin_cache_attributes(node->bo.alloc_flags,
++         node->bo.mem_property, node->bo.alignment);
++      list_addtail(&node->bucket_link, &retire->pending_buckets[size_class][attributes]);
++   }
++   ++retire->count;
++   ++retire->enqueued;
++   retire->pending_bytes += bo->size;
++
++   /* The caller releases the sparse-array entry before the worker can make
++    * this storage available to a new allocation. */
++   memset(bo, 0, sizeof(*bo));
++   darwin_wake_worker_locked(retire);
+    darwin_profile_slow_locked(retire, began, event, retire->failure);
+    pthread_mutex_unlock(&retire->lock);
+ 
+@@ -1449,8 +1770,9 @@ const struct vk_sync_type vk_darwin_sync_type = {
+ };
+ 
+ static void
+-darwin_note_fence(uint32_t fence)
++darwin_note_fence(struct darwin_connection *connection, uint32_t fence)
+ {
++   struct darwin_connection &dw = *connection;
+    if (dw.inflight_count == 8) {
+       memmove(dw.inflight, dw.inflight + 1, 7 * sizeof(dw.inflight[0]));
+       dw.inflight_count = 7;
+@@ -1474,7 +1796,7 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+ 
+    for (unsigned attempt = 0; attempt < 64; attempt++) {
+       NativeAdrenoAbiSubmitReply reply = {};
+-      kern_return_t kr = dw_call(NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
++      kern_return_t kr = dw_call(queue->device, NativeAdrenoMethodSubmit, &req, sizeof(req), &reply, sizeof(reply));
+       if (kr == KERN_SUCCESS) {
+          *fence = (uint32_t)reply.fence;
+          return VK_SUCCESS;
+@@ -1482,6 +1804,7 @@ darwin_submit_chunk(struct tu_queue *queue, const NativeAdrenoAbiSubmitBuffer *e
+       if (kr != kIOReturnBusy)
+          return vk_device_set_lost(&dev->vk, "submit failed: 0x%x", kr);
+ 
++      struct darwin_connection &dw = *darwin_connection_for(queue->device);
+       pthread_mutex_lock(&dw.lock);
+       uint32_t oldest = dw.inflight_count ? dw.inflight[0] : 0;
+       pthread_mutex_unlock(&dw.lock);
+@@ -1501,6 +1824,7 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+ {
+    struct tu_darwin_queue_submit *submit = (struct tu_darwin_queue_submit *)_submit;
+    struct tu_device *dev = queue->device;
++   struct darwin_connection &dw = *darwin_connection_for(dev);
+ 
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
+    for (uint32_t i = 0; i < wait_count; i++) {
+@@ -1522,7 +1846,7 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+          if (result != VK_SUCCESS)
+             return result;
+          pthread_mutex_lock(&dw.lock);
+-         darwin_note_fence(chunk_fence);
++         darwin_note_fence(&dw, chunk_fence);
+          pthread_mutex_unlock(&dw.lock);
+          fence = chunk_fence;
+       }
+@@ -1549,29 +1873,67 @@ static VkResult
+ darwin_device_init(struct tu_device *dev)
+ {
+    dev->fd = -1;
+-   /* The enumeration probe closed its connection; take the single slot for this device. */
+-   if (!dw.open) {
+-      VkResult result = dw_open_connection(dev->physical_device->instance);
+-      if (result != VK_SUCCESS)
+-         return result;
+-   }
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)
+       vk_zalloc(&dev->vk.alloc, sizeof(*retire), 8, VK_SYSTEM_ALLOCATION_SCOPE_DEVICE);
+    if (!retire) {
+-      dw_close_connection();
+       return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
++   struct darwin_connection &dw = retire->connection;
++   VkResult opened = dw_open_connection(&dw, dev->physical_device->instance);
++   if (opened != VK_SUCCESS) {
++      vk_free(&dev->vk.alloc, retire);
++      return opened;
++   }
++   dev->va_start = dw.info.va_start;
++   dev->va_size = dw.info.va_size;
+    if (pthread_mutex_init(&retire->lock, NULL)) {
++      dw_close_connection(&dw);
+       vk_free(&dev->vk.alloc, retire);
+-      dw_close_connection();
+       return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+    }
+    util_idalloc_init(&retire->ids, 256);
+    util_idalloc_reserve(&retire->ids, 0);
++   list_inithead(&retire->pending);
++   list_inithead(&retire->cache);
++   list_inithead(&retire->reclaim);
++   list_inithead(&retire->retry);
++   list_inithead(&retire->released);
++   for (unsigned size = 0; size < DARWIN_CACHE_SIZE_CLASSES; ++size) {
++      for (unsigned attributes = 0; attributes < DARWIN_CACHE_ATTRIBUTE_BUCKETS; ++attributes) {
++         list_inithead(&retire->buckets[size][attributes]);
++         list_inithead(&retire->pending_buckets[size][attributes]);
++      }
++   }
++   if (pthread_cond_init(&retire->work_wake, NULL)) {
++      util_idalloc_fini(&retire->ids);
++      pthread_mutex_destroy(&retire->lock);
++      dw_close_connection(&dw);
++      vk_free(&dev->vk.alloc, retire);
++      return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
++   }
++   if (pthread_cond_init(&retire->progress, NULL)) {
++      pthread_cond_destroy(&retire->work_wake);
++      util_idalloc_fini(&retire->ids);
++      pthread_mutex_destroy(&retire->lock);
++      dw_close_connection(&dw);
++      vk_free(&dev->vk.alloc, retire);
++      return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
++   }
++   retire->device = dev;
++   if (pthread_create(&retire->worker, NULL, darwin_retire_worker, retire)) {
++      pthread_cond_destroy(&retire->progress);
++      pthread_cond_destroy(&retire->work_wake);
++      util_idalloc_fini(&retire->ids);
++      pthread_mutex_destroy(&retire->lock);
++      dw_close_connection(&dw);
++      vk_free(&dev->vk.alloc, retire);
++      return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
++   }
++   retire->worker_started = true;
+    dev->darwin_retire = retire;
+-   pthread_mutex_lock(&dw.lock);
+-   retire->profile_device = ++dw.next_profile_device;
+-   pthread_mutex_unlock(&dw.lock);
++   pthread_mutex_lock(&profile_device_lock);
++   retire->profile_device = ++next_profile_device;
++   pthread_mutex_unlock(&profile_device_lock);
+    for (unsigned i = 0; i < NativeAdrenoBoProfileSizeCount; ++i) {
+       retire->sizes[i].upper_bytes = i + 1 == NativeAdrenoBoProfileSizeCount ?
+          UINT64_MAX : 4096ull << i;
+@@ -1608,6 +1970,15 @@ darwin_device_finish(struct tu_device *dev)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    if (retire) {
++      pthread_mutex_lock(&retire->lock);
++      retire->worker_stop = true;
++      darwin_wake_worker_locked(retire);
++      pthread_mutex_unlock(&retire->lock);
++      if (retire->worker_started) {
++         pthread_join(retire->worker, NULL);
++      }
++      pthread_cond_destroy(&retire->progress);
++      pthread_cond_destroy(&retire->work_wake);
+       if (retire->reporter_started) {
+          pthread_mutex_lock(&retire->lock);
+          retire->profile.evict_close += retire->cache_count;
+@@ -1621,8 +1992,8 @@ darwin_device_finish(struct tu_device *dev)
+    }
+    /* The reporter has sent its final snapshot before the connection is closed.
+     * Closing drains the GPU and releases every allocation still owned here. */
+-   dw_close_connection();
+    if (retire) {
++      dw_close_connection(&retire->connection);
+       /* Some CreateDevice failure paths already destroyed the VMA heap/mutex.
+        * Never return ranges here: they are either gone or about to be destroyed. */
+       if (debug_get_bool_option("TU_DARWIN_RETIRE_TRACE", false)) {
+@@ -1646,7 +2017,7 @@ static int
+ darwin_device_get_gpu_timestamp(struct tu_device *dev, uint64_t *ts)
+ {
+    NativeAdrenoAbiTimestamp reply = {};
+-   if (dw_call(NativeAdrenoMethodGetTimestamp, NULL, 0, &reply, sizeof(reply)) != KERN_SUCCESS)
++   if (dw_call(dev, NativeAdrenoMethodGetTimestamp, NULL, 0, &reply, sizeof(reply)) != KERN_SUCCESS)
+       return -1;
+    *ts = reply.ticks;
+    return 0;
+@@ -1656,7 +2027,7 @@ static int
+ darwin_device_get_suspend_count(struct tu_device *dev, uint64_t *suspend_count)
+ {
+    NativeAdrenoAbiStatus reply = {};
+-   if (dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &reply, sizeof(reply)) != KERN_SUCCESS)
++   if (dw_call(dev, NativeAdrenoMethodGetStatus, NULL, 0, &reply, sizeof(reply)) != KERN_SUCCESS)
+       *suspend_count = 0;
+    else
+       *suspend_count = reply.suspends;
+@@ -1667,7 +2038,7 @@ static VkResult
+ darwin_device_check_status(struct tu_device *device)
+ {
+    NativeAdrenoAbiStatus reply = {};
+-   kern_return_t kr = dw_call(NativeAdrenoMethodGetStatus, NULL, 0, &reply, sizeof(reply));
++   kern_return_t kr = dw_call(device, NativeAdrenoMethodGetStatus, NULL, 0, &reply, sizeof(reply));
+    if (kr == kIOReturnUnsupported)
+       return VK_SUCCESS; /* counters not attached in this kernel */
+    if (kr != KERN_SUCCESS)
+@@ -1728,7 +2099,8 @@ tu_knl_darwin_load(struct tu_instance *instance)
+       return vk_errorf(instance, VK_ERROR_INITIALIZATION_FAILED, "I can't KHR_display");
+    }
+ 
+-   VkResult result = dw_open_connection(instance);
++   struct darwin_connection connection = {};
++   VkResult result = dw_open_connection(&connection, instance);
+    if (result != VK_SUCCESS) {
+       if (result != VK_ERROR_INCOMPATIBLE_DRIVER)
+          mesa_loge("NativeAdreno: could not open the kernel client (%d)", result);
+@@ -1738,11 +2110,11 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    struct tu_physical_device *device = (struct tu_physical_device *)
+       vk_zalloc(&instance->vk.alloc, sizeof(*device), 8, VK_SYSTEM_ALLOCATION_SCOPE_INSTANCE);
+    if (!device) {
+-      dw_close_connection();
++      dw_close_connection(&connection);
+       return vk_error(instance, VK_ERROR_OUT_OF_HOST_MEMORY);
+    }
+ 
+-   const NativeAdrenoAbiDeviceInfo *info = &dw.info;
++   const NativeAdrenoAbiDeviceInfo *info = &connection.info;
+ 
+    device->instance = instance;
+    device->local_fd = -1;
+@@ -1772,7 +2144,7 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    device->has_preemption = false;
+    device->is_perf_cntr_selectable = false;
+    device->has_cached_coherent_memory = !!(info->flags & NativeAdrenoDeviceCachedCoherent);
+-   device->has_host_import = !!(dw.params.flags & NativeAdrenoParamsHostImport);
++   device->has_host_import = !!(connection.params.flags & NativeAdrenoParamsHostImport);
+    device->submitqueue_priority_count = 1;
+ 
+    device->ubwc_config.highest_bank_bit = info->highest_bank_bit;
+@@ -1792,8 +2164,9 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    instance->knl = &darwin_knl_funcs;
+ 
+    result = tu_physical_device_init(device, instance);
+-   /* The enumeration probe only needed the facts; the device takes the slot again in device_init. */
+-   dw_close_connection();
++   /* Enumeration owns this temporary connection. Each Vulkan device queries
++    * its own assigned window when it opens its persistent connection. */
++   dw_close_connection(&connection);
+    if (result != VK_SUCCESS) {
+       mesa_loge("NativeAdreno: tu_physical_device_init failed (%d)", result);
+       vk_free(&instance->vk.alloc, device);
+diff --git a/src/freedreno/vulkan/tu_rmv.cc b/src/freedreno/vulkan/tu_rmv.cc
+index 27bce56..fbc3f05 100644
+--- a/src/freedreno/vulkan/tu_rmv.cc
++++ b/src/freedreno/vulkan/tu_rmv.cc
+@@ -45,8 +45,8 @@ tu_rmv_fill_device_info(struct tu_device *device,
+       &info->memory_infos[VK_RMV_MEMORY_LOCATION_DEVICE];
+    if (physical_device->has_set_iova) {
+       *device_local_memory_info = {
+-         .size = physical_device->va_size,
+-         .physical_base_address = physical_device->va_start,
++         .size = device->va_size,
++         .physical_base_address = device->va_start,
+       };
+    } else {
+       *device_local_memory_info = {

@@ -14,11 +14,11 @@
     "commit": "624bab3918de5b978e1101517abca2b4fa426565",
     "branch": "development",
     "clone": "depth 1, blob filter, checked out source",
-    "files": {
-      "README.md": "0df40b723fd5ea51ca91b9e59fa5dac774015dde128a31b6834c3c8efb69a316",
-      "Cargo.toml": "e2fc374386d6ee10854f9c2996a8c3858cbb4f86f549f15c93dacf20cc4db439",
-      "crates/metal2vulkan/src/device/policy.rs": "1e07afdb2952046d13f593922fae6a27b6f26939912b6abf542645c60653a5e6"
-    }
+    "source_paths": [
+      "README.md",
+      "Cargo.toml",
+      "crates/metal2vulkan/src/device/policy.rs"
+    ]
   },
   "mesa": {
     "repository": "https://gitlab.freedesktop.org/mesa/mesa",

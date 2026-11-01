@@ -7,13 +7,25 @@ from .util import Error, git
 
 
 def catalog(ctx):
-    entries = load_toml(ctx.root / 'components.toml').get('component', [])
+    sources = [ctx.root / 'components.toml']
+    if ctx.schema_version == 2:
+        sources += [ctx.profile_roots[layer] / 'components.toml' for layer in ('arch', 'soc', 'os', 'device')]
+    return catalog_files(sources)
+
+
+def catalog_files(sources):
+    """Component tables are read in order; each later table owns its complete entry."""
     result = {}
-    for entry in entries:
-        identifier = entry.get('id')
-        if not identifier or identifier in result:
-            raise Error(f'components.toml: missing or duplicate component id {identifier!r}')
-        result[identifier] = entry
+    for source in sources:
+        if not source.is_file():
+            continue
+        identifiers = set()
+        for entry in load_toml(source).get('component', []):
+            identifier = entry.get('id')
+            if not identifier or identifier in identifiers:
+                raise Error(f'{source}: missing or duplicate component id {identifier!r}')
+            identifiers.add(identifier)
+            result[identifier] = entry
     return result
 
 

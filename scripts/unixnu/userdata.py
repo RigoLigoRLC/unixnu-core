@@ -23,6 +23,7 @@ decoded by udif.py on other hosts. Nothing is flashed: the report prints the fas
 import contextlib
 import hashlib
 import json
+import os
 import platform
 import plistlib
 import re
@@ -84,6 +85,7 @@ def disk_blocks(dmg, size):
 
 def build(ctx, dry_run=False):
     log('userdata payload')
+    record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
     spec = ctx.board.get('userdata')
     if not spec:
         raise Error('board.toml has no [userdata]')
@@ -142,7 +144,7 @@ def build(ctx, dry_run=False):
     with image.open('wb') as target:
         target.truncate(total)
         for (name, offset, size), (_, dmg) in zip(layout, sources):
-            digest = hashlib.sha256()
+            digest = hashlib.sha256()  # SHNGROOT v1 stores each raw window digest.
             target.seek(offset)
             done = 0
             with contextlib.closing(disk_blocks(dmg, size)) as blocks:
@@ -153,7 +155,9 @@ def build(ctx, dry_run=False):
             if done != size:
                 raise Error(f'{dmg.name}: {done} bytes of raw disk, expected {size}')
             entries.append((name, offset, size, digest.digest()))
-            log(f'userdata: {name} {size} bytes at {offset:#x} sha256 {digest.hexdigest()}')
+            log(f'userdata: {name} {size} bytes at {offset:#x}')
+            if record_hashes:
+                log(f'userdata: {name} sha256 {digest.hexdigest()}')
         object_entries = []
         for name, offset, size, path, skip in objects:
             with path.open('rb') as handle:
@@ -174,11 +178,18 @@ def build(ctx, dry_run=False):
         header[4064:4096] = hashlib.sha256(bytes(header[:4064])).digest()
         target.seek(0)
         target.write(header)
-    data = {'image_bytes': total, 'image_sha256': sha256_file(image), 'manifest_sha256': hashlib.sha256(bytes(header)).hexdigest(),
-            'windows': [{'name': n, 'offset': o, 'size': s, 'sha256': d.hex()} for n, o, s, d in entries],
-            'objects': [{'name': n, 'offset': o, 'size': s, 'sha256': d.hex()} for n, o, s, d in object_entries],
+    data = {'image_bytes': total,
+            'windows': [{'name': n, 'offset': o, 'size': s} for n, o, s, _ in entries],
+            'objects': [{'name': n, 'offset': o, 'size': s} for n, o, s, _ in object_entries],
             'userdata_bytes': capacity, 'flash_command': f'fastboot flash userdata {image}',
             'source': 'remote' if source.remote else 'local', 'hardware_tested': False}
+    if record_hashes:
+        data['image_sha256'] = sha256_file(image)
+        data['manifest_sha256'] = hashlib.sha256(bytes(header)).hexdigest()
+        for window, entry in zip(data['windows'], entries):
+            window['sha256'] = entry[3].hex()
+        for item, entry in zip(data['objects'], object_entries):
+            item['sha256'] = entry[3].hex()
     report.write_text(json.dumps(data, indent=2) + '\n')
     log(f'userdata: {image}')
     log(f'flash it yourself with: {data["flash_command"]}')

@@ -157,6 +157,8 @@ class Context:
             else:
                 selected = selected or configurations.get(str(self.device))
             selected = selected or per_os or self.board.get('kernel', {}).get('defconfig')
+            if selected and Path(selected).is_absolute():
+                selected = Path(selected).name
             if not selected or Path(selected).name != selected or selected in ('.', '..'):
                 raise Error('schema_version = 2 needs [kernel] defconfig or a selected defconfig')
             self.config_name = selected

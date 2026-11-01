@@ -24,7 +24,7 @@
 	url = https://github.com/UniXNU/AppleKeyStoreState.git
 [submodule "drivers/AdrenoMetal"]
 	path = drivers/AdrenoMetal
-	url = https://github.com/UniXNU/AdrenoMetal.git
+	url = https://github.com/RigoLigoRLC/unixnu-adrenometal.git
 [submodule "drivers/GopFramebuffer"]
 	path = drivers/GopFramebuffer
 	url = https://github.com/UniXNU/GopFramebuffer.git
@@ -48,7 +48,7 @@
 	url = https://github.com/UniXNU/AirNir.git
 [submodule "kits/ArmSmmu4K"]
 	path = kits/ArmSmmu4K
-	url = https://github.com/UniXNU/ArmSmmu4K.git
+	url = https://github.com/RigoLigoRLC/unixnu-arm-smmu4k.git
 [submodule "kits/XnuPrelink"]
 	path = kits/XnuPrelink
 	url = https://github.com/UniXNU/XnuPrelink.git

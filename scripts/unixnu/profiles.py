@@ -1,9 +1,10 @@
 """Layered ARM64, SoC, OS, and device configuration."""
 from copy import deepcopy
+import os
 from pathlib import Path
 
 from .config import load_toml
-from .util import Error
+from .util import Error, expand
 
 
 def merge(base, overlay):
@@ -62,6 +63,15 @@ def load(ctx, allow_fetch=False):
             node = node.get(key, {})
         node.pop(leaf, None)
     result.setdefault('board', {})['os_profile'] = os_name
+
+    # Private hardware inputs supply ADT properties after the public board.
+    hardware_input = os.environ.get('UNIXNU_HARDWARE_INPUT')
+    if hardware_input:
+        path = expand(hardware_input)
+        private = load_toml(path)
+        result = merge(result, {'adt': private.get('adt', {})})
+        ctx.profile_files.append(path)
+
     return result
 
 

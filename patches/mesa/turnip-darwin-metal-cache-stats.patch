@@ -1,0 +1,73 @@
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 9ed1375..3d9730c 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -159,11 +159,42 @@ struct darwin_retire_state {
+    pthread_cond_t report_wake;
+    bool reporter_started, reporter_stop;
+    uint64_t profile_device;
++   struct darwin_retire_state *stats_next; /* Live devices linked under profile_device_lock. */
+    io_connect_t profile_connection;
+    bool profile_tunnel;
+    uint32_t profile_selector;
+ };
+ 
++static struct darwin_retire_state *darwin_stats_devices;
++
++/* The Metal frontend reads totals across live devices: [0] eligible requests,
++ * [1] cache hits, [2] insertions, [3] evictions, [5] retained bytes and [6] the
++ * sum of each device's retained-byte peak. Slots 4 and 7 stay zero because
++ * this backend does not record cache flushes or free GPU range counts.
++ * The device-list lock keeps each retirement state alive while its lock
++ * protects the counter snapshot.
++ */
++extern "C" __attribute__((visibility("default"))) void tu_darwin_bo_cache_stats(uint64_t out[8]);
++extern "C" __attribute__((visibility("default"))) void
++tu_darwin_bo_cache_stats(uint64_t out[8])
++{
++   memset(out, 0, 8 * sizeof(uint64_t));
++
++   pthread_mutex_lock(&profile_device_lock);
++   for (struct darwin_retire_state *retire = darwin_stats_devices;
++        retire; retire = retire->stats_next) {
++      pthread_mutex_lock(&retire->lock);
++      out[0] += retire->profile.eligible;
++      out[1] += retire->profile.hits;
++      out[2] += retire->profile.puts;
++      out[3] += retire->cache_evictions;
++      out[5] += retire->cache_bytes;
++      out[6] += retire->cache_peak_bytes;
++      pthread_mutex_unlock(&retire->lock);
++   }
++   pthread_mutex_unlock(&profile_device_lock);
++}
++
+ static struct darwin_connection *
+ darwin_connection_for(struct tu_device *dev)
+ {
+@@ -3005,6 +3036,8 @@ darwin_device_init(struct tu_device *dev)
+    dev->darwin_retire = retire;
+    pthread_mutex_lock(&profile_device_lock);
+    retire->profile_device = ++next_profile_device;
++   retire->stats_next = darwin_stats_devices;
++   darwin_stats_devices = retire;
+    pthread_mutex_unlock(&profile_device_lock);
+    for (unsigned i = 0; i < NativeAdrenoBoProfileSizeCount; ++i) {
+       retire->sizes[i].upper_bytes = i + 1 == NativeAdrenoBoProfileSizeCount ?
+@@ -3042,6 +3075,16 @@ darwin_device_finish(struct tu_device *dev)
+ {
+    struct darwin_retire_state *retire = (struct darwin_retire_state *)dev->darwin_retire;
+    if (retire) {
++      pthread_mutex_lock(&profile_device_lock);
++      struct darwin_retire_state **entry = &darwin_stats_devices;
++      while (*entry && *entry != retire) {
++         entry = &(*entry)->stats_next;
++      }
++      if (*entry) {
++         *entry = retire->stats_next;
++      }
++      pthread_mutex_unlock(&profile_device_lock);
++
+       pthread_mutex_lock(&retire->lock);
+       retire->worker_stop = true;
+       darwin_wake_worker_locked(retire);
