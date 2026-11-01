@@ -1,0 +1,530 @@
+diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index da7e46e..4f1c670 100644
+--- a/src/freedreno/vulkan/tu_cmd_buffer.cc
++++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
+@@ -1620,6 +1620,16 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
+       return true;
+    }
+ 
++   /* An unbacked memoryless attachment stays in GMEM when this pass can use
++    * tile memory. Choosing SYSMEM here would allocate its full backing BO. */
++   for (unsigned i = 0; i < cmd->state.pass->attachment_count; ++i) {
++      const struct tu_image_view *iview = cmd->state.attachments[i];
++      if (iview && !(iview->image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) &&
++          iview->image->mem && iview->image->mem->lazy && !iview->image->mem->bo) {
++         return false;
++      }
++   }
++
+    tu_autotune::render_mode optimal_mode =
+       cmd->device->autotune->get_optimal_mode(cmd, rp_ctx, rp_key);
+    bool use_sysmem = optimal_mode == tu_autotune::render_mode::SYSMEM;
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index 2b3d36a..0551a29 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+@@ -13,6 +13,7 @@
+ #include <unistd.h>
+ 
+ #include <IOKit/IOKitLib.h>
++#include <dispatch/dispatch.h>
+ #include <mach/mach.h>
+ 
+ #include "NativeAdrenoABI.h"
+@@ -118,6 +119,26 @@ struct darwin_bo_node {
+    struct rb_node active_iova;
+    enum darwin_bo_state state;
+    uint64_t retry_after_ns;
++   uint64_t cached_ns;
++};
++
++/* darwin_va_hole belongs to both free-range trees. Address ordering permits
++ * adjacent ranges to merge; size ordering selects the smallest fitting range. */
++struct darwin_va_hole {
++   struct rb_node by_address;
++   struct rb_node by_size;
++   uint64_t start;
++   uint64_t size;
++};
++
++/* darwin_va owns this device connection's unallocated GPU addresses. The
++ * device VMA mutex protects both trees and their accounting. */
++struct darwin_va {
++   struct rb_tree address;
++   struct rb_tree size;
++   bool seeded;
++   uint64_t holes;
++   uint64_t used;
+ };
+ 
+ /* darwin_retire_state owns one node per native handle, including active BOs.
+@@ -130,6 +151,7 @@ struct darwin_retire_state {
+    struct util_idalloc ids;
+    struct darwin_bo_node nodes[DARWIN_NATIVE_BO_LIMIT + 1];
+    struct rb_tree active_bos;
++   struct darwin_va va;
+    struct list_head pending, cache, reclaim, retry, released;
+    struct list_head cache_general, cache_commands;
+    struct list_head buckets[DARWIN_CACHE_SIZE_CLASSES][DARWIN_CACHE_ATTRIBUTE_BUCKETS];
+@@ -145,6 +167,9 @@ struct darwin_retire_state {
+    uint64_t enqueued, reaped, pressure_waits;
+    uint64_t cache_bytes, cache_peak_bytes, cache_hits, cache_misses, cache_evictions;
+    uint64_t general_cache_bytes;
++   uint64_t cache_flushes;
++   uint64_t cache_cleaned_s;
++   uint32_t pressure_seen;
+    uint64_t released_objects_total, released_bytes_total;
+    uint64_t pending_bytes;
+    uint64_t reclaim_bytes;
+@@ -171,11 +196,11 @@ struct darwin_retire_state {
+ static struct darwin_retire_state *darwin_stats_devices;
+ static NativeAdrenoAbiPriority darwin_process_priority;
+ static bool darwin_process_priority_known;
++static volatile uint32_t darwin_memory_pressure;
+ 
+ /* The Metal frontend reads totals across live devices: [0] eligible requests,
+  * [1] cache hits, [2] insertions, [3] evictions, [5] retained bytes and [6] the
+- * sum of each device's retained-byte peak. Slots 4 and 7 stay zero because
+- * this backend does not record cache flushes or free GPU range counts.
++ * sum of each device's retained-byte peak. Slot 7 counts free GPU ranges.
+  * The device-list lock keeps each retirement state alive while its lock
+  * protects the counter snapshot.
+  */
+@@ -193,9 +218,11 @@ tu_darwin_bo_cache_stats(uint64_t out[8])
+       out[1] += retire->profile.hits;
+       out[2] += retire->profile.puts;
+       out[3] += retire->cache_evictions;
++      out[4] += retire->cache_flushes;
+       out[5] += retire->cache_bytes;
+       out[6] += retire->cache_peak_bytes;
+       pthread_mutex_unlock(&retire->lock);
++      out[7] += p_atomic_read(&retire->va.holes);
+    }
+    pthread_mutex_unlock(&profile_device_lock);
+ }
+@@ -733,27 +760,209 @@ darwin_submitqueue_close(struct tu_device *dev, struct tu_queue *queue)
+ 
+ /* ---- GPU address space: the client picks addresses out of [va_start, va_start + va_size). ---- */
+ 
++static int
++darwin_va_cmp_address(const struct rb_node *a, const struct rb_node *b)
++{
++   const struct darwin_va_hole *x = rb_node_data(struct darwin_va_hole, a, by_address);
++   const struct darwin_va_hole *y = rb_node_data(struct darwin_va_hole, b, by_address);
++   return x->start > y->start ? -1 : x->start < y->start ? 1 : 0;
++}
++
++static int
++darwin_va_cmp_size(const struct rb_node *a, const struct rb_node *b)
++{
++   const struct darwin_va_hole *x = rb_node_data(struct darwin_va_hole, a, by_size);
++   const struct darwin_va_hole *y = rb_node_data(struct darwin_va_hole, b, by_size);
++   if (x->size != y->size) {
++      return x->size > y->size ? -1 : 1;
++   }
++   return x->start > y->start ? -1 : x->start < y->start ? 1 : 0;
++}
++
++static void
++darwin_va_insert(struct darwin_va *va, struct darwin_va_hole *hole)
++{
++   rb_tree_insert(&va->address, &hole->by_address, darwin_va_cmp_address);
++   rb_tree_insert(&va->size, &hole->by_size, darwin_va_cmp_size);
++   p_atomic_inc(&va->holes);
++}
++
++static void
++darwin_va_remove(struct darwin_va *va, struct darwin_va_hole *hole)
++{
++   rb_tree_remove(&va->address, &hole->by_address);
++   rb_tree_remove(&va->size, &hole->by_size);
++   p_atomic_dec(&va->holes);
++}
++
++static bool
++darwin_va_add(struct darwin_va *va, uint64_t start, uint64_t size)
++{
++   struct darwin_va_hole *hole = (struct darwin_va_hole *)calloc(1, sizeof(*hole));
++   if (!hole) {
++      return false;
++   }
++   hole->start = start;
++   hole->size = size;
++   darwin_va_insert(va, hole);
++   return true;
++}
++
++static struct darwin_va_hole *
++darwin_va_at_or_below(struct darwin_va *va, uint64_t address)
++{
++   struct rb_node *best = NULL;
++   for (struct rb_node *node = va->address.root; node;) {
++      if (rb_node_data(struct darwin_va_hole, node, by_address)->start <= address) {
++         best = node;
++         node = node->right;
++      } else {
++         node = node->left;
++      }
++   }
++   return best ? rb_node_data(struct darwin_va_hole, best, by_address) : NULL;
++}
++
++/* The split allocates its additional metadata before removing the old range,
++ * so an allocation failure leaves the entire free range available. */
++static bool
++darwin_va_carve(struct darwin_va *va, struct darwin_va_hole *hole,
++                uint64_t address, uint64_t size)
++{
++   const uint64_t begin = hole->start;
++   const uint64_t end = begin + hole->size;
++   struct darwin_va_hole *tail = NULL;
++   if (address > begin && address + size < end) {
++      tail = (struct darwin_va_hole *)calloc(1, sizeof(*tail));
++      if (!tail) {
++         return false;
++      }
++   }
++
++   darwin_va_remove(va, hole);
++   if (address > begin) {
++      hole->size = address - begin;
++      darwin_va_insert(va, hole);
++      if (tail) {
++         tail->start = address + size;
++         tail->size = end - tail->start;
++         darwin_va_insert(va, tail);
++      }
++   } else if (address + size < end) {
++      hole->start = address + size;
++      hole->size = end - hole->start;
++      darwin_va_insert(va, hole);
++   } else {
++      free(hole);
++   }
++   va->used += size;
++   return true;
++}
++
++static uint64_t
++darwin_va_alloc(struct darwin_va *va, uint64_t size, bool high)
++{
++   struct rb_node *best = NULL;
++   for (struct rb_node *node = va->size.root; node;) {
++      if (rb_node_data(struct darwin_va_hole, node, by_size)->size >= size) {
++         best = node;
++         node = node->left;
++      } else {
++         node = node->right;
++      }
++   }
++   if (!best || !size) {
++      return 0;
++   }
++
++   struct darwin_va_hole *hole = rb_node_data(struct darwin_va_hole, best, by_size);
++   const uint64_t address = high ? hole->start + hole->size - size : hole->start;
++   return darwin_va_carve(va, hole, address, size) ? address : 0;
++}
++
++static bool
++darwin_va_alloc_at(struct darwin_va *va, uint64_t address, uint64_t size)
++{
++   struct darwin_va_hole *hole = darwin_va_at_or_below(va, address);
++   if (!hole || !size || address - hole->start >= hole->size ||
++       size > hole->size - (address - hole->start)) {
++      return false;
++   }
++   return darwin_va_carve(va, hole, address, size);
++}
++
++static void
++darwin_va_free(struct darwin_va *va, uint64_t address, uint64_t size)
++{
++   if (!size) {
++      return;
++   }
++   struct darwin_va_hole *below = darwin_va_at_or_below(va, address);
++   struct rb_node *next = below ? rb_node_next(&below->by_address) : rb_tree_first(&va->address);
++   struct darwin_va_hole *above = next ? rb_node_data(struct darwin_va_hole, next, by_address) : NULL;
++   if ((below && below->start + below->size > address) ||
++       (above && above->start < address + size)) {
++      mesa_loge("darwin: overlapping GPU address release");
++      return;
++   }
++
++   struct darwin_va_hole *merged = NULL;
++   uint64_t begin = address;
++   uint64_t end = address + size;
++   if (below && below->start + below->size == address) {
++      begin = below->start;
++      darwin_va_remove(va, below);
++      merged = below;
++   }
++   if (above && above->start == end) {
++      end = above->start + above->size;
++      darwin_va_remove(va, above);
++      if (merged) {
++         free(above);
++      } else {
++         merged = above;
++      }
++   }
++   if (merged) {
++      merged->start = begin;
++      merged->size = end - begin;
++      darwin_va_insert(va, merged);
++   } else {
++      darwin_va_add(va, begin, end - begin);
++   }
++   va->used -= size;
++}
++
+ static VkResult
+ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
+                      enum tu_bo_alloc_flags flags, uint64_t *iova)
+ {
+    *iova = 0;
++   if (!size || size % os_page_size || client_iova % os_page_size) {
++      return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
++   }
++   struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
+    mtx_lock(&dev->vma_mutex);
++   if (!va->seeded) {
++      if (!darwin_va_add(va, dev->va_start, ROUND_DOWN_TO(dev->va_size, os_page_size))) {
++         mtx_unlock(&dev->vma_mutex);
++         return vk_error(dev, VK_ERROR_OUT_OF_HOST_MEMORY);
++      }
++      va->seeded = true;
++   }
+    if (flags & TU_BO_ALLOC_REPLAYABLE) {
+       if (client_iova) {
+-         if (util_vma_heap_alloc_addr(&dev->vma, client_iova, size))
++         if (darwin_va_alloc_at(va, client_iova, size))
+             *iova = client_iova;
+          else {
+             mtx_unlock(&dev->vma_mutex);
+             return VK_ERROR_INVALID_OPAQUE_CAPTURE_ADDRESS;
+          }
+       } else {
+-         dev->vma.alloc_high = true;
+-         *iova = util_vma_heap_alloc(&dev->vma, size, os_page_size);
++         *iova = darwin_va_alloc(va, size, true);
+       }
+    } else {
+-      dev->vma.alloc_high = false;
+-      *iova = util_vma_heap_alloc(&dev->vma, size, os_page_size);
++      *iova = darwin_va_alloc(va, size, false);
+    }
+    mtx_unlock(&dev->vma_mutex);
+    return *iova ? VK_SUCCESS : VK_ERROR_OUT_OF_DEVICE_MEMORY;
+@@ -762,8 +971,9 @@ darwin_allocate_iova(struct tu_device *dev, uint64_t size, uint64_t client_iova,
+ static void
+ darwin_free_iova(struct tu_device *dev, uint64_t iova, uint64_t size)
+ {
++   struct darwin_va *va = &((struct darwin_retire_state *)dev->darwin_retire)->va;
+    mtx_lock(&dev->vma_mutex);
+-   util_vma_heap_free(&dev->vma, iova, size);
++   darwin_va_free(va, iova, size);
+    mtx_unlock(&dev->vma_mutex);
+ }
+ 
+@@ -972,6 +1182,7 @@ darwin_cache_completed_locked(struct darwin_retire_state *retire, struct darwin_
+    darwin_cache_capacity(bo->size, &size_class);
+    unsigned attributes = darwin_cache_attributes(bo->alloc_flags, bo->mem_property, bo->alignment);
+    node->state = DARWIN_BO_CACHED;
++   node->cached_ns = os_time_get_nano();
+    list_addtail(&node->link, &retire->cache);
+    list_addtail(&node->bucket_link, &retire->buckets[size_class][attributes]);
+    list_addtail(&node->cache_group_link,
+@@ -996,6 +1207,54 @@ darwin_wake_worker_locked(struct darwin_retire_state *retire)
+    pthread_cond_signal(&retire->work_wake);
+ }
+ 
++/* Libdispatch delivers system memory-pressure events to a process counter.
++ * Each device worker observes the counter and releases its completed cache. */
++static void
++darwin_watch_memory_pressure(void)
++{
++   static pthread_once_t once = PTHREAD_ONCE_INIT;
++   pthread_once(&once, [] {
++      dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_MEMORYPRESSURE, 0,
++         DISPATCH_MEMORYPRESSURE_WARN | DISPATCH_MEMORYPRESSURE_CRITICAL,
++         dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
++      if (!source) {
++         return;
++      }
++      dispatch_source_set_event_handler_f(source, [](void *) {
++         p_atomic_inc(&darwin_memory_pressure);
++      });
++      dispatch_activate(source);
++   });
++}
++
++static void
++darwin_clean_completed_cache_locked(struct darwin_retire_state *retire)
++{
++   const uint32_t pressure = p_atomic_read(&darwin_memory_pressure);
++   if (retire->pressure_seen != pressure) {
++      retire->pressure_seen = pressure;
++      ++retire->cache_flushes;
++      while (!list_is_empty(&retire->cache)) {
++         struct darwin_bo_node *node = list_first_entry(&retire->cache, struct darwin_bo_node, link);
++         darwin_evict_cached_locked(retire, node, DARWIN_EVICT_BYTES);
++      }
++      return;
++   }
++
++   const uint64_t now = os_time_get_nano();
++   if (retire->cache_cleaned_s == now / 1000000000) {
++      return;
++   }
++   retire->cache_cleaned_s = now / 1000000000;
++   while (!list_is_empty(&retire->cache)) {
++      struct darwin_bo_node *node = list_first_entry(&retire->cache, struct darwin_bo_node, link);
++      if (now - node->cached_ns < 2000000000ull) {
++         break;
++      }
++      darwin_evict_cached_locked(retire, node, DARWIN_EVICT_BYTES);
++   }
++}
++
+ /* The worker processes at most 32 nodes or 1 ms before yielding the CPU. A
+  * single IOKit operation can exceed that budget; it remains charged until it
+  * returns. Fence waits use a 1 ms deadline so shutdown observes stop promptly. */
+@@ -1014,6 +1273,8 @@ darwin_retire_worker(void *argument)
+          break;
+       }
+ 
++      darwin_clean_completed_cache_locked(retire);
++
+       list_for_each_entry_safe(struct darwin_bo_node, node, &retire->retry, link) {
+          if (os_time_get_nano() >= node->retry_after_ns) {
+             list_del(&node->link);
+@@ -1630,16 +1891,13 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+                const char *name, uint32_t *cache_reason)
+ {
+    MESA_TRACE_FUNC();
+-   if (lazy_vma) {
+-      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
+-   }
+ 
+    const uint64_t alignment = os_page_size;
+    const uint32_t excluded_flags = TU_BO_ALLOC_REPLAYABLE | TU_BO_ALLOC_DMABUF |
+                                    TU_BO_ALLOC_SHAREABLE | TU_BO_ALLOC_IMPLICIT_SYNC;
+-   const bool cacheable = !client_iova && !(flags & excluded_flags) &&
++   const bool cacheable = !lazy_vma && !client_iova && !(flags & excluded_flags) &&
+                           size <= DARWIN_BO_CACHE_MAX_OBJECT_BYTES;
+-   *cache_reason = client_iova ? NativeAdrenoBoCacheFixedAddress :
++   *cache_reason = (lazy_vma || client_iova) ? NativeAdrenoBoCacheFixedAddress :
+       (flags & excluded_flags) ? NativeAdrenoBoCacheExcludedFlags : NativeAdrenoBoCacheOversize;
+    struct darwin_retired_bo storage = {};
+    VkResult result = darwin_take_cached(dev, size, alignment, flags, mem_property,
+@@ -1661,8 +1919,9 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       if (!storage.gem_handle) {
+          return vk_error(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY);
+       }
+-      uint64_t iova;
+-      result = darwin_allocate_iova(dev, size, client_iova, flags, &iova);
++      uint64_t iova = lazy_vma ? lazy_vma->msm.iova : 0;
++      result = lazy_vma ? VK_SUCCESS :
++         darwin_allocate_iova(dev, size, client_iova, flags, &iova);
+       if (result == VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+          result = darwin_reclaim_cache(dev, DARWIN_EVICT_IOVA, 1, size);
+          if (result != VK_SUCCESS) {
+@@ -1686,18 +1945,27 @@ darwin_bo_init_recorded(struct tu_device *dev, struct vk_object_base *base,
+       if (kr == kIOReturnNoMemory || kr == kIOReturnNoResources) {
+          result = darwin_reclaim_cache(dev, DARWIN_EVICT_ALLOCATION, 1, size);
+          if (result != VK_SUCCESS) {
+-            darwin_free_iova(dev, iova, size);
++            if (!lazy_vma) {
++               darwin_free_iova(dev, iova, size);
++            }
+             darwin_cancel_bo_id(dev, storage.gem_handle);
+             return result;
+          }
+          kr = dw_call(dev, NativeAdrenoMethodBoAlloc, &alloc, sizeof(alloc), &reply, sizeof(reply));
+       }
+       if (kr != KERN_SUCCESS) {
+-         darwin_free_iova(dev, iova, size);
++         if (!lazy_vma) {
++            darwin_free_iova(dev, iova, size);
++         }
+          darwin_cancel_bo_id(dev, storage.gem_handle);
+          return vk_errorf(dev, VK_ERROR_OUT_OF_DEVICE_MEMORY, "BoAlloc failed: 0x%x", kr);
+       }
+ 
++      if (lazy_vma) {
++         /* Native storage now owns the reserved address. Map failure transfers
++          * it to the retirement worker through darwin_map_failure. */
++         lazy_vma->msm.backs_lazy_bo = true;
++      }
+       result = darwin_map_storage(dev, reply.handle, iova, size, storage.gem_handle,
+                                   (flags & TU_BO_ALLOC_GPU_READ_ONLY) ? 1u : 3u);
+       if (result != VK_SUCCESS) {
+@@ -3251,6 +3519,8 @@ darwin_device_init(struct tu_device *dev)
+    list_inithead(&retire->cache_general);
+    list_inithead(&retire->cache_commands);
+    rb_tree_init(&retire->active_bos);
++   rb_tree_init(&retire->va.address);
++   rb_tree_init(&retire->va.size);
+    list_inithead(&retire->reclaim);
+    list_inithead(&retire->retry);
+    list_inithead(&retire->released);
+@@ -3276,6 +3546,8 @@ darwin_device_init(struct tu_device *dev)
+       return vk_error(dev, VK_ERROR_INITIALIZATION_FAILED);
+    }
+    retire->device = dev;
++   darwin_watch_memory_pressure();
++   retire->pressure_seen = p_atomic_read(&darwin_memory_pressure);
+    if (pthread_create(&retire->worker, NULL, darwin_retire_worker, retire)) {
+       pthread_cond_destroy(&retire->progress);
+       pthread_cond_destroy(&retire->work_wake);
+@@ -3374,6 +3646,9 @@ darwin_device_finish(struct tu_device *dev)
+                    (unsigned long long)retire->cache_peak_bytes,
+                    (unsigned long long)retire->cache_evictions);
+       }
++      rb_tree_foreach_safe(struct darwin_va_hole, hole, &retire->va.address, by_address) {
++         free(hole);
++      }
+       util_idalloc_fini(&retire->ids);
+       pthread_mutex_destroy(&retire->lock);
+       vk_free(&dev->vk.alloc, retire);
+@@ -3423,12 +3698,28 @@ darwin_sparse_vma_init(struct tu_device *dev, struct vk_object_base *base,
+                        struct tu_sparse_vma *out_vma, uint64_t *out_iova,
+                        enum tu_sparse_vma_flags flags, uint64_t size, uint64_t client_iova)
+ {
+-   return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
++   if (flags & TU_SPARSE_VMA_MAP_ZERO) {
++      return vk_error(dev, VK_ERROR_FEATURE_NOT_PRESENT);
++   }
++   out_vma->flags = flags;
++   out_vma->msm.size = size;
++   out_vma->msm.backs_lazy_bo = false;
++   VkResult result = darwin_allocate_iova(dev, size, client_iova,
++      flags & TU_SPARSE_VMA_REPLAYABLE ? TU_BO_ALLOC_REPLAYABLE : TU_BO_ALLOC_NO_FLAGS,
++      &out_vma->msm.iova);
++   if (result != VK_SUCCESS) {
++      return result;
++   }
++   *out_iova = out_vma->msm.iova;
++   return VK_SUCCESS;
+ }
+ 
+ static void
+ darwin_sparse_vma_finish(struct tu_device *dev, struct tu_sparse_vma *vma)
+ {
++   if (!vma->msm.backs_lazy_bo) {
++      darwin_free_iova(dev, vma->msm.iova, vma->msm.size);
++   }
+ }
+ 
+ static const struct tu_knl darwin_knl_funcs = {
+@@ -3506,7 +3797,7 @@ tu_knl_darwin_load(struct tu_instance *instance)
+    device->has_set_iova = !!(info->flags & NativeAdrenoDeviceClientIova);
+    device->va_start = info->va_start;
+    device->va_size = info->va_size;
+-   device->has_lazy_bos = false;
++   device->has_lazy_bos = !TU_DEBUG(SYSMEM);
+    device->has_sparse = false;
+    device->has_sparse_prr = false;
+    device->has_raytracing = false;

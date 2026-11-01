@@ -31,6 +31,50 @@ Logical Metal queues share one Vulkan queue and kernel queue per process. The fr
 
 From the resolved iOS 27 target tree:
 
+The selected board supplies the same `NativeAdrenoABI.h` to Turnip and the plugin.
+Turnip reads the reported ABI version and sends 16 indirect buffers in a 416-byte
+record for version 1, or 128 in a 3104-byte record for version 2. The diagnostic
+mailbox retains the 16-buffer record. Host-import pages remain retained until the
+kernel acknowledges removal of their GPU mapping.
+
+On a Darwin device advertising cached coherent memory, Turnip exposes that memory
+as the default type for resources, heaps and internal command storage. CPU maps
+use write-back caching, and the kernel selects GPU mapping attributes from the
+allocation or imported pages. Metal Shared storage, WriteCombined hints, Private
+resources and eagerly allocated Memoryless attachments prefer cached coherent
+memory on unified-memory GPUs. The frontend's device query recognizes hardware
+coherence and kernel-managed visibility; either removes IOSurface flush-range
+collection and userspace cache operations from submission and completion.
+
+The SM7325 adaptation passes resource declarations, render memory barriers and
+fence stages through the frontend into metal2vulkan. Encoding accumulates access
+summaries, and submission exports GPU writes to the CPU only for allocations
+with CPU consumers. Turnip's asynchronous Darwin extension submits timeline
+dependencies and output points to the kernel scheduler; CPU waits sleep on the
+requested point. Display holds a read of the IOSurface backing until DPU has
+switched to its replacement.
+
+The `unixnu-sm-t733` branch keeps these submission and synchronization changes
+with the system BGRA8 sRGB format policy. The `unixnu-sm-t733-apple3` branch adds
+the Apple3 frontend, compiler and format implementations. Each device branch
+pins its corresponding core, SoC and Metal revisions.
+
+The SM7325 bridge uses metal2vulkan development commit
+`624bab3918de5b978e1101517abca2b4fa426565` and the ordered patches in
+`AdrenoMetal/bridge/patches/series`. The new runtime's fence stages retain the
+local resource visibility and cached coherent memory policies.
+
+Device answers are cached by selector and argument. The frontend disables no-copy
+rebind replay logs. Host-page textures use their imported memory directly when
+the runtime accepts the layout. Turnip uses draw loads and 2D stores for linear
+imported attachments whose dimensions do not fill complete GMEM blocks. Those
+transfers cover the valid texels within the owner's row pitch.
+
+Frame trace and pipeline journal files default off through
+`NATIVE_ADRENO_FRAME_TRACE=0` and `NATIVE_ADRENO_PIPELINE_JOURNAL=0`. Periodic
+in-memory statistics remain available. Frontend and host-import release errors
+each print at most 32 entries per process.
+
 ```sh
 python3 scripts/build-turnip-darwin.py --target ios27
 python3 scripts/build-adreno-metal-plugin.py --target ios27

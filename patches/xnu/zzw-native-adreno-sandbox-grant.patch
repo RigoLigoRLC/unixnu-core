@@ -2,7 +2,7 @@ diff --git a/iokit/Kernel/IOUserClient.cpp b/iokit/Kernel/IOUserClient.cpp
 index e7d6592..f940ab2 100644
 --- a/iokit/Kernel/IOUserClient.cpp
 +++ b/iokit/Kernel/IOUserClient.cpp
-@@ -4325,6 +4325,36 @@ is_io_service_set_authorization_id(
+@@ -4325,6 +4325,71 @@ is_io_service_set_authorization_id(
  }
  
  /* Routine io_service_open_ndr */
@@ -36,34 +36,69 @@ index e7d6592..f940ab2 100644
 +	return false;
 +}
 +
++/*
++ * The native Metal accelerator accepts the signed Metal entitlement for its
++ * plugin connection and progress markers. Existing process grants retain
++ * their service-specific policy for system components.
++ */
++static bool
++native_sandbox_grant_open(IOService * service, task_t owning_task, uint32_t connect_type)
++{
++	if (native_sandbox_grant(service)) {
++		return true;
++	}
++
++	const OSMetaClass * meta = service->getMetaClass();
++	OSString * plugin = OSDynamicCast(OSString, service->getProperty("MetalPluginName"));
++	OSString * plugin_class = OSDynamicCast(OSString, service->getProperty("MetalPluginClassName"));
++	OSString * entitlement = OSDynamicCast(OSString, service->getProperty("NativeSandboxGrantEntitlement"));
++	OSNumber * native_type = OSDynamicCast(OSNumber, service->getProperty("NativeSandboxGrantConnectType"));
++	if (!meta || 0 != strcmp(meta->getClassName(), "AGXAccelerator")
++	    || !plugin || !plugin->isEqualTo("NativeAdrenoMetal")
++	    || !plugin_class || !plugin_class->isEqualTo("NativeAdrenoMetalDevice")
++	    || !entitlement || !entitlement->isEqualTo("com.apple.security.ts.opengl-or-metal")
++	    || !native_type || native_type->unsigned32BitValue() != 0x4147) {
++		return false;
++	}
++
++	const uint32_t connection_type = native_type->unsigned32BitValue();
++	const bool plugin_connection = connect_type == connection_type;
++	const bool progress_marker = (connect_type >> 16) == connection_type && (connect_type & 0xffff) != 0;
++	if (!plugin_connection && !progress_marker) {
++		return false;
++	}
++
++	return IOTaskHasEntitlement(owning_task, entitlement->getCStringNoCopy());
++}
++
  kern_return_t
  is_io_service_open_extended(
  	io_object_t _service,
-@@ -4353,7 +4383,7 @@ is_io_service_open_extended(
+@@ -4353,7 +4418,7 @@ is_io_service_open_extended(
  	}
  
  #if CONFIG_MACF
 -	if (mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
-+	if (!native_sandbox_grant(service) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
++	if (!native_sandbox_grant_open(service, owningTask, connect_type) && mac_iokit_check_open_service(kauth_cred_get(), service, connect_type) != 0) {
  		return kIOReturnNotPermitted;
  	}
  #endif
-@@ -4512,7 +4542,9 @@ is_io_service_open_extended(
+@@ -4512,7 +4577,9 @@ is_io_service_open_extended(
  				res = kIOReturnNotPrivileged;
  			}
  #if CONFIG_MACF
 -			else if (0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
-+			/* The service's grant (native_sandbox_grant) stands in for the sandbox's verdict on the render server's open. */
-+			else if (!native_sandbox_grant(service)
++			/* The native accelerator's grant applies to this task and connection type. */
++			else if (!native_sandbox_grant_open(service, owningTask, connect_type)
 +			    && 0 != mac_iokit_check_open(kauth_cred_get(), client, connect_type)) {
  				IOLog("IOUC %s failed MACF in process %s\n",
  				    client->getMetaClass()->getClassName(), creatorNameCStr);
  				res = kIOReturnNotPermitted;
-@@ -4520,6 +4552,7 @@ is_io_service_open_extended(
+@@ -4520,6 +4587,7 @@ is_io_service_open_extended(
  #endif
  
  			if ((kIOReturnSuccess == res)
-+			    && !native_sandbox_grant(service)
++			    && !native_sandbox_grant_open(service, owningTask, connect_type)
  			    && gIOUCFilterCallbacks
  			    && gIOUCFilterCallbacks->io_filter_resolver) {
  				io_filter_policy_t filterPolicy;

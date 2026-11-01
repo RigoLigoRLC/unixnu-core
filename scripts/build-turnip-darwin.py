@@ -19,6 +19,8 @@ parser = argparse.ArgumentParser(description=__doc__)
 parser.add_argument('--target', choices=('host', 'ios', 'ios27'), default='host')
 parser.add_argument('--configure-only', action='store_true')
 parser.add_argument('--builtin-pack', type=Path, help='Embed an exact-source/profile/GPU-bound own builtin pack; no runtime compiler fallback')
+parser.add_argument('--abi-directory', type=Path, default=ROOT / 'drivers/Adreno740',
+                    help='NativeAdrenoABI.h directory for the selected kernel driver')
 args = parser.parse_args()
 SOURCE = ROOT / '.cache/mesa-work'
 OUT = ROOT / {'host': 'build/mesa-tu', 'ios': 'build/mesa-tu-ios', 'ios27': 'build/mesa-tu-ios27'}[args.target]
@@ -33,13 +35,13 @@ pins = json.loads((ROOT / 'scripts/data/adreno-compiler-inputs.json').read_text(
 if read(['git', '-C', SOURCE, 'rev-parse', 'HEAD']) != pins['mesa']['commit']:
     sys.exit('Pinned Mesa source differs')
 validate_recorded_patches(ROOT, SOURCE, pins)
-if not shutil.which('glslangValidator'):
-    sys.exit('glslangValidator is required by the Vulkan runtime build (brew install glslang)')
-
 env = {k: v for k, v in os.environ.items() if not k.startswith(('IR3_', 'FD_MESA_', 'NIR_', 'MESA_SHADER_', 'TU_'))}
 env['PATH'] = str(ROOT / '.cache/mesa-tools/bin') + ':' + str(ROOT / '.cache/mesa-venv/bin') + ':' + env['PATH']
+if not shutil.which('glslangValidator', path=env['PATH']):
+    sys.exit('glslangValidator is required by the Vulkan runtime build (brew install glslang)')
+
 options = ['-Dgallium-drivers=', '-Dvulkan-drivers=freedreno', '-Dfreedreno-kmds=darwin',
-           '-Dtu-darwin-abi-dir=' + str(ROOT / 'drivers/Adreno740'), '-Dplatforms=macos', '-Dglx=disabled',
+           '-Dtu-darwin-abi-dir=' + str(args.abi_directory.resolve()), '-Dplatforms=macos', '-Dglx=disabled',
            '-Degl=disabled', '-Dgbm=disabled', '-Dopengl=false', '-Dgles1=disabled', '-Dgles2=disabled',
            '-Dllvm=disabled', '-Dshared-glapi=disabled', '-Dxmlconfig=disabled', '-Dshader-cache=enabled',
            '-Dtools=', '-Dbuild-tests=false', '-Dvideo-codecs=', '-Dvulkan-layers=']
@@ -71,16 +73,22 @@ else:
 # source addition, compiler, target and build option. The generated embedded
 # header stays outside SOURCE and is deliberately excluded from this key;
 # otherwise the pack would make its own producer identity circular.
-source_diff = subprocess.check_output(['git', '-C', SOURCE, 'diff', 'HEAD', '--binary'])
-untracked = subprocess.check_output(['git', '-C', SOURCE, 'ls-files', '--others', '--exclude-standard', '-z']).split(b'\0')
-source_extras = {name.decode(): hashlib.sha256((SOURCE / name.decode()).read_bytes()).hexdigest()
-                 for name in untracked if name and (SOURCE / name.decode()).is_file()}
+record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
 profile = dict(mesa_revision=pins['mesa']['commit'], target=args.target,
-               source_diff_sha256=hashlib.sha256(source_diff).hexdigest(), extra_sources=source_extras,
-               patch_guard_sha256=hashlib.sha256((ROOT / 'scripts/mesa_patch_identity.py').read_bytes()).hexdigest(),
                compiler=read([env['CXX'], '--version']), options=options,
-               build_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
-source_id = hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+               record_hashes=record_hashes)
+source_id = ''
+if record_hashes:
+    source_diff = subprocess.check_output(['git', '-C', SOURCE, 'diff', 'HEAD', '--binary'])
+    untracked = subprocess.check_output(['git', '-C', SOURCE, 'ls-files', '--others', '--exclude-standard', '-z']).split(b'\0')
+    source_extras = {name.decode(): hashlib.sha256((SOURCE / name.decode()).read_bytes()).hexdigest()
+                     for name in untracked if name and (SOURCE / name.decode()).is_file()}
+    profile.update(source_diff_sha256=hashlib.sha256(source_diff).hexdigest(), extra_sources=source_extras,
+                   patch_guard_sha256=hashlib.sha256((ROOT / 'scripts/mesa_patch_identity.py').read_bytes()).hexdigest(),
+                   build_script_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest())
+    source_id = hashlib.sha256(json.dumps(profile, sort_keys=True, separators=(',', ':')).encode()).hexdigest()
+elif args.builtin_pack:
+    sys.exit('UNIXNU_RECORD_HASHES=0 builds runtime builtin shaders; omit --builtin-pack')
 OUT.mkdir(parents=True, exist_ok=True)
 pack_header = ''
 pack_sha = None
@@ -99,8 +107,13 @@ options += ['-Dtu-builtin-source-id=' + source_id, '-Dtu-builtin-pack-header=' +
 # The pipeline cache's identity (VkPhysicalDeviceProperties::pipelineCacheUUID) from the compiler's source alone, the same for every
 # target: Mesa's own on Darwin is the library file's mtime (disk_cache_get_function_timestamp), which differs per install and per build,
 # so the pipelines a boot compiled into the persistent Data cache would miss after every image rebuild of the same compiler.
-build_id = hashlib.sha256(json.dumps(dict(mesa_revision=pins['mesa']['commit'], source_diff_sha256=profile['source_diff_sha256'],
-                                          extra_sources=source_extras), sort_keys=True).encode()).hexdigest()[:40]
+if record_hashes:
+    build_id = hashlib.sha256(json.dumps(dict(mesa_revision=pins['mesa']['commit'], source_diff_sha256=profile['source_diff_sha256'],
+                                              extra_sources=source_extras), sort_keys=True).encode()).hexdigest()[:40]
+else:
+    # The committed core revision owns the Mesa pin and every applied patch.
+    # Its identity keeps caches stable across rebuilds without reading file digests.
+    build_id = read(['git', '-C', str(ROOT), 'rev-parse', 'HEAD'])
 options += ['-Dtu-build-id=' + build_id]
 log = LOGS / ('mesa-tu-%s-configure.log' % args.target)
 with log.open('w') as stream:

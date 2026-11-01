@@ -8,19 +8,53 @@ owner trust module (make-owner-trust-bundle.py); neither changes the original tr
 import argparse
 import hashlib
 import json
+import os
 import plistlib
 import re
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-# --target ios27: the arm64e build for iPadOS 27 (24A446), whose render server is an arm64e process.
 parser = argparse.ArgumentParser(description=__doc__)
-parser.add_argument('--target', choices=('ios', 'ios27'), default='ios')
-parser.add_argument('--no-replay', action='store_true', help='omit the optional host simulation capture used by diagnostic probes')
+parser.add_argument('--target', choices=['ios', 'ios27'], default='ios')
+parser.add_argument('--gpu-abi-dir', type=Path, default=Path('drivers/Adreno740'),
+                    help='directory containing the selected kernel GPU NativeAdrenoABI.h, relative to the build tree')
+parser.add_argument('--scanout-copy', choices=['on', 'off'], default='on',
+                    help='copy display frames into the inherited framebuffer with the GPU')
+parser.add_argument('--quartzcore-display-state', choices=['on', 'off'], default='on',
+                    help='read and modify display state at the addresses selected for the A740 OS image')
+parser.add_argument('--turnip-replay', choices=['a740', 'off'], default='a740',
+                    help='include the recorded A740 command stream in the unpublished diagnostic path')
+parser.add_argument('--no-replay', action='store_true',
+                    help='omit the host simulation command stream from diagnostic probes')
+parser.add_argument('--single-sample', choices=['on', 'off'], default='on',
+                    help='replace requested multisampling with one sample when enabled')
+parser.add_argument('--turnip-debug', default='sysmem,nocb',
+                    help='default TU_DEBUG for published Metal devices; an empty value leaves it unset')
+parser.add_argument('--turnip-smoke-debug', default='nocb',
+                    help='default TU_DEBUG for the unpublished Vulkan diagnostic; an empty value leaves it unset')
+parser.add_argument('--shader-compiler', type=Path,
+                    help='glslc or glslangValidator executable used to compile the bundled Vulkan shaders')
+parser.add_argument('--skip-shader-validation', action='store_true',
+                    help='compile the bundled Vulkan shaders without invoking spirv-val')
 args = parser.parse_args()
+if args.no_replay:
+    args.turnip_replay = 'off'
+
+gpu_abi_dir = (ROOT / args.gpu_abi_dir).resolve()
+if not (gpu_abi_dir / 'NativeAdrenoABI.h').is_file():
+    raise SystemExit('The selected GPU ABI directory must contain NativeAdrenoABI.h')
+if args.turnip_replay == 'a740' and gpu_abi_dir != (ROOT / 'drivers/Adreno740').resolve():
+    raise SystemExit('The recorded command stream requires the A740 ABI; select --turnip-replay off for another GPU')
+board_options = [
+    '-DNATIVE_ADRENO_SCANOUT_COPY=' + str(int(args.scanout_copy == 'on')),
+    '-DNATIVE_ADRENO_QUARTZCORE_DISPLAY_STATE=' + str(int(args.quartzcore_display_state == 'on')),
+    '-DNATIVE_ADRENO_A740_REPLAY=' + str(int(args.turnip_replay == 'a740')),
+    '-DNATIVE_ADRENO_SINGLE_SAMPLE_DEFAULT=' + str(int(args.single_sample == 'on')),
+    '-DNATIVE_ADRENO_TURNIP_DEBUG=' + json.dumps(args.turnip_debug),
+    '-DNATIVE_ADRENO_TURNIP_SMOKE_DEBUG=' + json.dumps(args.turnip_smoke_debug),
+]
 IOS27 = args.target == 'ios27'
 OUT = ROOT / ('build/adreno-metal-plugin27' if IOS27 else 'build/adreno-metal-plugin')
 bundle = OUT / 'NativeAdrenoMetal.bundle'
@@ -30,45 +64,59 @@ bundle.mkdir(parents=True)
 sdk = subprocess.check_output(['xcrun', '--sdk', 'iphoneos', '--show-sdk-path'], text=True).strip()
 base = ['xcrun', 'clang', '-target', 'arm64e-apple-ios27.0' if IOS27 else 'arm64-apple-ios17.0', '-isysroot', sdk, '-O2', '-g', '-Wall', '-Wextra', '-Werror',
         '-fstack-protector-strong']
-source_hash = hashlib.sha256()
-for path in sorted((ROOT / 'drivers/AdrenoMetal').rglob('*')):
-    if path.is_file() and '.git' not in path.parts and path.suffix in ('.h','.mm','.cpp','.rs','.patch'):
-        source_hash.update(str(path.relative_to(ROOT / 'drivers/AdrenoMetal')).encode())
-        source_hash.update(path.read_bytes())
-metal_build_id = source_hash.hexdigest()
+if os.environ.get('UNIXNU_RECORD_HASHES', '1') == '0':
+    metal_build_id = subprocess.check_output(
+        ['git', '-C', str(ROOT / 'drivers/AdrenoMetal'), 'rev-parse', 'HEAD'], text=True).strip()
+    build_manifest = {'metal_source_revision': metal_build_id, 'target': args.target}
+else:
+    source_hash = hashlib.sha256()
+    for path in sorted((ROOT / 'drivers/AdrenoMetal').rglob('*')):
+        if path.is_file() and '.git' not in path.parts and path.suffix in ('.h', '.mm', '.cpp', '.rs', '.patch'):
+            source_hash.update(str(path.relative_to(ROOT / 'drivers/AdrenoMetal')).encode())
+            source_hash.update(path.read_bytes())
+
+    metal_build_id = source_hash.hexdigest()
+    build_manifest = {'metal_source_sha256': metal_build_id, 'target': args.target}
+
 base += ['-DNATIVE_METAL_BUILD_ID="' + metal_build_id + '"']
-(bundle / 'gpu-build.json').write_text(json.dumps({'metal_source_sha256': metal_build_id, 'target': args.target}, indent=2)+'\n')
 VULKAN_INCLUDE = ROOT / '.cache/mesa-work/include'
 TURNIP = ROOT / ('build/mesa-tu-ios27' if IOS27 else 'build/mesa-tu-ios') / 'src/freedreno/vulkan/libvulkan_freedreno.dylib'
 turnip_profile = TURNIP.parents[3] / 'builtin-build-profile.json'
 if turnip_profile.is_file():
-    manifest = json.loads((bundle / 'gpu-build.json').read_text())
-    manifest['turnip'] = json.loads(turnip_profile.read_text())
-    (bundle / 'gpu-build.json').write_text(json.dumps(manifest, indent=2)+'\n')
+    build_manifest['turnip'] = json.loads(turnip_profile.read_text())
+
+(bundle / 'gpu-build.json').write_text(json.dumps(build_manifest, indent=2) + '\n')
 if not TURNIP.is_file():
-    raise SystemExit('Build Turnip first: python3 scripts/build-turnip-darwin.py --target ' + ('ios27' if IOS27 else 'ios'))
-subprocess.run(['python3', ROOT / 'scripts/gen-turnip-smoke-shaders.py'], check=True)
-# Turnip's first submission, recorded on the host, for the plugin's prefix replay (build/turnip-smoke/TurnipReplay.h).
-if args.no_replay:
-    (ROOT / 'build/turnip-smoke/TurnipReplay.h').unlink(missing_ok=True)
-else:
+    raise SystemExit('Build Turnip first: python3 scripts/build-turnip-darwin.py --target ' + args.target)
+shader_command = ['python3', ROOT / 'scripts/gen-turnip-smoke-shaders.py']
+if args.shader_compiler:
+    shader_command.extend(['--compiler', str((ROOT / args.shader_compiler).resolve())])
+if args.skip_shader_validation:
+    shader_command.append('--skip-validation')
+subprocess.run(shader_command, check=True)
+# The command stream recorded by the host simulator targets A740.
+if args.turnip_replay == 'a740':
     subprocess.run(['python3', ROOT / 'scripts/gen-turnip-replay.py'], check=True)
-BRIDGE_TARGET = 'ios27' if IOS27 else 'ios'
-subprocess.run(['python3', ROOT / 'scripts/build-adreno-metal-bridge.py', '--target', BRIDGE_TARGET], check=True)
-BRIDGE = ROOT / 'build/adreno-metal-bridge' / BRIDGE_TARGET / 'libadreno_metal_bridge.a'
-# arm64e: the Rust objects' imports that take a callback go through the signing wrappers of RustPacBoundary.c, and their indirect branches
-# are routed through its stripping trampolines after the link (scripts/rust-pac-rewrite.py).
-link_extra, PAC_RENAMES = [], {'_pthread_create': '_nmb_pac_pthread_create', '__tlv_atexit': '_nmb_pac_tlv_atexit',
-                               '_atexit': '_nmb_pac_atexit', '__dyld_register_func_for_add_image': '_nmb_pac_dyld_register_func_for_add_image',
-                               '__Unwind_Backtrace': '_nmb_pac_Unwind_Backtrace', '_dlsym': '_nmb_pac_dlsym'}
+else:
+    (ROOT / 'build/turnip-smoke/TurnipReplay.h').unlink(missing_ok=True)
+subprocess.run(['python3', ROOT / 'scripts/build-adreno-metal-bridge.py', '--target', args.target], check=True)
+BRIDGE = ROOT / 'build/adreno-metal-bridge' / args.target / 'libadreno_metal_bridge.a'
+link_extra = []
 if IOS27:
+    pac_renames = {
+        '_pthread_create': '_nmb_pac_pthread_create',
+        '__tlv_atexit': '_nmb_pac_tlv_atexit',
+        '_atexit': '_nmb_pac_atexit',
+        '__dyld_register_func_for_add_image': '_nmb_pac_dyld_register_func_for_add_image',
+        '__Unwind_Backtrace': '_nmb_pac_Unwind_Backtrace',
+        '_dlsym': '_nmb_pac_dlsym',
+    }
     objcopy = next(p for p in ['/opt/homebrew/opt/llvm/bin/llvm-objcopy', shutil.which('llvm-objcopy') or ''] if p and Path(p).exists())
     pac_bridge = OUT / 'libadreno_metal_bridge_pac.a'
-    subprocess.run([objcopy, *[f'--redefine-sym={a}={b}' for a, b in PAC_RENAMES.items()], BRIDGE, pac_bridge], check=True)
+    subprocess.run([objcopy, *[f'--redefine-sym={a}={b}' for a, b in pac_renames.items()], BRIDGE, pac_bridge], check=True)
     BRIDGE = pac_bridge
     boundary = OUT / 'RustPacBoundary.o'
-    subprocess.run([*base, '-std=c11', '-I', VULKAN_INCLUDE, '-c', ROOT / 'drivers/AdrenoMetal/bridge/RustPacBoundary.c', '-o', boundary],
-                   check=True)
+    subprocess.run([*base, '-std=c11', '-I', VULKAN_INCLUDE, '-c', ROOT / 'drivers/AdrenoMetal/bridge/RustPacBoundary.c', '-o', boundary], check=True)
     link_extra = [boundary, '-Wl,-map,' + str(OUT / 'NativeAdrenoMetal.map')]
 pm4 = OUT / 'AdrenoPM4.o'
 subprocess.run([*base, '-std=c11', '-c', ROOT / 'kits/AdrenoPM4/AdrenoPM4.c', '-o', pm4], check=True)
@@ -78,14 +126,13 @@ exe = bundle / 'NativeAdrenoMetal'
 PRIME_LIST = ROOT / 'build/prime-list.txt'
 prime_section = [f'-Wl,-sectcreate,__DATA,__primelist,{PRIME_LIST}'] if PRIME_LIST.is_file() else []
 subprocess.run([*(['xcrun', 'clang++'] + base[2:]), '-std=c++17', '-fobjc-arc', '-Wno-deprecated-declarations', '-bundle',
-                '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
+                *board_options, '-I', gpu_abi_dir, '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE, '-I', ROOT / 'build/turnip-smoke',
                 '-x', 'objective-c++', ROOT / 'drivers/AdrenoMetal/NativeAdrenoMetalPlugin.mm',
                 ROOT / 'drivers/AdrenoMetal/NativeBridgeMetalFrontend.mm', '-x', 'none', pm4, BRIDGE,
                 *link_extra, '-Wl,-dead_strip', *prime_section, '-lobjc', '-framework', 'Foundation', '-framework', 'Metal', '-framework', 'IOSurface', '-o', exe],
                check=True)
 if IOS27:
-    subprocess.run(['python3', ROOT / 'scripts/rust-pac-rewrite.py', exe, OUT / 'NativeAdrenoMetal.map', 'libadreno_metal_bridge_pac.a'],
-                   check=True)
+    subprocess.run(['python3', ROOT / 'scripts/rust-pac-rewrite.py', exe, OUT / 'NativeAdrenoMetal.map', 'libadreno_metal_bridge_pac.a'], check=True)
 subprocess.run(['strip', '-x', exe], check=True)
 # The linker writes the debug symbols of the Rust bridge next to the executable; keep them beside the bundle, not in the image.
 symbols = OUT / 'NativeAdrenoMetal.dSYM'
@@ -113,7 +160,7 @@ cdhash = re.search(r'^CDHash=([a-f0-9]{40})$', detail, re.M)[1]
 assert re.search(r'^Page size=4096$', detail, re.M), 'the signature must use 4 KiB pages'
 header = exe.read_bytes()[:16]
 magic, cputype, subtype = int.from_bytes(header[0:4], 'little'), int.from_bytes(header[4:8], 'little'), int.from_bytes(header[8:12], 'little')
-assert (magic, cputype, subtype & 0xffffff) == (0xfeedfacf, 0x100000c, 2 if IOS27 else 0), 'expected an arm64e (27) or ARM64 (17) Mach-O'
+assert (magic, cputype, subtype & 0xffffff) == (0xfeedfacf, 0x100000c, 2 if IOS27 else 0), 'expected the selected ARM64 Mach-O subtype'
 # The probe daemon (launchd starts it as an owner job). The original platform sandbox policy refuses IOServiceOpen for any user-client class
 # a process has not been granted (the same refusal an unentitled consumer got in the offline owner tests), so it carries exactly the grant that
 # worked there: com.apple.security.iokit-user-client-class naming the one class it opens, plus no-container.
@@ -124,7 +171,7 @@ entitlements.write_bytes(plistlib.dumps({'com.apple.private.security.no-containe
                                          'com.apple.private.logging.admin': True, 'com.apple.private.logging.diagnostic': True,
                                          'com.apple.private.logging.stream': True}))
 daemon = OUT / 'adrenoprobed'
-subprocess.run(['xcrun', 'clang++', *base[2:], '-std=c++17', '-I', ROOT / 'drivers/Adreno740', '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE,
+subprocess.run(['xcrun', 'clang++', *base[2:], '-std=c++17', *board_options, '-I', gpu_abi_dir, '-I', ROOT / 'kits/AdrenoPM4', '-I', VULKAN_INCLUDE,
                 '-I', ROOT / 'build/turnip-smoke',
                 ROOT / 'drivers/AdrenoMetal/NativeAdrenoProbeDaemon.cpp', '-x', 'objective-c++', '-fobjc-arc',
                 ROOT / 'drivers/AdrenoMetal/NativeOsLogExport.mm', '-x', 'none', pm4, '-framework', 'Foundation', '-lz', '-o', daemon], check=True)

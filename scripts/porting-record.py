@@ -4,12 +4,15 @@ import argparse
 import fnmatch
 from html import escape
 from pathlib import Path
+import os
 import re
 import subprocess
 import sys
 import tomllib
 from urllib.parse import quote
 from urllib.request import urlopen
+
+from unixnu.components import catalog_files
 
 ROOT = Path(__file__).resolve().parents[1]
 AREAS = {
@@ -56,7 +59,7 @@ def strings(value):
     return isinstance(value, list) and bool(value) and all(text(item) for item in value)
 
 
-def validate(record, board, label, allow_custom_components=False):
+def validate(record, board, label, component_catalog=None, allow_custom_components=False):
     need(record.get('schema_version') == 1, f'{label}: schema_version must be 1')
     info = record.get('device', {})
     for key in ('name', 'soc', 'os_profile', 'summary'):
@@ -69,7 +72,7 @@ def validate(record, board, label, allow_custom_components=False):
     need(len(ids) == len(set(ids)), f'{label}: duplicate area ID')
     need(set(AREAS).issubset(ids), f'{label}: missing areas: {sorted(set(AREAS) - set(ids))}')
     selected = set(board.get('components', {}).get('include', []))
-    catalog = {c['id']: c for c in tomllib.loads((ROOT / 'components.toml').read_text())['component']}
+    catalog = component_catalog if component_catalog is not None else catalog_files([ROOT / 'components.toml'])
     pending = list(selected)
     while pending:
         component = pending.pop()
@@ -115,10 +118,29 @@ def validate(record, board, label, allow_custom_components=False):
     return record
 
 
-def check(device, base=None):
+def check(device, base=None, soc=None):
     record = tomllib.loads((device / 'porting.toml').read_text())
     board = tomllib.loads((device / 'board.toml').read_text())
-    validate(record, board, str(device))
+    sources = [ROOT / 'components.toml', ROOT / 'profiles/arch/arm64/components.toml']
+    for filename in ('feeds.toml', 'local.toml'):
+        path = device / filename
+        if not path.is_file():
+            continue
+        for entry in tomllib.loads(path.read_text()).get('source', []):
+            if entry.get('kind') != 'soc' or entry.get('name') != board.get('board', {}).get('soc_source'):
+                continue
+            if entry.get('local'):
+                local_soc = Path(os.path.expandvars(entry['local'])).expanduser()
+                if not local_soc.is_absolute():
+                    local_soc = device / local_soc
+                sources.append(local_soc / 'components.toml')
+    if soc is not None:
+        sources.append(soc / 'components.toml')
+    profile = board.get('board', {}).get('os_profile')
+    if profile:
+        sources.append(ROOT / 'profiles/os' / profile / 'components.toml')
+    sources.append(device / 'components.toml')
+    validate(record, board, str(device), catalog_files(sources))
     for area in record['area']:
         for item in area['evidence']:
             if not item['reference'].startswith('https://'):
@@ -224,12 +246,13 @@ def main():
     check_parser = commands.add_parser('check')
     check_parser.add_argument('--device', type=Path, required=True)
     check_parser.add_argument('--base', help='compare code changes with this Git revision')
+    check_parser.add_argument('--soc', type=Path, help='SoC source directory whose components.toml is included')
     site_parser = commands.add_parser('site')
     site_parser.add_argument('--local', action='append', default=[], metavar='DEVICE=PATH')
     args = parser.parse_args()
     try:
         if args.command == 'check':
-            check(args.device, args.base)
+            check(args.device, args.base, args.soc)
         else:
             site(args.local)
     except (ValueError, KeyError, OSError, subprocess.CalledProcessError) as error:
