@@ -184,7 +184,7 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
 index bcb7724..43fb96e 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
-@@ -33,6 +33,127 @@ enum tu_cmd_buffer_status {
+@@ -33,6 +33,134 @@ enum tu_cmd_buffer_status {
     TU_CMD_BUFFER_STATUS_ACTIVE = 1,
  };
  
@@ -256,6 +256,13 @@ index bcb7724..43fb96e 100644
 +
 +   if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT) {
 +      cmd->resource_fallback_reasons |= TU_RESOURCE_FALLBACK_SPARSE;
++      return;
++   }
++
++   /* GMEM-only attachments reserve an address without allocating storage.
++    * The render path records their range after allocating a backing BO.
++    */
++   if (image->mem && image->mem->lazy && !image->mem->bo) {
 +      return;
 +   }
 +
@@ -452,6 +459,22 @@ index bcb7724..43fb96e 100644
     struct tu_cb_control_point enable_cb_patch = {
        .type = TU_CB_CONTROL_TYPE_PATCHPOINT,
        .patchpoint = cb_state.nop_header,
+@@ -3805,8 +3975,15 @@ tu_allocate_transient_attachments(struct tu_cmd_buffer *cmd, bool sysmem)
+          VkResult result = tu_allocate_lazy_memory(cmd->device,
+                                                    iview->image->mem);
+          if (result != VK_SUCCESS)
+             return result;
+       }
++
++      /* A lazy attachment can acquire storage after render-pass recording
++       * begins. Register it after the GMEM/SYSMEM allocation decision.
++       */
++      if (iview && iview->image->mem && iview->image->mem->lazy) {
++         tu_cmd_use_image(cmd, iview->image, TU_RESOURCE_READ | TU_RESOURCE_WRITE);
++      }
+    }
+ 
+    return VK_SUCCESS;
 @@ -4177,6 +4340,9 @@ tu_cmd_buffer_destroy(struct vk_command_buffer *vk_cmd_buffer)
     struct tu_cmd_buffer *cmd_buffer =
        container_of(vk_cmd_buffer, struct tu_cmd_buffer, vk);
@@ -1702,7 +1725,7 @@ index 2ff6826..d8b03ff 100644
     }
     return VK_SUCCESS;
  }
-@@ -1347,6 +1379,78 @@ tu_GetDescriptorEXT(
+@@ -1347,6 +1379,86 @@ tu_GetDescriptorEXT(
  }
  TU_GENX(tu_GetDescriptorEXT);
  
@@ -1760,6 +1783,14 @@ index 2ff6826..d8b03ff 100644
 +   if (image) {
 +      if (image->vk.create_flags & VK_IMAGE_CREATE_SPARSE_BINDING_BIT)
 +         *unknown = true;
++
++      /* Lazy input attachments are covered by the render pass when it
++       * allocates their storage; a GMEM-only input has no backing BO.
++       */
++      if (image->mem && image->mem->lazy && !image->mem->bo) {
++         return {};
++      }
++
 +      return {image->iova, image->total_size, access};
 +   }
 +   return {};
