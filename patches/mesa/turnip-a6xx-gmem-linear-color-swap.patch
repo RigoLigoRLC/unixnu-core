@@ -1,0 +1,64 @@
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
+@@ -569,15 +569,20 @@
+                    TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = pitch));
+ }
+ 
+-/* GMEM holds a colour in the byte order its render target writes it in: a linear image's MRT swap (WXYZ for BGRA) is already applied
+- * there, as system memory rendering writes it. A load or a store therefore moves the bytes as they are, with the identity swap on the
+- * memory side too; the image's own swap on top exchanged red and blue against what system memory rendering writes (a frame mixing
+- * both modes: the wallpaper of the lock screen 51 % exchanged in i-batch, centre redrawn in system memory correct). A mutable tiled
+- * image (MUTABLEEN) keeps its swap.
++/* A6xx GMEM transfers retain the view's register values. The GMEM sampling
++ * descriptor uses WZYX, while a linear BGRA destination uses WXYZ to write
++ * its bytes in BGRA order. The MRT and resolve registers on A6xx have no
++ * MUTABLEEN bit. A7xx and later use the transfer override below for views
++ * whose hardware mutable mode is disabled.
+  */
++template <chip CHIP>
+ static inline uint32_t
+ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity, bool mutable_view)
+ {
++   if (CHIP == A6XX) {
++      return info;
++   }
++
+    return mutable_view ? info : ((info & ~swap_mask) | identity);
+ }
+ 
+@@ -588,7 +593,7 @@
+ {
+    uint32_t dst_info = iview->RB_A2D_DEST_BUFFER_INFO;
+    if (gmem_transfer)
+-      dst_info = tu_gmem_transfer_swap_fixup(dst_info, A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP__MASK,
++      dst_info = tu_gmem_transfer_swap_fixup<CHIP>(dst_info, A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP__MASK,
+                                              A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
+    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
+       A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_FORMAT, dst_info);
+@@ -1766,7 +1771,7 @@
+ {
+    uint32_t mrt_buf_info = iview->RB_MRT_BUF_INFO;
+    if (gmem_transfer)
+-      mrt_buf_info = tu_gmem_transfer_swap_fixup(mrt_buf_info, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
++      mrt_buf_info = tu_gmem_transfer_swap_fixup<CHIP>(mrt_buf_info, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
+                                                  A6XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX), iview->is_mutable);
+ 
+    enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
+@@ -1892,7 +1897,7 @@
+    } else {
+       RB_MRT_BUF_INFO = iview->view.RB_MRT_BUF_INFO;
+       gmem_offset = tu_attachment_gmem_offset(cmd, att, layer);
+-      RB_MRT_BUF_INFO = tu_gmem_transfer_swap_fixup(RB_MRT_BUF_INFO, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
++      RB_MRT_BUF_INFO = tu_gmem_transfer_swap_fixup<CHIP>(RB_MRT_BUF_INFO, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK,
+                                                     A6XX_RB_MRT_BUF_INFO_COLOR_SWAP(WZYX), iview->view.is_mutable);
+    }
+ 
+@@ -2463,7 +2468,7 @@
+       }
+    } else {
+       tu_cs_emit(cs, gmem_transfer ?
+-                        tu_gmem_transfer_swap_fixup(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO,
++                        tu_gmem_transfer_swap_fixup<CHIP>(blt_view->view->RB_RESOLVE_SYSTEM_BUFFER_INFO,
+                                                     A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP__MASK,
+                                                     A6XX_RB_RESOLVE_SYSTEM_BUFFER_INFO_COLOR_SWAP(WZYX),
+                                                     blt_view->view->is_mutable) :
