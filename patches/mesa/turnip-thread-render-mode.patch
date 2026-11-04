@@ -1,12 +1,13 @@
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index 1ac9c8b..2cfbc83 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
-@@ -1383,6 +1383,16 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
+@@ -1555,13 +1555,24 @@ use_hw_binning(struct tu_cmd_buffer *cmd)
     return vsc->binning_possible && vsc->binning_useful;
  }
  
-+/* The render mode of the calling thread's passes, for the GMEM colour order test (the plugin's NativeTurnipSwapTest.h): 's' system memory,
-+ * 'g' GMEM where the pass can, 0 the process's mode (tu_sheng_render_mode). */
++/* The calling thread can select GMEM ('g') or system memory ('s') for a
++ * colour capture. Zero uses the command capture and process settings. */
 +static thread_local char tu_thread_render_mode;
 +extern "C" __attribute__((visibility("default"))) void tu_sheng_set_thread_render_mode(char mode);
 +extern "C" __attribute__((visibility("default"))) void
@@ -18,12 +19,12 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
  static bool
  use_sysmem_rendering(struct tu_cmd_buffer *cmd,
                       tu_autotune::rp_ctx_t *rp_ctx,
-@@ -1391,7 +1401,7 @@ use_sysmem_rendering(struct tu_cmd_buffer *cmd,
-    /* TU_DEBUG(SYSMEM) still lets a pass with a transient attachment (below) render in GMEM: in system memory such a pass wrote and
-     * read every transient attachment in DRAM (a 3048x2032 pass with RGBA16F and R32F transients took 9-12 ms of GPU time) and
-     * backed it for good. */
--   const char sheng_mode = tu_sheng_render_mode();
-+   const char sheng_mode = tu_thread_render_mode ? tu_thread_render_mode : tu_sheng_render_mode();
+                      tu_autotune::rp_key_opt rp_key)
+ {
+    const uint32_t capture_mode = tu_darwin_trace_render_mode(cmd);
+-   const char sheng_mode = capture_mode == 2 ? 's' : capture_mode == 1 ? 'g' : tu_sheng_render_mode();
++   const char sheng_mode = tu_thread_render_mode ? tu_thread_render_mode :
++      capture_mode == 2 ? 's' : capture_mode == 1 ? 'g' : tu_sheng_render_mode();
+    /* TU_DEBUG(SYSMEM) permits unbacked transient attachments to stay in GMEM.
+     * An explicit capture selection still uses system memory for comparison. */
     const bool forced_sysmem = sheng_mode == 'g' ? false : sheng_mode == 's' ? true : TU_DEBUG(SYSMEM);
- 
-    /* can't fit attachments into gmem */

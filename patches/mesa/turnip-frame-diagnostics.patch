@@ -1,96 +1,65 @@
-diff --git a/src/freedreno/vulkan/tu_frame_diagnostic.h b/src/freedreno/vulkan/tu_frame_diagnostic.h
---- /dev/null
-+++ b/src/freedreno/vulkan/tu_frame_diagnostic.h
-@@ -0,0 +1,16 @@
-+/* SPDX-License-Identifier: MIT */
-+#pragma once
-+#include <stdint.h>
-+#include <stdlib.h>
-+#ifdef __APPLE__
-+extern "C" bool tu_darwin_frame_diagnostic(uint32_t,const void *,uint32_t);
-+static inline void tu_frame_event(uint32_t event,uint64_t a=0,uint64_t b=0,uint64_t c=0,uint64_t d=0,uint64_t e=0,uint64_t f=0,uint64_t g=0,uint64_t h=0,uint64_t i=0,uint64_t j=0,uint64_t k=0,uint64_t l=0) {
-+   static const bool on=getenv("SHENG_GPU_TRACE")!=nullptr;
-+   if(!on || event)return;
-+   /* Pass and submission records stay in this process's rings (frames.trace); none reach the kernel ring. */
-+   struct {uint64_t seq,us;uint32_t event,pid;uint64_t v[12];} rec={0,0,event,0,{a,b,c,d,e,f,g,h,i,j,k,l}};
-+   (void)tu_darwin_frame_diagnostic(0x7102,&rec,sizeof(rec));
-+}
-+#else
-+static inline void tu_frame_event(uint32_t,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0,uint64_t=0) {}
-+#endif
-diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
---- a/src/freedreno/vulkan/tu_knl_darwin.cc
-+++ b/src/freedreno/vulkan/tu_knl_darwin.cc
+diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index c5f4e35..edab989 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.cc
++++ b/src/freedreno/vulkan/tu_clear_blit.cc
 @@ -1,3 +1,4 @@
 +#include "tu_frame_diagnostic.h"
  /*
-  * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
-  * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
-@@ -276,6 +277,23 @@
-    note.count = count;
-    memcpy(note.words, words, count * sizeof(uint32_t));
-    return dw_call(NativeAdrenoMethodNote, &note, sizeof(note), NULL, 0) == KERN_SUCCESS;
-+}
-+
-+extern "C" __attribute__((visibility("default"))) const char *tu_darwin_frame_build_id(void);
-+extern "C" __attribute__((visibility("default"))) const char *tu_darwin_frame_build_id(void) {
-+#ifdef TU_BUILD_ID_OVERRIDE
-+   return TU_BUILD_ID_OVERRIDE;
-+#else
-+   return "unknown";
-+#endif
-+}
-+
-+extern "C" __attribute__((visibility("default"))) bool
-+tu_darwin_frame_diagnostic(uint32_t method,const void *data,uint32_t bytes)
-+{
-+   if(!dw.open || !data || method!=0x7102 ||
-+      bytes!=120)return false;
-+   return dw_call(method,data,bytes,NULL,0)==KERN_SUCCESS;
+  * Copyright 2019-2020 Valve Corporation
+  * SPDX-License-Identifier: MIT
+@@ -213,8 +214,9 @@ format_to_ifmt(enum pipe_format format)
+ static uint64_t tu_gmem_side_counts[4][4];
+ 
+ void
+-tu_note_gmem_side(unsigned site, bool linear, bool mutableen, unsigned swap)
++tu_note_gmem_side(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview, unsigned site, bool linear, bool mutableen, unsigned swap)
+ {
++   tu_frame_event(37,(uintptr_t)cmd,site,(uintptr_t)iview,(uintptr_t)iview->image,iview->vk.format,linear,mutableen,swap,iview->view.color_swap,iview->view.is_mutable);
+    p_atomic_inc(&tu_gmem_side_counts[site][0]);
+    if (swap != WZYX)
+       p_atomic_inc(&tu_gmem_side_counts[site][1]);
+@@ -1680,7 +1682,7 @@ r3d_src_gmem_load(struct tu_cmd_buffer *cmd,
+                   const struct tu_image_view *iview,
+                   uint32_t layer)
+ {
+-   tu_note_gmem_side(1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
++   tu_note_gmem_side(cmd, iview, 1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
+    r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, true);
  }
  
- static void
-@@ -1458,6 +1476,7 @@
-    for (uint32_t i = 0; i < wait_count; i++) {
-       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
-       /* tu_queue_submit() holds submit_mutex here (tu_queue.cc), which the wait releases while it sleeps. */
-+      tu_frame_event(43,(uintptr_t)submit,0,(uintptr_t)s,s->state,s->fence,waits[i].wait_value);
-       while (s->state == DARWIN_SYNC_UNSIGNALED)
-          pthread_cond_wait(&dev->timeline_cond, &dev->submit_mutex);
+@@ -1718,7 +1720,7 @@ r3d_src_gmem(struct tu_cmd_buffer *cmd,
+ 
+    if (!iview->view.is_mutable)
+       tu_desc_set_swap<CHIP>(desc, WZYX);
+-   tu_note_gmem_side(0, iview->image->layout[0].tile_mode == TILE6_LINEAR, false,
++   tu_note_gmem_side(cmd, iview, 0, iview->image->layout[0].tile_mode == TILE6_LINEAR, false,
+                      iview->view.is_mutable ? iview->view.color_swap : WZYX);
+ 
+    /* If FDM offset is used, the last row and column extend beyond the
+@@ -6268,7 +6270,7 @@ store_cp_blit(struct tu_cmd_buffer *cmd,
+       src_height += tiling->tile0.height;
     }
-@@ -1479,6 +1498,7 @@
-          darwin_note_fence(chunk_fence);
-          pthread_mutex_unlock(&dw.lock);
-          fence = chunk_fence;
-+         tu_frame_event(38,(uintptr_t)submit,chunk_fence,at,count,rec.busy,rec.space_wait_us,wait_count,signal_count);
-       }
-       p_atomic_set(&queue->fence, fence);
-       rec.buffers = MIN2(total, 255u);
-@@ -1496,6 +1516,7 @@
  
-    for (uint32_t i = 0; i < signal_count; i++) {
-       struct vk_darwin_sync *s = container_of(signals[i].sync, struct vk_darwin_sync, vk);
-+      tu_frame_event(43,(uintptr_t)submit,1,(uintptr_t)s,s->state,fence,signals[i].signal_value);
-       s->fence = fence;
-       s->state = fence ? DARWIN_SYNC_FENCE : DARWIN_SYNC_SIGNALED;
-    }
-diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
---- a/src/freedreno/vulkan/tu_queue.cc
-+++ b/src/freedreno/vulkan/tu_queue.cc
-@@ -1,3 +1,4 @@
-+#include "tu_frame_diagnostic.h"
- /*
-  * Copyright © 2016 Red Hat.
-  * Copyright © 2016 Bas Nieuwenhuizen
-@@ -476,6 +477,7 @@
+-   tu_note_gmem_side(2, dst_iview->image->layout[0].tile_mode == TILE6_LINEAR, src_iview->view.is_mutable, fmt.swap);
++   tu_note_gmem_side(cmd, dst_iview, 2, dst_iview->image->layout[0].tile_mode == TILE6_LINEAR, src_iview->view.is_mutable, fmt.swap);
  
-    for (uint32_t i = 0; i < cmdbuf_count; i++) {
-       struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
-+      tu_frame_event(42,(uintptr_t)submit,(uintptr_t)cmd_buffer,i,cmdbuf_count);
-       struct tu_cs *cs = &cmd_buffer->cs;
+    uint64_t va = gmem_offset;
+    if (CHIP < A8XX) {
+diff --git a/src/freedreno/vulkan/tu_clear_blit.h b/src/freedreno/vulkan/tu_clear_blit.h
+index 7d59dc3..ed20f18 100644
+--- a/src/freedreno/vulkan/tu_clear_blit.h
++++ b/src/freedreno/vulkan/tu_clear_blit.h
+@@ -107,7 +107,7 @@ tu_attachment_unpadded(struct tu_cmd_buffer *cmd, const struct tu_image_view *iv
+  * 2 a 2D store's source, 3 an input attachment read from tile memory.
+  */
+ void
+-tu_note_gmem_side(unsigned site, bool linear, bool mutableen, unsigned swap);
++tu_note_gmem_side(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview, unsigned site, bool linear, bool mutableen, unsigned swap);
  
-       if (perf_pass_index != ~0) {
+ void
+ tu_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer,
 diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd_buffer.cc
+index d31937d..197c99b 100644
 --- a/src/freedreno/vulkan/tu_cmd_buffer.cc
 +++ b/src/freedreno/vulkan/tu_cmd_buffer.cc
 @@ -1,3 +1,4 @@
@@ -98,7 +67,7 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
  /*
   * Copyright © 2016 Red Hat.
   * Copyright © 2016 Bas Nieuwenhuizen
-@@ -2901,7 +2902,7 @@
+@@ -3102,7 +3103,7 @@ tu_emit_input_attachments(struct tu_cmd_buffer *cmd,
  
        if (!iview->view.is_mutable)
           tu_desc_set_swap<CHIP>(dst, WZYX);
@@ -107,7 +76,7 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
                          iview->view.is_mutable ? iview->view.color_swap : WZYX);
  
        /* If FDM offset is used, the last row and column extend beyond the
-@@ -4203,6 +4204,11 @@
+@@ -4439,6 +4440,11 @@ tu_note_pass(struct tu_cmd_buffer *cmd, bool sysmem, unsigned slot, uint64_t kpx
     const uint32_t seq = p_atomic_inc_return(&tu_pass_seq);
     rec.seq = seq;
     tu_pass_ring[seq % 512] = rec;
@@ -119,7 +88,7 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
     return seq;
  }
  
-@@ -4581,6 +4587,7 @@
+@@ -4846,6 +4852,7 @@ VkResult
  tu_cmd_buffer_begin(struct tu_cmd_buffer *cmd_buffer,
                      const VkCommandBufferBeginInfo *pBeginInfo)
  {
@@ -127,62 +96,175 @@ diff --git a/src/freedreno/vulkan/tu_cmd_buffer.cc b/src/freedreno/vulkan/tu_cmd
     vk_command_buffer_begin(&cmd_buffer->vk, pBeginInfo);
  
     memset(&cmd_buffer->state, 0, sizeof(cmd_buffer->state));
-diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
---- a/src/freedreno/vulkan/tu_clear_blit.cc
-+++ b/src/freedreno/vulkan/tu_clear_blit.cc
+diff --git a/src/freedreno/vulkan/tu_frame_diagnostic.h b/src/freedreno/vulkan/tu_frame_diagnostic.h
+new file mode 100644
+index 0000000..afff485
+--- /dev/null
++++ b/src/freedreno/vulkan/tu_frame_diagnostic.h
+@@ -0,0 +1,74 @@
++/* SPDX-License-Identifier: MIT */
++#pragma once
++
++#include <stdint.h>
++#include <stdlib.h>
++#include <string.h>
++
++#ifdef __APPLE__
++#include <sys/sysctl.h>
++
++extern "C" bool tu_darwin_frame_diagnostic(uint32_t, const void *, uint32_t);
++
++/* The render server sends bounded pass, attachment and GMEM transfer records
++ * to the kernel trace when SHENG_GPU_TRACE is enabled. */
++static inline bool
++tu_swap_trace_on()
++{
++   static const bool on = getenv("SHENG_GPU_TRACE") != nullptr && !strcmp(getprogname(), "backboardd");
++   return on;
++}
++
++static inline void
++tu_frame_event(uint32_t event, uint64_t a = 0, uint64_t b = 0, uint64_t c = 0,
++               uint64_t d = 0, uint64_t e = 0, uint64_t f = 0, uint64_t g = 0,
++               uint64_t h = 0, uint64_t i = 0, uint64_t j = 0, uint64_t k = 0,
++               uint64_t l = 0)
++{
++   if (!tu_swap_trace_on() || (event != 36 && event != 37 && event != 44)) {
++      return;
++   }
++
++   struct {
++      uint64_t seq, us;
++      uint32_t event, pid;
++      uint64_t values[12];
++   } record = {0, 0, event, 0, {a, b, c, d, e, f, g, h, i, j, k, l}};
++   (void)tu_darwin_frame_diagnostic(0x7102, &record, sizeof(record));
++}
++
++/* The sheng-tum boot argument selects GMEM ('g') or strict system memory
++ * ('s') for colour capture. Zero leaves the ordinary render-mode policy. */
++static inline char
++tu_sheng_render_mode()
++{
++   static const char mode = [] {
++      char args[1100] = {};
++      size_t size = sizeof(args) - 1;
++      const char *at = sysctlbyname("kern.bootargs", args, &size, nullptr, 0) == 0 ?
++         strstr(args, "sheng-tum=") : nullptr;
++      return at && (at[10] == 'g' || at[10] == 's') ? at[10] : char(0);
++   }();
++   return mode;
++}
++#else
++static inline char
++tu_sheng_render_mode()
++{
++   return 0;
++}
++
++static inline bool
++tu_swap_trace_on()
++{
++   return false;
++}
++
++static inline void
++tu_frame_event(uint32_t, uint64_t = 0, uint64_t = 0, uint64_t = 0,
++               uint64_t = 0, uint64_t = 0, uint64_t = 0, uint64_t = 0,
++               uint64_t = 0, uint64_t = 0, uint64_t = 0, uint64_t = 0,
++               uint64_t = 0)
++{
++}
++#endif
+diff --git a/src/freedreno/vulkan/tu_knl_darwin.cc b/src/freedreno/vulkan/tu_knl_darwin.cc
+index dea7d3d..104e022 100644
+--- a/src/freedreno/vulkan/tu_knl_darwin.cc
++++ b/src/freedreno/vulkan/tu_knl_darwin.cc
 @@ -1,3 +1,4 @@
 +#include "tu_frame_diagnostic.h"
  /*
-  * Copyright 2019-2020 Valve Corporation
-  * SPDX-License-Identifier: MIT
-@@ -213,8 +214,9 @@
- static uint64_t tu_gmem_side_counts[4][4];
- 
- void
--tu_note_gmem_side(unsigned site, bool linear, bool mutableen, unsigned swap)
--{
-+tu_note_gmem_side(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview, unsigned site, bool linear, bool mutableen, unsigned swap)
-+{
-+   tu_frame_event(37,(uintptr_t)cmd,site,(uintptr_t)iview,(uintptr_t)iview->image,iview->vk.format,linear,mutableen,swap,iview->view.color_swap,iview->view.is_mutable);
-    p_atomic_inc(&tu_gmem_side_counts[site][0]);
-    if (swap != WZYX)
-       p_atomic_inc(&tu_gmem_side_counts[site][1]);
-@@ -1643,7 +1645,7 @@
-                   const struct tu_image_view *iview,
-                   uint32_t layer)
- {
--   tu_note_gmem_side(1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
-+   tu_note_gmem_side(cmd, iview, 1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
-    r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, true);
+  * Native Darwin kernel backend for Turnip: talks to the NativeAdreno IOKit user client (NativeAdrenoABI.h, version 1).
+  * Modelled on tu_knl_kgsl.cc (no libdrm) and tu_knl_drm_msm.cc (the client chooses GPU addresses).
+@@ -331,6 +332,31 @@ tu_darwin_note(uint32_t kind, const uint32_t *words, uint32_t count)
+    return accepted;
  }
  
-@@ -1681,7 +1683,7 @@
++extern "C" __attribute__((visibility("default"))) const char *tu_darwin_frame_build_id(void);
++extern "C" __attribute__((visibility("default"))) const char *
++tu_darwin_frame_build_id(void)
++{
++#ifdef TU_BUILD_ID_OVERRIDE
++   return TU_BUILD_ID_OVERRIDE;
++#else
++   return "unknown";
++#endif
++}
++
++extern "C" __attribute__((visibility("default"))) bool
++tu_darwin_frame_diagnostic(uint32_t method, const void *data, uint32_t bytes)
++{
++   if (!data || method != 0x7102 || bytes != 120) {
++      return false;
++   }
++
++   pthread_mutex_lock(&profile_device_lock);
++   const bool accepted = darwin_stats_devices &&
++      dw_call(&darwin_stats_devices->connection, method, data, bytes, NULL, 0) == KERN_SUCCESS;
++   pthread_mutex_unlock(&profile_device_lock);
++   return accepted;
++}
++
+ int
+ tu_darwin_trace_call(struct tu_device *device, uint32_t method,
+                      const void *input, size_t input_size,
+@@ -3403,6 +3429,8 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+       pthread_mutex_lock(&dw.lock);
+       darwin_note_fence(&dw, completion);
+       pthread_mutex_unlock(&dw.lock);
++      tu_frame_event(38, (uintptr_t)submit, completion, 0, total, trace.busy,
++                     trace.space_wait_us, wait_count, signal_count);
+       if (u_trace_submission_data) {
+          u_trace_submission_data->gpu_ts_offset = 0;
+       }
+@@ -3413,6 +3441,7 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+    /* The kernel client has one ring and no GPU-side waits: wait on the CPU before submitting. */
+    for (uint32_t i = 0; i < wait_count; i++) {
+       struct vk_darwin_sync *s = container_of(waits[i].sync, struct vk_darwin_sync, vk);
++      tu_frame_event(43, (uintptr_t)submit, 0, (uintptr_t)s, s->state, s->fence, waits[i].wait_value);
+       VkResult result = darwin_sync_wait(dev, s, UINT64_MAX);
+       if (result != VK_SUCCESS)
+          return vk_device_set_lost(&dev->vk, "wait before submit failed");
+@@ -3447,6 +3476,8 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
+          darwin_note_fence(&dw, chunk_fence);
+          pthread_mutex_unlock(&dw.lock);
+          fence = chunk_fence;
++         tu_frame_event(38, (uintptr_t)submit, chunk_fence, at, count, trace.busy,
++                        trace.space_wait_us, wait_count, signal_count);
+       }
+       tu_darwin_pm4_end(capture, VK_SUCCESS, fence);
+       p_atomic_set(&queue->fence, fence);
+@@ -3457,6 +3488,7 @@ darwin_queue_submit(struct tu_queue *queue, void *_submit,
  
-    if (!iview->view.is_mutable)
-       tu_desc_set_swap<CHIP>(desc, WZYX);
--   tu_note_gmem_side(0, iview->image->layout[0].tile_mode == TILE6_LINEAR, false,
-+   tu_note_gmem_side(cmd, iview, 0, iview->image->layout[0].tile_mode == TILE6_LINEAR, false,
-                      iview->view.is_mutable ? iview->view.color_swap : WZYX);
- 
-    /* If FDM offset is used, the last row and column extend beyond the
-@@ -5968,7 +5970,7 @@
-       src_height += tiling->tile0.height;
+    for (uint32_t i = 0; i < signal_count; i++) {
+       struct vk_darwin_sync *s = container_of(signals[i].sync, struct vk_darwin_sync, vk);
++      tu_frame_event(43, (uintptr_t)submit, 1, (uintptr_t)s, s->state, fence, signals[i].signal_value);
+       s->fence = fence;
+       s->state = fence ? DARWIN_SYNC_FENCE : DARWIN_SYNC_SIGNALED;
     }
+diff --git a/src/freedreno/vulkan/tu_queue.cc b/src/freedreno/vulkan/tu_queue.cc
+index f4b1dbe..029b856 100644
+--- a/src/freedreno/vulkan/tu_queue.cc
++++ b/src/freedreno/vulkan/tu_queue.cc
+@@ -1,3 +1,4 @@
++#include "tu_frame_diagnostic.h"
+ /*
+  * Copyright © 2016 Red Hat.
+  * Copyright © 2016 Bas Nieuwenhuizen
+@@ -536,6 +537,7 @@ queue_submit(struct vk_queue *_queue, struct vk_queue_submit *vk_submit)
  
--   tu_note_gmem_side(2, dst_iview->image->layout[0].tile_mode == TILE6_LINEAR, src_iview->view.is_mutable, fmt.swap);
-+   tu_note_gmem_side(cmd, dst_iview, 2, dst_iview->image->layout[0].tile_mode == TILE6_LINEAR, src_iview->view.is_mutable, fmt.swap);
+    for (uint32_t i = 0; i < cmdbuf_count; i++) {
+       struct tu_cmd_buffer *cmd_buffer = cmd_buffers[i];
++      tu_frame_event(42, (uintptr_t)submit, (uintptr_t)cmd_buffer, i, cmdbuf_count);
+       struct tu_cs *cs = &cmd_buffer->cs;
  
-    uint64_t va = gmem_offset;
-    if (CHIP < A8XX) {
-diff --git a/src/freedreno/vulkan/tu_clear_blit.h b/src/freedreno/vulkan/tu_clear_blit.h
---- a/src/freedreno/vulkan/tu_clear_blit.h
-+++ b/src/freedreno/vulkan/tu_clear_blit.h
-@@ -107,7 +107,7 @@
-  * 2 a 2D store's source, 3 an input attachment read from tile memory.
-  */
- void
--tu_note_gmem_side(unsigned site, bool linear, bool mutableen, unsigned swap);
-+tu_note_gmem_side(struct tu_cmd_buffer *cmd, const struct tu_image_view *iview, unsigned site, bool linear, bool mutableen, unsigned swap);
- 
- void
- tu_cmd_fill_buffer_addr(VkCommandBuffer commandBuffer,
+       result = tu_cmd_record_result(cmd_buffer);

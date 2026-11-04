@@ -1,15 +1,28 @@
 diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_clear_blit.cc
+index 984d429..7d10271 100644
 --- a/src/freedreno/vulkan/tu_clear_blit.cc
 +++ b/src/freedreno/vulkan/tu_clear_blit.cc
-@@ -628,6 +628,17 @@ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity
+@@ -619,11 +619,8 @@ r2d_src_buffer_unaligned(struct tu_cmd_buffer *cmd,
+                    TPL1_A2D_SRC_TEXTURE_PITCH(CHIP, .pitch = pitch));
+ }
+ 
+-/* GMEM holds a colour in the byte order its render target writes it in: a linear image's MRT swap (WXYZ for BGRA) is already applied
+- * there, as system memory rendering writes it. A load or a store therefore moves the bytes as they are, with the identity swap on the
+- * memory side too; the image's own swap on top exchanged red and blue against what system memory rendering writes (a frame mixing
+- * both modes: the wallpaper of the lock screen 51 % exchanged in i-batch, centre redrawn in system memory correct). A mutable tiled
+- * image (MUTABLEEN) keeps its swap.
++/* The tile side uses shader component order with identity swap. Mutable
++ * tiled views keep their swap because MUTABLEEN changes that representation.
+  */
+ static inline uint32_t
+ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity, bool mutable_view)
+@@ -631,6 +628,15 @@ tu_gmem_transfer_swap_fixup(uint32_t info, uint32_t swap_mask, uint32_t identity
     return mutable_view ? info : ((info & ~swap_mask) | identity);
  }
  
-+/* The memory side of a transfer between tile memory and a linear image keeps the image's own swap. Measured on the device (the plugin's
-+ * NativeTurnipSwapTest.h, swaptest4, device and imported host memory alike): a draw leaves its colour in tile memory in shader order (it
-+ * reads back right through an input attachment), so with the identity swap on the memory side a GMEM pass stored drawn BGRA8 colour with
-+ * red and blue exchanged (cc6633 for 3366cc) and loaded memory into tile memory in memory order (an input attachment read the loaded
-+ * blue as red). The tile side stays the identity (tu_gmem_transfer_swap_fixup in r3d_dst_gmem). */
++/* The memory side keeps the image view's swap. A linear BGRA image uses
++ * WXYZ to convert between shader component order in GMEM and BGRA bytes
++ * in ordinary device memory or imported host memory. */
 +static inline uint32_t
 +tu_gmem_memory_side_info(uint32_t info)
 +{
@@ -19,7 +32,7 @@ diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_cle
  template <chip CHIP>
  static void
  r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
-@@ -635,8 +646,7 @@ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
+@@ -638,8 +644,7 @@ r2d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
  {
     uint32_t dst_info = iview->RB_A2D_DEST_BUFFER_INFO;
     if (gmem_transfer)
@@ -29,17 +42,30 @@ diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_cle
     enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
        A6XX_RB_A2D_DEST_BUFFER_INFO_COLOR_FORMAT, dst_info);
     enum pipe_format dst_format = iview->format;
-@@ -1691,7 +1701,8 @@ r3d_src_gmem_load(struct tu_cmd_buffer *cmd,
+@@ -1709,9 +1714,9 @@ r3d_src_load(struct tu_cmd_buffer *cmd,
+       tu_desc_set_format<CHIP>(desc, tex_format);
+    }
+ 
+-   /* When loading/storing GMEM we always load the full image and don't do any
+-    * swizzling or swapping, that's done in the draw when reading/writing
+-    * GMEM, so we need to fixup the swizzle and swap.
++   /* Loads read the full component vector. Mutable GMEM transfers use
++    * identity sampling because their tile-side MRT applies the view's swap;
++    * other loads keep the memory view's swap.
+     */
+    if (override_swap)
+       tu_desc_set_swap<CHIP>(desc, WZYX);
+@@ -1731,7 +1736,8 @@ r3d_src_gmem_load(struct tu_cmd_buffer *cmd,
                    uint32_t layer)
  {
     tu_note_gmem_side(cmd, iview, 1, iview->image->layout[0].tile_mode == TILE6_LINEAR, false, WZYX);
 -   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, true);
-+   /* The memory side keeps the image's own swap (tu_gmem_memory_side_info); a mutable view's stays as upstream. */
++   /* Linear memory keeps its native swap; mutable tiled memory uses identity sampling. */
 +   r3d_src_load<CHIP>(cmd, cs, iview, layer, VK_FILTER_NEAREST, iview->view.is_mutable);
  }
  
  template <chip CHIP>
-@@ -1776,8 +1787,7 @@ r3d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
+@@ -1816,8 +1822,7 @@ r3d_dst_impl(struct tu_cs *cs, const struct fdl6_view *iview, uint32_t layer,
  {
     uint32_t mrt_buf_info = iview->RB_MRT_BUF_INFO;
     if (gmem_transfer)
@@ -49,7 +75,7 @@ diff --git a/src/freedreno/vulkan/tu_clear_blit.cc b/src/freedreno/vulkan/tu_cle
  
     enum a6xx_format fmt = (enum a6xx_format) pkt_field_get(
        A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT, mrt_buf_info);
-@@ -2470,12 +2480,8 @@ event_blit_run(struct tu_cmd_buffer *cmd,
+@@ -2512,12 +2517,8 @@ event_blit_run(struct tu_cmd_buffer *cmd,
           tu_cs_emit(cs, A6XX_RB_RESOLVE_SYSTEM_BUFFER_PITCH(blt_view->stencil_pitch).value);
        }
     } else {
