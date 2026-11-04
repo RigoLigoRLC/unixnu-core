@@ -179,6 +179,7 @@ class Ipsw:
 
     def disk_image(self, component):
         """A component as a plain disk image: extracted, then decrypted when the IPSW ships it as AEA."""
+        record_hashes = os.environ.get('UNIXNU_RECORD_HASHES', '1') != '0'
         # AEA inputs may have been removed after decryption. Validate the plain
         # image and both recorded identities before downloading the archive again.
         name = self.member(component)
@@ -192,9 +193,9 @@ class Ipsw:
                 pin = self.config.get('sha256', {}).get(archive.name)
                 if source.get('member') == name and data.get('member') == name \
                         and data.get('aea_sha256') == source.get('sha256') \
-                        and (pin is None or pin == source.get('sha256')) \
+                        and (not record_hashes or pin is None or pin == source.get('sha256')) \
                         and data.get('size') == plain.stat().st_size \
-                        and sha256_file(plain) == data.get('sha256'):
+                        and (not record_hashes or sha256_file(plain) == data.get('sha256')):
                     return plain
         path = self.extract(component)
         if path.suffix != '.aea':
