@@ -12,7 +12,7 @@
 	url = https://github.com/UniXNU/DarwinBoot.git
 [submodule "drivers/SoftwareAES"]
 	path = drivers/SoftwareAES
-	url = https://github.com/UniXNU/SoftwareAES.git
+	url = https://github.com/RigoLigoRLC/unixnu-softwareaes.git
 [submodule "drivers/Adreno740"]
 	path = drivers/Adreno740
 	url = https://github.com/UniXNU/Adreno740.git
@@ -21,7 +21,7 @@
 	url = https://github.com/UniXNU/QcomGeniSpi.git
 [submodule "drivers/AppleKeyStoreState"]
 	path = drivers/AppleKeyStoreState
-	url = https://github.com/UniXNU/AppleKeyStoreState.git
+	url = https://github.com/RigoLigoRLC/unixnu-applekeystorestate.git
 [submodule "drivers/AdrenoMetal"]
 	path = drivers/AdrenoMetal
 	url = https://github.com/RigoLigoRLC/unixnu-adrenometal.git
